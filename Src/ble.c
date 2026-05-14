@@ -71,6 +71,12 @@
 #define ACI_OP_GATT_SRV_INIT                  0xFD01   /* OCF=0x101 */
 #define ACI_OP_GATT_SRV_ADD_SERVICE_NWK       0xFD02   /* OCF=0x102 */
 #define ACI_OP_GATT_SRV_ADD_CHAR_NWK          0xFD04   /* OCF=0x104 */
+/* aci_gatt_srv_write_handle_value_nwk — server-side write to a
+   characteristic value handle. Used right after aci_gap_init to
+   overwrite the BlueNRG-LP SDK's default GAP Device Name (which leaks
+   out as "BlueNRG [<configured>]" on macOS Core Bluetooth) with the
+   clean BLE_ADV_NAME string. See movement_logger_firmware#1. */
+#define ACI_OP_GATT_SRV_WRITE_HANDLE_VALUE    0xFD06   /* OCF=0x106 */
 #define ACI_OP_GATT_SRV_NOTIFY                0xFD2F   /* OCF=0x12F */
 
 /* FileSync wire protocol (CLAUDE.md) */
@@ -690,8 +696,14 @@ int BLE_Init(void)
   ErrLog_Write(buf);
   if (rc != 0) return -6;
 
-  /* aci_gap_init — peripheral role, static random address. Returns 7 bytes
-     of handles which we don't use here (just the status byte). */
+  /* aci_gap_init — peripheral role, static random address. Response
+     payload (after the status byte stripped by ble_aci_cmd) is 6 bytes:
+       service_handle         (2 LE)
+       dev_name_char_handle   (2 LE)
+       appearance_char_handle (2 LE)
+     We capture dev_name_char_handle so the next call can overwrite the
+     BlueNRG-LP SDK's default Device Name characteristic value. */
+  uint16_t dev_name_handle = 0;
   {
     uint8_t p[4] = {
       0x01,                       /* role: peripheral */
@@ -699,10 +711,38 @@ int BLE_Init(void)
       BLE_ADV_NAME_LEN,
       0x01,                       /* identity addr type: static random */
     };
-    rc = ble_aci_cmd(ACI_OP_GAP_INIT, p, sizeof(p), NULL, 0);
-    snprintf(buf, sizeof(buf), "ble: aci_gap_init cc=%d", rc);
+    uint8_t resp[6] = { 0 };
+    rc = ble_aci_cmd(ACI_OP_GAP_INIT, p, sizeof(p), resp, sizeof(resp));
+    dev_name_handle = (uint16_t)(resp[2] | (resp[3] << 8));
+    snprintf(buf, sizeof(buf), "ble: aci_gap_init cc=%d dev_name_h=0x%04x",
+             rc, dev_name_handle);
     ErrLog_Write(buf);
     if (rc != 0) return -7;
+  }
+
+  /* Overwrite the BlueNRG-LP SDK's default GAP Device Name characteristic
+     value with our clean BLE_ADV_NAME. Without this the SDK leaves the
+     factory default in place ("BlueNRG [<configured>]") which macOS
+     Core Bluetooth caches post-connect and replays on subsequent scans,
+     so clients that exact-match the advertised local name (the
+     MovementLogger desktop GUI before its substring-match fix) fail to
+     recognise the box. The Complete Local Name AD field in the
+     advertising packet (built below) is already clean — this writes the
+     matching value into the GATT GAP service. movement_logger_firmware#1. */
+  {
+    uint8_t p[6 + BLE_ADV_NAME_LEN];
+    int i = 0;
+    p[i++] = (uint8_t)(dev_name_handle & 0xFF);
+    p[i++] = (uint8_t)(dev_name_handle >> 8);
+    p[i++] = 0x00; p[i++] = 0x00;          /* val_offset = 0 */
+    p[i++] = (uint8_t)BLE_ADV_NAME_LEN;
+    p[i++] = 0x00;                          /* value_length = BLE_ADV_NAME_LEN */
+    memcpy(&p[i], BLE_ADV_NAME, BLE_ADV_NAME_LEN); i += BLE_ADV_NAME_LEN;
+    rc = ble_aci_cmd(ACI_OP_GATT_SRV_WRITE_HANDLE_VALUE, p, (uint16_t)i, NULL, 0);
+    snprintf(buf, sizeof(buf), "ble: set_gap_dev_name cc=%d", rc);
+    ErrLog_Write(buf);
+    /* Non-fatal: if this fails the box still advertises correctly,
+       it'll just look ugly in the post-connect GAP read. */
   }
 
   /* aci_gatt_srv_add_service_nwk — register the BlueST FileSync service
