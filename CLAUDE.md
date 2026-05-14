@@ -128,6 +128,17 @@ predecessor stack hit):
   field). The current MovementLogger GUI scans for this exact name.
   PR also references `PumpTsueri` as the field-test name — keep
   `PL_FW_BLE_NAME` (Inc/config.h) as the single source of truth.
+- **GAP Device Name characteristic value must be written explicitly.**
+  `aci_gap_init` only sizes the GAP Device Name characteristic; it
+  leaves the BlueNRG-LP SDK's factory default in place, which surfaces
+  on macOS Core Bluetooth as `BlueNRG [<configured>]` and breaks any
+  client doing exact-name matching. After `aci_gap_init`, capture the
+  returned `dev_name_char_handle` and issue
+  `aci_gatt_srv_write_handle_value_nwk` (OCF=0x106) with the clean
+  `BLE_ADV_NAME`. Both the advert AD packet *and* the GATT
+  characteristic must carry the same string. Fixed in v0.0.3; see
+  `Src/ble.c` around the GAP init + write block and
+  zdavatz/movement_logger_firmware#1 for the macOS symptom.
 
 ## Known WIP edges (per the PR description)
 
