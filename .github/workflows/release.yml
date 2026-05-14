@@ -1,0 +1,81 @@
+name: Release firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.0.2). Must already exist or will be created from the current ref.'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+          arm-none-eabi-gcc --version
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build firmware
+        working-directory: STM32CubeIDE
+        run: make TOOLCHAIN=/usr/bin
+
+      - name: Rename + hash artifact
+        id: artifact
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          cp STM32CubeIDE/build/firmware.bin "firmware-${TAG}.bin"
+          SHA=$(sha256sum "firmware-${TAG}.bin" | awk '{print $1}')
+          SIZE=$(wc -c < "firmware-${TAG}.bin")
+          echo "path=firmware-${TAG}.bin" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "size=${SIZE}" >> "$GITHUB_OUTPUT"
+          arm-none-eabi-size STM32CubeIDE/build/PumpLogger.elf
+
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          BODY="Built by GitHub Actions from commit \`${GITHUB_SHA}\`.
+
+          - Asset: \`${{ steps.artifact.outputs.path }}\`
+          - Size: ${{ steps.artifact.outputs.size }} bytes
+          - SHA-256: \`${{ steps.artifact.outputs.sha256 }}\`
+          - Toolchain: Ubuntu \`gcc-arm-none-eabi\` (apt)
+          - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Hardware target: STEVAL-MKBOXPRO Rev_C. Flash with:
+
+          \`\`\`sh
+          dfu-util -d 0483:df11 -a 0 -s 0x08000000:mass-erase:force -D ${{ steps.artifact.outputs.path }}
+          \`\`\`"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${{ steps.artifact.outputs.path }}" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes "$BODY" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "$BODY" \
+              --repo "$GITHUB_REPOSITORY" \
+              "${{ steps.artifact.outputs.path }}"
+          fi
