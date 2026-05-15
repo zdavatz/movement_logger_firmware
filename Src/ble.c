@@ -35,6 +35,7 @@
 #include "watchdog.h"
 #include "logger.h"
 #include "stream.h"
+#include "battery.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -71,11 +72,6 @@
 #define ACI_OP_GATT_SRV_INIT                  0xFD01   /* OCF=0x101 */
 #define ACI_OP_GATT_SRV_ADD_SERVICE_NWK       0xFD02   /* OCF=0x102 */
 #define ACI_OP_GATT_SRV_ADD_CHAR_NWK          0xFD04   /* OCF=0x104 */
-/* aci_gatt_srv_write_handle_value_nwk — server-side write to a
-   characteristic value handle. Used right after aci_gap_init to
-   overwrite the BlueNRG-LP SDK's default GAP Device Name (which leaks
-   out as "BlueNRG [<configured>]" on macOS Core Bluetooth) with the
-   clean BLE_ADV_NAME string. See movement_logger_firmware#1. */
 #define ACI_OP_GATT_SRV_WRITE_HANDLE_VALUE    0xFD06   /* OCF=0x106 */
 #define ACI_OP_GATT_SRV_NOTIFY                0xFD2F   /* OCF=0x12F */
 
@@ -112,8 +108,14 @@ static const uint8_t BLE_SENSORSTREAM_UUID[16] = {
   0x1b,0xc5,0xd5,0xa5,0x02,0x00,0x36,0xac,
   0xe1,0x11,0x10,0x00,0x00,0x01,0x00,0x00,
 };
+static const uint8_t BLE_BATTERY_UUID[16] = {
+  /* 00000200-0010-11e1-ac36-0002a5d5c51b */
+  0x1b,0xc5,0xd5,0xa5,0x02,0x00,0x36,0xac,
+  0xe1,0x11,0x10,0x00,0x00,0x02,0x00,0x00,
+};
 
 /* Char property bitfield */
+#define BLE_PROP_READ           0x02
 #define BLE_PROP_WRITE          0x08
 #define BLE_PROP_WRITE_NO_RSP   0x04
 #define BLE_PROP_NOTIFY         0x10
@@ -129,6 +131,7 @@ static uint16_t          g_svc_handle      = 0;
 static uint16_t          g_filecmd_handle  = 0;
 static uint16_t          g_filedata_handle = 0;
 static uint16_t          g_stream_handle   = 0;
+static uint16_t          g_battery_handle  = 0;
 
 /* Current connection handle (0 = no active connection). Set in BLE_Tick on
    HCI_LE_Connection_Complete; cleared on Disconnection_Complete. */
@@ -139,6 +142,15 @@ static uint16_t          g_conn_handle     = 0;
 static uint8_t           g_stream_subscribed = 0;
 static uint32_t          g_stream_last_ms    = 0;
 #define STREAM_PERIOD_MS 2000
+
+/* BatteryStatus: stored value updated + (if subscribed) notified once per
+   minute, plus immediately on a low-battery flag transition. */
+static uint8_t           g_battery_subscribed = 0;
+static uint8_t           g_battery_low_prev   = 0;
+static uint32_t          g_battery_check_ms   = 0;   /* 1 Hz transition check */
+static uint32_t          g_battery_notify_ms  = 0;   /* 1/min periodic notify */
+#define BATTERY_CHECK_MS   1000
+#define BATTERY_PERIOD_MS  60000
 
 #define BLE_ADV_NAME      "PumpTsueri"
 #define BLE_ADV_NAME_LEN  10
@@ -334,6 +346,23 @@ static int ble_adv_enable(void)
 {
   uint8_t p[6] = { 0x01, 0x01, 0x00, 0x00, 0x00, 0x00 };
   return ble_aci_cmd(ACI_OP_GAP_SET_ADV_ENABLE, p, sizeof(p), NULL, 0);
+}
+
+/* Write a characteristic's stored value (offset 0). Two uses:
+   - overwrite the BlueNRG SDK's default GAP Device Name at init
+   - refresh the read+notify BatteryStatus value so host READs are fresh */
+static int ble_write_handle_value(uint16_t val_handle,
+                                  const uint8_t *data, uint16_t len)
+{
+  uint8_t p[64];
+  int i = 0;
+  p[i++] = (uint8_t)(val_handle & 0xFF);
+  p[i++] = (uint8_t)(val_handle >> 8);
+  p[i++] = 0x00; p[i++] = 0x00;                   /* val_offset = 0 */
+  p[i++] = (uint8_t)(len & 0xFF);
+  p[i++] = (uint8_t)(len >> 8);
+  if (len > 0) { memcpy(&p[i], data, len); i += len; }
+  return ble_aci_cmd(ACI_OP_GATT_SRV_WRITE_HANDLE_VALUE, p, (uint16_t)i, NULL, 0);
 }
 
 /* ----- FileData notify --------------------------------------------------- */
@@ -696,14 +725,8 @@ int BLE_Init(void)
   ErrLog_Write(buf);
   if (rc != 0) return -6;
 
-  /* aci_gap_init — peripheral role, static random address. Response
-     payload (after the status byte stripped by ble_aci_cmd) is 6 bytes:
-       service_handle         (2 LE)
-       dev_name_char_handle   (2 LE)
-       appearance_char_handle (2 LE)
-     We capture dev_name_char_handle so the next call can overwrite the
-     BlueNRG-LP SDK's default Device Name characteristic value. */
-  uint16_t dev_name_handle = 0;
+  /* aci_gap_init — peripheral role, static random address. Returns
+     service_handle(2) + dev_name_char_handle(2) + appearance_char_handle(2). */
   {
     uint8_t p[4] = {
       0x01,                       /* role: peripheral */
@@ -711,38 +734,26 @@ int BLE_Init(void)
       BLE_ADV_NAME_LEN,
       0x01,                       /* identity addr type: static random */
     };
-    uint8_t resp[6] = { 0 };
+    uint8_t resp[6];              /* svc(2) + dev_name(2) + appearance(2) */
     rc = ble_aci_cmd(ACI_OP_GAP_INIT, p, sizeof(p), resp, sizeof(resp));
-    dev_name_handle = (uint16_t)(resp[2] | (resp[3] << 8));
-    snprintf(buf, sizeof(buf), "ble: aci_gap_init cc=%d dev_name_h=0x%04x",
+    uint16_t dev_name_handle = (uint16_t)(resp[2] | (resp[3] << 8));
+    snprintf(buf, sizeof(buf), "ble: aci_gap_init cc=%d dnh=0x%04x",
              rc, dev_name_handle);
     ErrLog_Write(buf);
     if (rc != 0) return -7;
-  }
 
-  /* Overwrite the BlueNRG-LP SDK's default GAP Device Name characteristic
-     value with our clean BLE_ADV_NAME. Without this the SDK leaves the
-     factory default in place ("BlueNRG [<configured>]") which macOS
-     Core Bluetooth caches post-connect and replays on subsequent scans,
-     so clients that exact-match the advertised local name (the
-     MovementLogger desktop GUI before its substring-match fix) fail to
-     recognise the box. The Complete Local Name AD field in the
-     advertising packet (built below) is already clean — this writes the
-     matching value into the GATT GAP service. movement_logger_firmware#1. */
-  {
-    uint8_t p[6 + BLE_ADV_NAME_LEN];
-    int i = 0;
-    p[i++] = (uint8_t)(dev_name_handle & 0xFF);
-    p[i++] = (uint8_t)(dev_name_handle >> 8);
-    p[i++] = 0x00; p[i++] = 0x00;          /* val_offset = 0 */
-    p[i++] = (uint8_t)BLE_ADV_NAME_LEN;
-    p[i++] = 0x00;                          /* value_length = BLE_ADV_NAME_LEN */
-    memcpy(&p[i], BLE_ADV_NAME, BLE_ADV_NAME_LEN); i += BLE_ADV_NAME_LEN;
-    rc = ble_aci_cmd(ACI_OP_GATT_SRV_WRITE_HANDLE_VALUE, p, (uint16_t)i, NULL, 0);
-    snprintf(buf, sizeof(buf), "ble: set_gap_dev_name cc=%d", rc);
+    /* Overwrite the BlueNRG-LP SDK's default GAP Device Name. aci_gap_init
+       only SIZES the Device Name characteristic — its value keeps the
+       chip's debug default ("BlueNRG [PumpTsueri]") until we write it.
+       iOS/macOS Core Bluetooth caches that GAP value and surfaces it on
+       later scans, so without this the box advertises as the vendor debug
+       string. Value handle = declaration handle + 1 (same convention ST's
+       ble_manager.c uses for the BlueNRG-LP path).
+       See zdavatz/movement_logger_firmware#1. */
+    rc = ble_write_handle_value((uint16_t)(dev_name_handle + 1),
+                                (const uint8_t *)BLE_ADV_NAME, BLE_ADV_NAME_LEN);
+    snprintf(buf, sizeof(buf), "ble: gap_name='%s' set cc=%d", BLE_ADV_NAME, rc);
     ErrLog_Write(buf);
-    /* Non-fatal: if this fails the box still advertises correctly,
-       it'll just look ugly in the post-connect GAP read. */
   }
 
   /* aci_gatt_srv_add_service_nwk — register the BlueST FileSync service
@@ -834,6 +845,30 @@ int BLE_Init(void)
              rc, g_stream_handle);
     ErrLog_Write(buf);
     if (rc != 0) return -14;
+  }
+
+  /* BatteryStatus char — read + notify, 8-byte STC3115 snapshot */
+  {
+    uint8_t p[26];
+    int i = 0;
+    p[i++] = (uint8_t)(g_svc_handle & 0xFF);
+    p[i++] = (uint8_t)(g_svc_handle >> 8);
+    p[i++] = 0x02;
+    memcpy(&p[i], BLE_BATTERY_UUID, 16); i += 16;
+    p[i++] = BATTERY_PACKET_SIZE; p[i++] = 0;
+    p[i++] = BLE_PROP_READ | BLE_PROP_NOTIFY;
+    p[i++] = 0x00;
+    p[i++] = 0x00;
+    p[i++] = 0x10;
+    p[i++] = 0x01;
+    uint8_t resp[3];
+    rc = ble_aci_cmd(ACI_OP_GATT_SRV_ADD_CHAR_NWK, p, (uint16_t)i,
+                     resp, sizeof(resp));
+    g_battery_handle = (uint16_t)(resp[0] | (resp[1] << 8));
+    snprintf(buf, sizeof(buf), "ble: add_battery cc=%d h=0x%04x",
+             rc, g_battery_handle);
+    ErrLog_Write(buf);
+    if (rc != 0) return -15;
   }
 
   /* ACI_GAP_SET_ADVERTISING_CONFIGURATION — extended-advertising config.
@@ -938,13 +973,43 @@ static void ble_stream_tick(void)
   ble_notify(g_stream_handle + 1, pkt, STREAM_PACKET_SIZE);
 }
 
+/* BatteryStatus: refresh the stored value (so reads work) + notify
+   subscribers. Runs at 1 Hz to catch a low-battery flag transition; the
+   full periodic notify fires once a minute, plus immediately on transition.
+   Reuses the logger's cached fuel sample — no extra I²C reads. */
+static void ble_battery_tick(void)
+{
+  if (g_conn_handle == 0) return;
+  uint32_t now = HAL_GetTick();
+  if ((now - g_battery_check_ms) < BATTERY_CHECK_MS) return;
+  g_battery_check_ms = now;
+
+  PL_Snapshot snap;
+  Logger_GetSnapshot(&snap);
+  uint8_t low = (snap.fuel.soc_x10 < BATTERY_LOW_SOC_X10) ? 1 : 0;
+  uint8_t transitioned = (low != g_battery_low_prev);
+  g_battery_low_prev   = low;
+
+  uint8_t due_periodic = (uint32_t)(now - g_battery_notify_ms) >= BATTERY_PERIOD_MS;
+  if (!transitioned && !due_periodic) return;
+  g_battery_notify_ms = now;
+
+  uint8_t pkt[BATTERY_PACKET_SIZE];
+  Battery_Pack(&snap.fuel, low, (uint8_t)Logger_IsActive(), pkt);
+  ble_write_handle_value(g_battery_handle + 1, pkt, BATTERY_PACKET_SIZE);
+  if (g_battery_subscribed) {
+    ble_notify(g_battery_handle + 1, pkt, BATTERY_PACKET_SIZE);
+  }
+}
+
 void BLE_Tick(void)
 {
   if (!g_advertising) return;
 
-  /* Stream emit runs every tick regardless of pending events — it's a
-     timer, not an event response. */
+  /* Stream + battery emit run every tick regardless of pending events —
+     they're timers, not event responses. */
   ble_stream_tick();
+  ble_battery_tick();
 
   if (!irq_high()) return;
 
@@ -976,8 +1041,9 @@ void BLE_Tick(void)
          unsubscribed and the host's app re-subscribes explicitly. Without
          this the box would keep firing notifications the new client never
          asked for. */
-      g_conn_handle       = 0;
-      g_stream_subscribed = 0;
+      g_conn_handle        = 0;
+      g_stream_subscribed  = 0;
+      g_battery_subscribed = 0;
       /* Re-arm advertising — the chip stopped it on connect and won't
          resume on its own. Without this the box is invisible to any
          further connection attempt. */
@@ -1025,6 +1091,15 @@ void BLE_Tick(void)
           g_stream_last_ms    = HAL_GetTick();   /* first packet after the period */
           snprintf(buf, sizeof(buf), "ble: stream subscribed=%d",
                    g_stream_subscribed);
+          ErrLog_Write(buf);
+        }
+        /* BatteryStatus CCCD — same pattern, gates the periodic battery
+           notify (the stored value is refreshed regardless, for reads). */
+        else if (attr == (uint16_t)(g_battery_handle + 2) && dlen >= 1) {
+          g_battery_subscribed = (evt[12] & 0x01);
+          g_battery_notify_ms  = HAL_GetTick() - BATTERY_PERIOD_MS;  /* notify soon */
+          snprintf(buf, sizeof(buf), "ble: battery subscribed=%d",
+                   g_battery_subscribed);
           ErrLog_Write(buf);
         }
       } else {

@@ -19,8 +19,10 @@ together with the requirements; from there we go to Phase 2 (skeleton).
 8. [Cooperative scheduler](#8-cooperative-scheduler)
 9. [Module boundaries](#9-module-boundaries)
 10. [Memory budget](#10-memory-budget)
-11. [Watchdog details](#11-watchdog-details)
-12. [Boot sequence](#12-boot-sequence)
+11. [State-machine robustness — design standard](#11-state-machine-robustness--design-standard)
+12. [Watchdog details](#12-watchdog-details)
+13. [Boot sequence](#13-boot-sequence)
+14. [Decisions left for implementation phase](#14-decisions-left-for-implementation-phase)
 
 ---
 
@@ -501,7 +503,83 @@ PumpLogger/
 
 ---
 
-## 11. Watchdog details
+## 11. State-machine robustness — design standard
+
+**Locked 2026-05-15** after the Phase 6 file-sync hang: a BLE READ
+spun forever inside `ble_notify_blocking` while feeding `Watchdog_Kick`
+from the retry loop. IWDG stayed happy, `Logger_Tick` starved, green
+LED dark. The watchdog "worked" — but it was the wrong layer to catch
+this case, because the hang was a foreseeable software condition
+(client disconnected mid-stream / TX queue saturated), not an
+unforeseeable CPU fault.
+
+Principle: **the watchdog is the last resort, not a recovery
+mechanism.** A watchdog reset costs the in-flight SD session, a
+visible reboot, and a flash-bank-swap risk. Every state machine in
+PumpLogger must catch its own foreseeable failure modes in software,
+so the watchdog only ever fires for things we genuinely cannot
+foresee (stack overflow, bus stall, memory corruption).
+
+### The three required ingredients for every state machine
+
+1. **Per-state deadline**, measured in SysTick ticks (not in retry
+   counts — retries say nothing about wall-clock progress). Stored
+   alongside the state itself as `state_entered_tick`. Caller
+   checks `now - state_entered_tick > DEADLINE_TICKS` on each Tick
+   entry.
+2. **Defined emergency-exit transition** back to IDLE, with full
+   resource cleanup: close any open file, reset buffers, clear
+   state-machine-internal counters, release any held BLE handles.
+   The exit path must never depend on the same resource that may
+   have caused the hang (e.g. don't try to notify the client when
+   we're aborting *because* notify is stuck).
+3. **Errlog entry with context**, on every emergency exit:
+   `state-machine: <name> aborted in state <s> after <ms>ms,
+   reason=<code>`. Counter for repeated hits in the same session.
+
+### Single source of `Watchdog_Kick()`
+
+Kicked **only from the main loop, between Tick calls**. Never from
+inside a state machine's working code, never from a retry loop,
+never from a chunk-emission hot path. Rationale: a kick from a hot
+loop maskiert exactly the hang the watchdog is meant to catch.
+
+### Standard exit codes for the errlog
+
+| Code | Meaning |
+|---|---|
+| `SM_OK` | normal completion (logged on debug, suppressed in prod) |
+| `SM_TIMEOUT` | deadline exceeded |
+| `SM_PEER_GONE` | resource owner disappeared (BLE disconnect mid-op) |
+| `SM_IO_ERROR` | underlying driver returned non-recoverable error |
+| `SM_BAD_STATE` | unreachable state hit (assertion-style, should never fire) |
+
+### Audit table (current PumpLogger state-machines)
+
+| State machine | File | Deadline? | Emergency exit? | Errlog? |
+|---|---|---|---|---|
+| BLE READ chunking | `ble.c` | ❌ | ❌ | ❌ |
+| BLE LIST emission | `ble.c` | ❌ | ❌ | ❌ |
+| BLE notify retry | `ble.c` | ❌ (count-based, with `Watchdog_Kick`!) | ❌ | ❌ |
+| FAT cluster-alloc scan | `sd_fatfs.c` | ⚠️ implicit O(N) | ❌ | ❌ |
+| GPS UBX init wait-ack | `gps.c` | ✅ 200 ms | ✅ NAK/TO marker | ✅ |
+| Logger_Tick cadence | `logger.c` | n/a (no loop) | n/a | n/a |
+| SD `HAL_SD_WriteBlocks` | HAL | ✅ HAL timeout | ⚠️ HAL-internal reset | ⚠️ partial |
+
+Anything ❌ or ⚠️ is on the Phase-8 hardening list. The READ /
+LIST / notify-retry triplet is the first batch — see issue tracker
+task #14.
+
+### Convention for adding a new state machine
+
+Every PR adding a new state machine in PumpLogger must include the
+three ingredients from the start, and the author must add a row to
+the audit table above. PR reviewers reject state machines that lack
+any of the three. This keeps the design standard from rotting back.
+
+---
+
+## 12. Watchdog details
 
 Three independent layers, by purpose:
 
@@ -571,7 +649,7 @@ catches it.
 
 ---
 
-## 12. Boot sequence
+## 13. Boot sequence
 
 From cold-boot to "advertising + logging" — target ≤ 1 s.
 
@@ -598,7 +676,7 @@ retries if the chip is slow.
 
 ---
 
-## 13. Decisions left for implementation phase
+## 14. Decisions left for implementation phase
 
 Some details we'll decide as we hit them, rather than over-specifying
 here:
