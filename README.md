@@ -17,7 +17,9 @@ Bare-metal firmware for the **STEVAL-MKBOXPRO Rev_C** (SensorTile.box PRO) runni
 - Buy: [st.com — STEVAL-MKBOXPRO](https://www.st.com/en/evaluation-tools/steval-mkboxpro.html) (also available from Mouser, DigiKey, Farnell and other ST distributors)
 - Rev_A/B and STWIN.box are **not** supported — they stay on the old firmware tree.
 
-MCU: STM32U585AIIxQ (Cortex-M33 @ 160 MHz, HSI→PLL). BLE: BlueNRG-LP on SPI1, polled (EXTI11 intentionally unused — see CLAUDE.md). Sensors: LSM6DSV16X / LIS2MDL / LPS22DF / STTS22H / STC3115 / u-blox MAX-M10S GPS. Power: Li-Po + wireless charging; Hall sensor + magnet wired as a hardware supply-rail interrupter (no MCU sleep modes).
+MCU: STM32U585AIIxQ (Cortex-M33 @ 160 MHz, HSI→PLL). BLE: BlueNRG-LP on SPI1, polled (EXTI11 intentionally unused — see CLAUDE.md). Sensors: LSM6DSV16X / LIS2MDL / LPS22DF / STTS22H / STC3115 / [u-blox MAX-M10S](https://www.u-blox.com/en/product/max-m10s-module) GPS receiver. Power: Li-Po + wireless charging; Hall sensor + magnet wired as a hardware supply-rail interrupter (no MCU sleep modes).
+
+The GPS receiver is **not on the STEVAL-MKBOXPRO** — it is a separate [u-blox MAX-M10S](https://www.u-blox.com/en/product/max-m10s-module) module wired to UART4 @ 38400 baud (e.g. a [MAX-M10S breakout from SparkFun](https://www.sparkfun.com/products/18037) or any MAX-M10S carrier). See CLAUDE.md / DESIGN.md for the wiring and the u-blox config sequence.
 
 ## Build
 
