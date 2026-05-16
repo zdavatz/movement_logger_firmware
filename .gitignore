@@ -1,1 +1,13 @@
+# Build output
 /STM32CubeIDE/build/
+
+# Build counter — bumps every `make`, embedded via -DPL_BUILD_NUM.
+# Local-only; committing would create spurious diffs.
+/STM32CubeIDE/.build_counter
+
+# Finder-induced "Kopie" duplicates — never intended to be committed
+*Kopie*
+* Kopie*
+
+# macOS
+.DS_Store

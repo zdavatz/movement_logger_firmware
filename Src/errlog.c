@@ -100,9 +100,20 @@ int ErrLog_Init(void)
   return 0;
 }
 
+static volatile uint8_t g_warning_latched = 0;
+
+uint8_t ErrLog_WarningLatched(void) { return g_warning_latched; }
+
 void ErrLog_Write(const char *s)
 {
   if (!g_inited || !s) return;
+  /* Latch the warning flag the first time we see a '***' marker —
+     the convention used for prominent errlog lines (GPS not decoding,
+     SD almost full, etc.). Main loop reads the latch to drive the
+     red LED so the operator notices without needing to pull SD. */
+  if (!g_warning_latched && s[0] == '*' && s[1] == '*' && s[2] == '*') {
+    g_warning_latched = 1;
+  }
   char line[200];
   int n = snprintf(line, sizeof(line), "[%lu ms] %s\n",
                    (unsigned long)HAL_GetTick(), s);

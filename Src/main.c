@@ -50,9 +50,11 @@ int main(void)
   HAL_GPIO_WritePin(PL_LED_RED_PORT,   PL_LED_RED_PIN,   GPIO_PIN_SET);
   HAL_GPIO_WritePin(PL_LED_GREEN_PORT, PL_LED_GREEN_PIN, GPIO_PIN_RESET);
 
-  /* Buzzer last — depends on TIM1 + GPIOE clocks. */
+  /* Buzzer last — depends on TIM1 + GPIOE clocks. The two-tone "boot done"
+     beep is removed: logger has been past Phase-2 bring-up for weeks, and
+     the antenna-test build needs the buzzer silent at boot so it can use
+     it for the sat-count signal pattern instead. */
   Buzzer_Init();
-  Buzzer_BootDone();
 
   /* Hand-off: red off, green on. From here on the scheduler drives
      everything via SysTick. */
@@ -80,7 +82,12 @@ int main(void)
 
   pl_fx_status_t sd_rc = SDFat_Mount();
   if (sd_rc != PL_FX_OK) {
-    beep_pattern(800, 4, 200, 200);
+    /* No SD card = no logging = useless box. Treat as fatal: red LED
+       on solid + green off + long beep, then halt. The operator must
+       NOT be able to start a pumpfoil session and discover hours later
+       that the SD slot was empty — same failure mode as forgetting
+       the film in a camera. Hard halt, no second chance. */
+    Error_Handler(__FILE__, __LINE__);
   } else {
     Buzzer_Beep(3000U, 60U);
     ErrLog_Init();
@@ -136,8 +143,39 @@ int main(void)
     GPS_Tick();
     BLE_Tick();
 
-    if (sched_due(PL_SCHED_LED, PL_CADENCE_LED_BLINK)) {
-      HAL_GPIO_TogglePin(PL_LED_GREEN_PORT, PL_LED_GREEN_PIN);
+    /* Green-LED pattern based on GPS fix quality. Phase advances every
+       125 ms; eight 125 ms slots = one second per cycle. Pattern table:
+         NONE: 1 1 1 1 0 0 0 0  → slow blink (500 ms on / 500 ms off)
+         WEAK: 1 0 1 0 0 0 0 0  → double flash (4-6 sats)
+         GOOD: 1 0 1 0 1 0 0 0  → triple flash (≥7 sats)
+       The slow-blink case is identical in feel to the pre-Build-#49
+       LED — so when GPS isn't fixed yet (boot, indoors, etc.) the
+       operator sees the familiar "logger alive" heartbeat. Adding
+       a 2nd / 3rd flash means GPS is actually producing valid fixes,
+       letting the operator drop the dedicated GPS module LEDs to save
+       power without losing GPS-status feedback. */
+    if (sched_due(PL_SCHED_LED, PL_CADENCE_LED_PHASE)) {
+      static const uint8_t LED_PATTERN[3][8] = {
+        { 1, 1, 1, 1, 0, 0, 0, 0 },   /* PL_GPS_QUALITY_NONE */
+        { 1, 0, 1, 0, 0, 0, 0, 0 },   /* PL_GPS_QUALITY_WEAK */
+        { 1, 0, 1, 0, 1, 0, 0, 0 },   /* PL_GPS_QUALITY_GOOD */
+      };
+      static uint8_t led_phase = 0;
+      pl_gps_quality_t q = GPS_LastFixQuality();
+      if (q > PL_GPS_QUALITY_GOOD) q = PL_GPS_QUALITY_GOOD;
+      HAL_GPIO_WritePin(PL_LED_GREEN_PORT, PL_LED_GREEN_PIN,
+                        LED_PATTERN[q][led_phase] ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      led_phase = (uint8_t)((led_phase + 1u) & 0x07u);
+    }
+
+    /* Red LED solid-on as soon as ErrLog latches a '***' warning. The
+       operator notices something needs attention without needing to
+       pull the SD card mid-session. Once latched stays latched until
+       reset — single transition per boot, no LED flicker. Green keeps
+       blinking so the operator can tell "warning + still running"
+       apart from the fatal-Error_Handler case ("warning + green dark"). */
+    if (ErrLog_WarningLatched()) {
+      HAL_GPIO_WritePin(PL_LED_RED_PORT, PL_LED_RED_PIN, GPIO_PIN_SET);
     }
 
     sched_wait_next_tick();
@@ -260,8 +298,18 @@ void SystemClock_Config(void)
 void Error_Handler(const char *file, int line)
 {
   (void)file; (void)line;
+  /* Fatal-error LED+buzzer convention (DESIGN.md §11-ish):
+       red LED on solid + green LED dark → "the box is dead, check errlog"
+       one long low-frequency beep → audible even if the box is in a
+       rucksack or you're not looking at it.
+     Order matters: beep + LED updates BEFORE __disable_irq, because
+     Buzzer_Beep uses HAL_Delay which spins on SysTick and would hang
+     forever once interrupts are off. Once the alarm has sounded we
+     disable IRQs and park the CPU. */
+  HAL_GPIO_WritePin(PL_LED_RED_PORT,   PL_LED_RED_PIN,   GPIO_PIN_SET);
+  HAL_GPIO_WritePin(PL_LED_GREEN_PORT, PL_LED_GREEN_PIN, GPIO_PIN_RESET);
+  Buzzer_Beep(800U, 800U);          /* 800 Hz, 0.8 s = unmistakable alarm */
   __disable_irq();
-  HAL_GPIO_WritePin(PL_LED_RED_PORT, PL_LED_RED_PIN, GPIO_PIN_SET);
   for (;;) {}
 }
 

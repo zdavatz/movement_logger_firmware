@@ -15,6 +15,7 @@
 #include "sensors_baro.h"
 #include "sensors_fuel.h"
 #include "gps.h"
+#include "buzzer.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -171,9 +172,40 @@ void Logger_Tick(void)
     PL_GpsFix f;
     if (GPS_GetLatestFix(&f) == 0) {
       g_last_gps = f;
-      emit_gps_row(&f);
+      /* Only write to GpsNNN.csv when the fix is actually valid. GGA
+         alone bumps the update flag (parse_gga sets g_updated=1 even
+         with fix_q=0), so without this filter every disconnected
+         antenna or open-sky-blocked moment writes "ghost" rows with
+         the last-known lat/lon and nsat=0 / hdop=99.9 — confusing the
+         visualisation tools that interpret each row as a real fix. */
+      if (f.fix_q > 0) emit_gps_row(&f);
     }
   }
+
+#if PL_GPS_ANTENNA_BEEP
+  /* Antenna-test mode: every 10 s beep N times where N = satellites in
+     fix. Direct audio feedback while swapping antennas — more sats =
+     better antenna. Build with `make GPS_ANTENNA_BEEP=1`. Blocks
+     Logger_Tick for ~N*140ms during the beep burst, which is fine for
+     a transient test build (we're not chasing 100 Hz IMU here, we're
+     listening to the buzzer). Default off so production logging
+     stays silent. */
+  static uint32_t s_last_ant_beep_ms = 0;
+  uint32_t now_ant = HAL_GetTick();
+  if (now_ant - s_last_ant_beep_ms >= 10000) {
+    s_last_ant_beep_ms = now_ant;
+    uint8_t n = g_last_gps.num_sat;
+    if (n > 16) n = 16;                  /* cap so worst case stays ~2 s */
+    if (g_last_gps.fix_q > 0 && n > 0) {
+      /* 100 ms beep + 250 ms gap = 350 ms per "count tick" → 10 sats =
+         3.5 s burst. Slow enough for the ear to count. */
+      for (uint8_t i = 0; i < n; i++) {
+        Buzzer_Beep(2000, 100);
+        HAL_Delay(250);
+      }
+    }
+  }
+#endif
 
   if (sched_due(PL_SCHED_BATTERY, PL_CADENCE_BATTERY)) {
     PL_FuelSample fuel;
@@ -203,6 +235,22 @@ void Logger_Tick(void)
     ErrLog_Writef("gps_diag: bytes=%lu lines_good=%lu lines_bad=%lu rmc=%lu gga=%lu errors=%lu",
                   (unsigned long)b, (unsigned long)lg, (unsigned long)lb,
                   (unsigned long)rmc, (unsigned long)gga, (unsigned long)err);
+
+    /* One-shot loud marker if GPS communication is fundamentally broken.
+       Fires once per boot at 30 s if lines_good is still 0 — the
+       deliberate hand-signal that "the GPS file will be empty, go look
+       at the module / wiring / baud rate, the firmware can't see NMEA".
+       No retry logic on purpose: a retry path is hard to test reliably
+       and a loud error marker is enough to drive the human to fix the
+       root cause (factory-reset the module, check wires, etc.). */
+    static uint8_t s_gps_broken_announced = 0;
+    if (!s_gps_broken_announced && now_diag >= 30000 && lg == 0) {
+      s_gps_broken_announced = 1;
+      ErrLog_Writef("*** GPS NO NMEA: %lus, 0 lines parsed (bytes=%lu errors=%lu) ***",
+                    (unsigned long)(now_diag / 1000),
+                    (unsigned long)b, (unsigned long)err);
+      ErrLog_Writef("*** module is sending, we can't decode — check UART baud/wiring ***");
+    }
   }
 }
 

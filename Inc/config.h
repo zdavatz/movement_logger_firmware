@@ -51,7 +51,7 @@
 #define PL_TICK_HZ             1000U         /* SysTick @ 1 ms */
 
 /* Task cadences (in ticks). Tasks run when `(tick_count % CADENCE) == 0`.   */
-#define PL_CADENCE_LED_BLINK   500U          /* heartbeat LED toggle = 0.5 Hz */
+#define PL_CADENCE_LED_PHASE   125U          /* LED pattern phase tick — 8 phases × 125 ms = 1 s cycle. Pattern table in main.c encodes single (no-fix) / double (weak) / triple (good) GPS-quality flash. */
 #define PL_CADENCE_SENSOR      10U           /* 100 Hz sensor sample */
 #define PL_CADENCE_BARO        40U           /* 25 Hz baro/temp poll */
 #define PL_CADENCE_GPS_POLL    50U           /* drain GPS DMA every 50 ms */

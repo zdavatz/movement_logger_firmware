@@ -33,4 +33,15 @@ uint8_t GPS_FixUpdated(void);
 void GPS_GetStats(uint32_t *bytes, uint32_t *lines_good, uint32_t *lines_bad,
                   uint32_t *rmc, uint32_t *gga, uint32_t *errors);
 
+/* GPS fix-quality summary, used to drive the green-LED pattern (single /
+   double / triple flash). Returns NONE if the latest valid-status RMC
+   is older than ~3 s — i.e. signal lost mid-session goes back to
+   "no fix" pattern instead of latching the previous good state. */
+typedef enum {
+  PL_GPS_QUALITY_NONE = 0,
+  PL_GPS_QUALITY_WEAK = 1,        /* 4–6 sats */
+  PL_GPS_QUALITY_GOOD = 2,        /* ≥7 sats */
+} pl_gps_quality_t;
+pl_gps_quality_t GPS_LastFixQuality(void);
+
 #endif

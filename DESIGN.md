@@ -558,17 +558,19 @@ loop maskiert exactly the hang the watchdog is meant to catch.
 
 | State machine | File | Deadline? | Emergency exit? | Errlog? |
 |---|---|---|---|---|
-| BLE READ chunking | `ble.c` | ❌ | ❌ | ❌ |
-| BLE LIST emission | `ble.c` | ❌ | ❌ | ❌ |
-| BLE notify retry | `ble.c` | ❌ (count-based, with `Watchdog_Kick`!) | ❌ | ❌ |
+| BLE READ chunking | `ble.c` | ✅ 60 s total / 5 s stall | ✅ `fsm_emergency_exit` + close file | ✅ `fsm: <name> aborted code=N` |
+| BLE LIST emission | `ble.c` | ⚠️ bounded by root-dir size | ✅ notify-fail aborts enumeration | ✅ `fsm: LIST aborted` |
+| BLE notify retry | `ble.c` | ✅ 50 ms (FSM) / 500 ms (one-shot) | ✅ returns -1 to caller | ⚠️ via caller |
 | FAT cluster-alloc scan | `sd_fatfs.c` | ⚠️ implicit O(N) | ❌ | ❌ |
 | GPS UBX init wait-ack | `gps.c` | ✅ 200 ms | ✅ NAK/TO marker | ✅ |
 | Logger_Tick cadence | `logger.c` | n/a (no loop) | n/a | n/a |
 | SD `HAL_SD_WriteBlocks` | HAL | ✅ HAL timeout | ⚠️ HAL-internal reset | ⚠️ partial |
 
-Anything ❌ or ⚠️ is on the Phase-8 hardening list. The READ /
-LIST / notify-retry triplet is the first batch — see issue tracker
-task #14.
+Status as of build #40 (2026-05-15): the READ / LIST / notify-retry
+triplet that motivated this section is now compliant. FAT cluster-alloc
+is the next candidate — its current O(N) bound is fine at our cluster
+counts (few tens) but a deliberate deadline would future-proof it
+against a fragmented multi-GB card.
 
 ### Convention for adding a new state machine
 

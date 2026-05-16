@@ -37,9 +37,16 @@ BUILD_COUNTER := $(shell \
   echo $$N > $(BUILD_COUNTER_FILE); \
   echo $$N)
 
+# Antenna-test build flag — when set to 1, Logger_Tick beeps N times every
+# 10 s with N = satellites in fix. Direct audio feedback for swapping GPS
+# antennas without needing the GUI. Default 0 (production: silent buzzer).
+# Override per build: `make GPS_ANTENNA_BEEP=1`.
+GPS_ANTENNA_BEEP ?= 0
+
 CFLAGS = $(CPU) $(DEFS) $(INCLUDES) -O2 -Wall -Wno-format -Wno-unused-function \
          -fdata-sections -ffunction-sections -g3 \
-         -DPL_BUILD_NUM=$(BUILD_COUNTER)
+         -DPL_BUILD_NUM=$(BUILD_COUNTER) \
+         -DPL_GPS_ANTENNA_BEEP=$(GPS_ANTENNA_BEEP)
 
 LDSCRIPT = STM32U585AIIXQ_FLASH.ld
 LDFLAGS  = $(CPU) -T$(LDSCRIPT) -Wl,--gc-sections \

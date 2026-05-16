@@ -385,21 +385,29 @@ static int ble_notify(uint16_t val_handle, const uint8_t *data, uint16_t len)
   return ble_aci_cmd(ACI_OP_GATT_SRV_NOTIFY, p, (uint16_t)i, NULL, 0);
 }
 
-/* Notify with congestion handling. The BlueNRG-LP TX buffer holds only a
-   handful of pending notifications; once full, aci_gatt_srv_notify returns
-   non-zero (INSUFFICIENT_RESOURCES). We back off + retry the SAME payload —
-   the radio drains a packet roughly every connection interval. The IWDG is
-   kicked each retry so a large transfer doesn't trip the 8 s watchdog.
-   Returns 0 on success, -1 if it never drains within the retry budget. */
-static int ble_notify_blocking(uint16_t val_handle, const uint8_t *data, uint16_t len)
+/* Notify with bounded congestion handling. The BlueNRG-LP TX buffer holds
+   only a handful of pending notifications; once full, aci_gatt_srv_notify
+   returns non-zero (INSUFFICIENT_RESOURCES). We back off + retry the SAME
+   payload for at most `max_ms` of wall-clock time — the radio drains a
+   packet roughly every connection interval (typical 30 ms on macOS).
+   Returns 0 on success, -1 on timeout.
+
+   Deliberately NO Watchdog_Kick here. State-machine-robustness rule
+   (DESIGN.md Section 11): a retry loop must not pet the watchdog. If the
+   bus is genuinely stuck, IWDG (2 s) must be allowed to fire — masking
+   that defeats the safety net. The caller is responsible for picking
+   max_ms low enough that the total time inside BLE_Tick stays below the
+   IWDG budget. */
+static int ble_notify_try(uint16_t val_handle, const uint8_t *data,
+                          uint16_t len, uint32_t max_ms)
 {
-  for (int retry = 0; retry < 400; retry++) {
+  uint32_t t0 = HAL_GetTick();
+  for (;;) {
     int rc = ble_notify(val_handle, data, len);
     if (rc == 0) return 0;
-    Watchdog_Kick();
-    HAL_Delay(10);   /* let the radio push one packet out */
+    if (HAL_GetTick() - t0 >= max_ms) return -1;
+    HAL_Delay(1);                                 /* tight poll — drain is fast */
   }
-  return -1;
 }
 
 /* ----- FileSync command handling ----------------------------------------- */
@@ -411,16 +419,138 @@ static uint8_t  g_cmd_len     = 0;
 static uint8_t  g_cmd_pending = 0;
 
 /* LIST: one notification per root-dir entry, "name,size\n", then a lone
-   "\n" terminator. Callback runs inside SDFat_ListRoot's walk. */
+   "\n" terminator. Callback runs inside SDFat_ListRoot's walk. Returns
+   non-zero to abort enumeration if a notify fails — keeps LIST bounded
+   when the peer goes silent. */
 static int list_emit_cb(const char *name, uint32_t size, void *user)
 {
   (void)user;
   char row[40];
   int n = snprintf(row, sizeof(row), "%s,%lu\n", name, (unsigned long)size);
-  if (n > 0) {
-    ble_notify_blocking(g_filedata_handle + 1, (const uint8_t *)row, (uint16_t)n);
+  if (n <= 0) return 0;
+  if (ble_notify_try(g_filedata_handle + 1, (const uint8_t *)row, (uint16_t)n, 500) != 0) {
+    ErrLog_Write("fsm: LIST aborted code=2 why=notify-stalled");
+    return 1;   /* abort enumeration */
   }
-  return 0;   /* continue enumeration */
+  return 0;
+}
+
+/* ----- READ state-machine ------------------------------------------------ */
+
+/* Per DESIGN.md Section 11 (locked 2026-05-15): every long-running
+   operation that risks blocking BLE_Tick must run as a state machine with
+   per-state deadline, defined emergency-exit path, and errlog context.
+
+   READ is the only operation big enough to warrant this — files can be
+   hundreds of KB and a single transfer means thousands of notify calls.
+   LIST and DELETE stay one-shot (bounded by SD root-dir size). */
+
+/* Exit codes for emergency exits — same enum as DESIGN.md Section 11. */
+#define SM_OK          0
+#define SM_TIMEOUT     1
+#define SM_PEER_GONE   2
+#define SM_IO_ERROR    3
+#define SM_BAD_STATE   4
+
+/* Per-state deadlines. READ_DEADLINE is generous (1 MB at ~17 KB/s ≈
+   60 s); STALL_DEADLINE catches a vanished peer within seconds. Both
+   measured in HAL ticks (1 ms). */
+#define FSM_READ_DEADLINE_MS    60000
+#define FSM_STALL_DEADLINE_MS    5000
+
+/* Per-chunk notify budget INSIDE fsm_advance. Short on purpose: each
+   BLE_Tick may eat at most this much wall-clock so Logger_Tick stays
+   responsive. Typical macOS connection interval is 30 ms; 50 ms is
+   one comfortable interval of retry. Failed sends just retry next tick. */
+#define FSM_NOTIFY_BUDGET_MS      50
+
+typedef enum { FSM_IDLE = 0, FSM_READ_STREAM } fsm_state_t;
+
+static struct {
+  fsm_state_t state;
+  uint32_t    entered_tick;
+  uint32_t    last_progress_tick;
+  PL_File     f;
+  uint32_t    sent;                 /* bytes notified to host so far */
+  uint32_t    file_size;            /* total size, for done-marker */
+  char        name[16];
+  uint8_t     buf[20];              /* current chunk in flight */
+  uint16_t    buf_len;              /* 0 = need to read fresh next call */
+} g_fsm;
+
+static void fsm_emergency_exit(int code, const char *why)
+{
+  uint32_t held_ms = HAL_GetTick() - g_fsm.entered_tick;
+  char buf[96];
+  snprintf(buf, sizeof(buf), "fsm: %s aborted code=%d ms=%lu sent=%lu why=%s",
+           g_fsm.name, code, (unsigned long)held_ms,
+           (unsigned long)g_fsm.sent, why);
+  ErrLog_Write(buf);
+  if (g_fsm.state == FSM_READ_STREAM) {
+    SDFat_Close(&g_fsm.f);
+  }
+  /* Best-effort status byte. If the peer is genuinely gone the send
+     fails fast (500 ms cap) and we don't care. */
+  if (g_conn_handle != 0) {
+    uint8_t st = (code == SM_IO_ERROR) ? FSYNC_ST_IO_ERROR :
+                 (code == SM_BAD_STATE) ? FSYNC_ST_BAD_REQ :
+                                          FSYNC_ST_IO_ERROR;
+    ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+  }
+  g_fsm.state = FSM_IDLE;
+}
+
+static void fsm_advance(void)
+{
+  if (g_fsm.state == FSM_IDLE) return;
+
+  uint32_t now = HAL_GetTick();
+
+  /* Deadline checks first — fail fast, before any work. */
+  if (now - g_fsm.entered_tick >= FSM_READ_DEADLINE_MS) {
+    fsm_emergency_exit(SM_TIMEOUT, "deadline");
+    return;
+  }
+  if (now - g_fsm.last_progress_tick >= FSM_STALL_DEADLINE_MS) {
+    fsm_emergency_exit(SM_PEER_GONE, "stall");
+    return;
+  }
+  if (g_conn_handle == 0) {
+    fsm_emergency_exit(SM_PEER_GONE, "disconnect");
+    return;
+  }
+
+  /* Read next chunk if our retry buffer is empty. */
+  if (g_fsm.buf_len == 0) {
+    uint32_t got = 0;
+    pl_fx_status_t s = SDFat_Read(&g_fsm.f, g_fsm.buf, sizeof(g_fsm.buf), &got);
+    if (s != PL_FX_OK) {
+      fsm_emergency_exit(SM_IO_ERROR, "sdread");
+      return;
+    }
+    if (got == 0) {
+      /* Clean EOF. */
+      char msg[96];
+      snprintf(msg, sizeof(msg), "fsm: %s done sent=%lu size=%lu",
+               g_fsm.name, (unsigned long)g_fsm.sent,
+               (unsigned long)g_fsm.file_size);
+      ErrLog_Write(msg);
+      SDFat_Close(&g_fsm.f);
+      g_fsm.state = FSM_IDLE;
+      return;
+    }
+    g_fsm.buf_len = (uint16_t)got;
+  }
+
+  /* Try once to send the buffered chunk. On congestion just leave the
+     buffer in place — next BLE_Tick comes around fast and tries again. */
+  if (ble_notify_try(g_filedata_handle + 1, g_fsm.buf, g_fsm.buf_len,
+                     FSM_NOTIFY_BUDGET_MS) != 0) {
+    return;
+  }
+  g_fsm.sent              += g_fsm.buf_len;
+  g_fsm.buf_len            = 0;
+  g_fsm.last_progress_tick = now;
 }
 
 static void ble_process_command(void)
@@ -432,13 +562,20 @@ static void ble_process_command(void)
   uint8_t op = g_cmd_buf[0];
   char buf[64];
 
+  /* Log every incoming opcode immediately — earlier builds only logged
+     LIST, so a missing READ trace meant "did the GUI even send it?" was
+     unanswerable. Now any opcode lands in the errlog before dispatch. */
+  snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x len=%u",
+           op, (unsigned)g_cmd_len);
+  ErrLog_Write(buf);
+
   if (op == FSYNC_OP_LIST) {
     snprintf(buf, sizeof(buf), "ble: cmd LIST conn=0x%04x fdh=0x%04x",
              g_conn_handle, (uint16_t)(g_filedata_handle + 1));
     ErrLog_Write(buf);
     SDFat_ListRoot(list_emit_cb, NULL);
     uint8_t term = '\n';
-    int rc = ble_notify_blocking(g_filedata_handle + 1, &term, 1);
+    int rc = ble_notify_try(g_filedata_handle + 1, &term, 1, 500);
     snprintf(buf, sizeof(buf), "ble: LIST done term_rc=%d", rc);
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_READ) {
@@ -446,17 +583,34 @@ static void ble_process_command(void)
        4-byte little-endian start offset. Offset absent → 0 → whole file.
        A resumed transfer after a dropped link passes offset = bytes the
        host already has. Streams raw file bytes; NOT_FOUND / IO_ERROR /
-       BAD_REQUEST come back as a single status byte instead. */
+       BAD_REQUEST / BUSY come back as a single status byte instead.
+
+       Initiates the READ state machine; actual chunk streaming runs in
+       fsm_advance() over many BLE_Ticks. Returning fast here keeps the
+       main loop responsive while a multi-MB transfer is in flight. */
+
+    /* Refuse a new READ if one is already in flight — host should wait
+       for FSM completion (or disconnect, which will abort and free us). */
+    if (g_fsm.state != FSM_IDLE) {
+      uint8_t st = FSYNC_ST_BUSY;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+      ErrLog_Write("ble: READ busy — fsm already active");
+      return;
+    }
+
     char     name[16];
     uint32_t offset = 0;
 
     if (g_cmd_len <= 1) {
-      /* TEST SHORTCUT: a bare 0x02 reads a fixed default file at offset 0.
-         nRF Connect Mobile caps the hex-write field at 16 chars, too short
-         for "02 <name> 00 <4-byte offset>". Real clients send the full
-         command. Remove or repurpose in Phase 8. */
-      strcpy(name, "BAT000.CSV");
-      ErrLog_Write("ble: READ (test shortcut → BAT000.CSV @0)");
+      /* Bare 0x02 with no filename is malformed by spec — reject. The
+         pre-Phase-8 builds had a "bare 0x02 → BAT000.CSV" test shortcut
+         here for nRF Connect Mobile's 16-char input limit, removed
+         in production: real clients always send the full opcode +
+         NUL-terminated name + optional 4-byte offset. */
+      uint8_t st = FSYNC_ST_BAD_REQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+      ErrLog_Write("ble: READ bad request (no filename)");
+      return;
     } else {
       /* Locate the NUL terminator inside g_cmd_buf[1 .. g_cmd_len-1]. */
       int nul = -1;
@@ -480,7 +634,7 @@ static void ble_process_command(void)
       }
       if (nlen == 0 || nlen > sizeof(name) - 1) {
         uint8_t st = FSYNC_ST_BAD_REQ;
-        ble_notify(g_filedata_handle + 1, &st, 1);
+        ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
         ErrLog_Write("ble: READ bad request");
         return;
       }
@@ -488,68 +642,54 @@ static void ble_process_command(void)
       name[nlen] = '\0';
     }
 
-    PL_File f;
-    pl_fx_status_t s = SDFat_OpenRead(&f, name);
+    /* Open + optional seek synchronously — these are cheap (one or two
+       SD reads each). The streaming loop is what becomes async. */
+    PL_File f_open;
+    pl_fx_status_t s = SDFat_OpenRead(&f_open, name);
     if (s != PL_FX_OK) {
       uint8_t st = (s == PL_FX_ERR_NOT_FOUND) ? FSYNC_ST_NOT_FOUND
                                               : FSYNC_ST_IO_ERROR;
-      ble_notify(g_filedata_handle + 1, &st, 1);
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
       snprintf(buf, sizeof(buf), "ble: READ '%s' open fail s=%d", name, s);
       ErrLog_Write(buf);
       return;
     }
+    if (offset > 0) SDFat_Seek(&f_open, offset);
 
-    if (offset > 0) SDFat_Seek(&f, offset);
+    /* Hand the open file + metadata to the state machine; fsm_advance
+       will stream chunk-by-chunk in subsequent BLE_Ticks. */
+    memset(&g_fsm, 0, sizeof(g_fsm));
+    g_fsm.state              = FSM_READ_STREAM;
+    g_fsm.f                  = f_open;
+    g_fsm.entered_tick       = HAL_GetTick();
+    g_fsm.last_progress_tick = g_fsm.entered_tick;
+    g_fsm.file_size          = f_open.size;
+    memcpy(g_fsm.name, name, sizeof(g_fsm.name));
 
-    snprintf(buf, sizeof(buf), "ble: READ '%s' off=%lu size=%lu",
-             name, (unsigned long)offset, (unsigned long)f.size);
-    ErrLog_Write(buf);
-
-    /* 20-byte chunks — safe under the default 23-byte ATT MTU. A future
-       build can negotiate a larger MTU and use bigger chunks. */
-    uint8_t  chunk[20];
-    uint32_t sent = 0;                             /* bytes streamed this call */
-    int      fail = 0;
-    for (;;) {
-      uint32_t got = 0;
-      if (SDFat_Read(&f, chunk, sizeof(chunk), &got) != PL_FX_OK) { fail = 1; break; }
-      if (got == 0) break;                         /* EOF */
-      if (ble_notify_blocking(g_filedata_handle + 1, chunk, (uint16_t)got) != 0) {
-        fail = 1; break;                           /* TX never drained */
-      }
-      sent += got;
-      Watchdog_Kick();                             /* keep IWDG happy on big files */
-    }
-    SDFat_Close(&f);
-    snprintf(buf, sizeof(buf), "ble: READ '%s' done off=%lu sent=%lu size=%lu%s",
-             name, (unsigned long)offset, (unsigned long)sent,
-             (unsigned long)f.size, fail ? " FAIL" : "");
+    snprintf(buf, sizeof(buf), "fsm: READ '%s' start off=%lu size=%lu",
+             name, (unsigned long)offset, (unsigned long)f_open.size);
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_DELETE) {
-    /* DELETE <name>: free the file's clusters + mark the dir entry deleted.
-       Reply is a single status byte on FileData. Same 16-char nRF input
-       limit applies → a bare 0x03 deletes a fixed test file. */
+    /* DELETE <name>: free the file's clusters + mark the dir entry
+       deleted. Reply is a single status byte on FileData. The bare-0x03
+       test shortcut (→ GPS000.CSV) was removed in Phase 8; a real
+       client always sends opcode + name. */
     char name[16];
     uint8_t nlen = (g_cmd_len > 1) ? (uint8_t)(g_cmd_len - 1) : 0;
-    if (nlen == 0) {
-      strcpy(name, "GPS000.CSV");          /* TEST SHORTCUT */
-      nlen = (uint8_t)strlen(name);
-      ErrLog_Write("ble: DELETE (test shortcut → GPS000.CSV)");
-    } else if (nlen > sizeof(name) - 1) {
+    if (nlen == 0 || nlen > sizeof(name) - 1) {
       uint8_t st = FSYNC_ST_BAD_REQ;
-      ble_notify_blocking(g_filedata_handle + 1, &st, 1);
-      ErrLog_Write("ble: DELETE bad request");
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: DELETE bad request (no/too-long filename)");
       return;
-    } else {
-      memcpy(name, &g_cmd_buf[1], nlen);
-      name[nlen] = '\0';
     }
+    memcpy(name, &g_cmd_buf[1], nlen);
+    name[nlen] = '\0';
 
     pl_fx_status_t s = SDFat_Delete(name);
     uint8_t st = (s == PL_FX_OK)              ? FSYNC_ST_OK
                : (s == PL_FX_ERR_NOT_FOUND)   ? FSYNC_ST_NOT_FOUND
                                               : FSYNC_ST_IO_ERROR;
-    ble_notify_blocking(g_filedata_handle + 1, &st, 1);
+    ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
     snprintf(buf, sizeof(buf), "ble: DELETE '%s' s=%d st=0x%02x", name, s, st);
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_STOP_LOG) {
@@ -1011,6 +1151,11 @@ void BLE_Tick(void)
   ble_stream_tick();
   ble_battery_tick();
 
+  /* Drive the FileSync state machine — one chunk of work per tick, with
+     internal deadline + stall + disconnect guards. Runs unconditionally
+     (not gated on irq_high) so progress happens even on quiet links. */
+  fsm_advance();
+
   if (!irq_high()) return;
 
   uint8_t evt[260];
@@ -1044,6 +1189,13 @@ void BLE_Tick(void)
       g_conn_handle        = 0;
       g_stream_subscribed  = 0;
       g_battery_subscribed = 0;
+      /* Tear down any in-flight READ — frees the SD file handle + writes
+         an "aborted code=2" marker to the errlog so we know post-mortem
+         why the transfer ended. fsm_advance would catch this too on
+         next tick, but doing it here closes the file in the same tick. */
+      if (g_fsm.state != FSM_IDLE) {
+        fsm_emergency_exit(SM_PEER_GONE, "disconnect");
+      }
       /* Re-arm advertising — the chip stopped it on connect and won't
          resume on its own. Without this the box is invisible to any
          further connection attempt. */

@@ -30,4 +30,12 @@ void ErrLog_Heartbeat(void);
 /* Flush whatever is buffered to SD. */
 void ErrLog_Flush(void);
 
+/* Warning latch — set to 1 the first time ErrLog_Write is called with a
+   line starting with '***' (the convention for prominent errlog
+   markers). Main loop reads this to drive the red LED on solid, so an
+   operator sees "something significant happened, check the errlog"
+   without needing to pull the SD card during a session. One-shot per
+   boot — once latched, stays latched until reset. */
+uint8_t ErrLog_WarningLatched(void);
+
 #endif
