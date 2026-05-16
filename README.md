@@ -10,9 +10,14 @@ Bare-metal firmware for the **STEVAL-MKBOXPRO Rev_C** (SensorTile.box PRO) runni
 - **[DESIGN.md](DESIGN.md)** — *how* (GATT UUIDs, FileSync wire protocol, SensorStream byte layout, HCI command sequence, on-SD CSV schemas).
 - **[CLAUDE.md](CLAUDE.md)** — invariants, hard rules, and gotchas accumulated during bring-up. Worth reading before making non-trivial changes.
 
-## Hardware target
+## Supported hardware
 
-STEVAL-MKBOXPRO Rev_C only. MCU: STM32U585AIIxQ (Cortex-M33 @ 160 MHz, HSI→PLL). BLE: BlueNRG-LP on SPI1, polled (EXTI11 intentionally unused — see CLAUDE.md). Sensors: LSM6DSV16X / LIS2MDL / LPS22DF / STTS22H / STC3115 / u-blox MAX-M10S GPS.
+**STMicroelectronics STEVAL-MKBOXPRO (SensorTile.box PRO), Rev_C only.**
+
+- Buy: [st.com — STEVAL-MKBOXPRO](https://www.st.com/en/evaluation-tools/steval-mkboxpro.html) (also available from Mouser, DigiKey, Farnell and other ST distributors)
+- Rev_A/B and STWIN.box are **not** supported — they stay on the old firmware tree.
+
+MCU: STM32U585AIIxQ (Cortex-M33 @ 160 MHz, HSI→PLL). BLE: BlueNRG-LP on SPI1, polled (EXTI11 intentionally unused — see CLAUDE.md). Sensors: LSM6DSV16X / LIS2MDL / LPS22DF / STTS22H / STC3115 / u-blox MAX-M10S GPS. Power: Li-Po + wireless charging; Hall sensor + magnet wired as a hardware supply-rail interrupter (no MCU sleep modes).
 
 ## Build
 
