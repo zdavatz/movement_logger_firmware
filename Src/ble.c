@@ -136,6 +136,13 @@ static uint16_t          g_battery_handle  = 0;
 /* Current connection handle (0 = no active connection). Set in BLE_Tick on
    HCI_LE_Connection_Complete; cleared on Disconnection_Complete. */
 static uint16_t          g_conn_handle     = 0;
+/* Negotiated ATT MTU for the active connection. Default 23 (=20-byte
+   notify payload) per BLE spec; updated to actual negotiated value
+   when the BlueNRG-LP emits ACI_ATT_EXCHANGE_MTU_RESP_EVENT (0x0C17)
+   after a client kicks off MTU exchange. fsm_advance uses (mtu-3) as
+   the chunk size when it's > 20, giving up to ~12× the throughput on
+   clients that negotiate larger MTUs (typical iOS/macOS: 247). */
+static volatile uint16_t g_att_mtu         = 23;
 
 /* SensorStream: emitted only while a client has subscribed to its CCCD.
    No mode switch — SD logging runs regardless (DESIGN.md Section 2/3). */
@@ -455,8 +462,16 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
 /* Per-state deadlines. READ_DEADLINE is generous (1 MB at ~17 KB/s ≈
    60 s); STALL_DEADLINE catches a vanished peer within seconds. Both
    measured in HAL ticks (1 ms). */
-#define FSM_READ_DEADLINE_MS    60000
-#define FSM_STALL_DEADLINE_MS    5000
+/* Bumped 2026-05-16 after a real-life sync test aborted SENS000.CSV
+   (332 KB at ~3 KB/s) with the old 60 s deadline at 60% progress.
+   Files easily reach 1+ MB after long sessions; a 10-minute budget
+   covers realistic worst-case sustained-3 KB/s transfers.
+   Stall-deadline lifted from 5 s → 15 s to ride out macOS Bluetooth
+   power-management hiccups without false "stall" aborts. Real
+   peer-gone (disconnect / out-of-range) still gets caught within
+   reason, just slightly slower. */
+#define FSM_READ_DEADLINE_MS   600000
+#define FSM_STALL_DEADLINE_MS   15000
 
 /* Per-chunk notify budget INSIDE fsm_advance. Short on purpose: each
    BLE_Tick may eat at most this much wall-clock so Logger_Tick stays
@@ -474,9 +489,31 @@ static struct {
   uint32_t    sent;                 /* bytes notified to host so far */
   uint32_t    file_size;            /* total size, for done-marker */
   char        name[16];
-  uint8_t     buf[20];              /* current chunk in flight */
+  uint8_t     buf[244];             /* current chunk in flight; sized for max ATT MTU (247-3) */
   uint16_t    buf_len;              /* 0 = need to read fresh next call */
 } g_fsm;
+
+/* Force the chip to drop the current connection. Fire-and-forget — the
+   chip responds with Command Status (0x0F) not Command Complete, so
+   we don't bother waiting via ble_hci_cmd. The actual disconnect lands
+   asynchronously, and the existing Disconnection_Complete event handler
+   (BLE_Tick, code 0x05) then re-arms advertising via ble_adv_enable.
+   Called from fsm_emergency_exit to recover from "stall" cases where
+   macOS quietly stopped acking but the chip's LL supervision timeout
+   hasn't fired yet — without this the box stays connected-in-limbo
+   and never re-advertises, becoming invisible to nRF / GUI. */
+static int ble_hci_disconnect(uint16_t conn_handle, uint8_t reason)
+{
+  uint8_t frame[7];
+  frame[0] = 0x01;                                 /* HCI command type */
+  frame[1] = 0x06;                                 /* opcode 0x0406 lo */
+  frame[2] = 0x04;                                 /* opcode 0x0406 hi */
+  frame[3] = 0x03;                                 /* plen */
+  frame[4] = (uint8_t)(conn_handle & 0xFF);
+  frame[5] = (uint8_t)(conn_handle >> 8);
+  frame[6] = reason;
+  return ble_hci_send(frame, sizeof(frame));
+}
 
 static void fsm_emergency_exit(int code, const char *why)
 {
@@ -490,12 +527,33 @@ static void fsm_emergency_exit(int code, const char *why)
     SDFat_Close(&g_fsm.f);
   }
   /* Best-effort status byte. If the peer is genuinely gone the send
-     fails fast (500 ms cap) and we don't care. */
+     fails fast (50 ms cap) and we don't care. */
   if (g_conn_handle != 0) {
     uint8_t st = (code == SM_IO_ERROR) ? FSYNC_ST_IO_ERROR :
                  (code == SM_BAD_STATE) ? FSYNC_ST_BAD_REQ :
                                           FSYNC_ST_IO_ERROR;
     ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+  }
+  /* Recovery for the "stall" / "deadline" / "sdread" cases: if our local
+     g_conn_handle is still set, the chip thinks the connection is
+     alive — we need to actively tear it down AND re-arm advertising.
+     Build #56 only sent HCI_Disconnect and relied on the chip to emit
+     Disconnection_Complete back — but in real-world testing (Mac BT
+     toggled off), the chip never raised that event, so re-advertising
+     never fired and the box stayed invisible. Build #57 belt-and-
+     suspenders: HCI_Disconnect AND a direct local re-arm without
+     waiting for any chip event. */
+  if (g_conn_handle != 0) {
+    uint16_t ch = g_conn_handle;
+    int hd_rc  = ble_hci_disconnect(ch, 0x13);       /* reason: Remote User */
+    HAL_Delay(500);                                  /* give chip time to process */
+    g_conn_handle        = 0;
+    g_stream_subscribed  = 0;
+    g_battery_subscribed = 0;
+    int adv_rc = ble_adv_enable();
+    snprintf(buf, sizeof(buf), "fsm: hci_disc=0x%04x rc=%d, re-adv rc=%d",
+             ch, hd_rc, adv_rc);
+    ErrLog_Write(buf);
   }
   g_fsm.state = FSM_IDLE;
 }
@@ -523,7 +581,17 @@ static void fsm_advance(void)
   /* Read next chunk if our retry buffer is empty. */
   if (g_fsm.buf_len == 0) {
     uint32_t got = 0;
-    pl_fx_status_t s = SDFat_Read(&g_fsm.f, g_fsm.buf, sizeof(g_fsm.buf), &got);
+    /* Dynamic chunk size: ATT_MTU minus 3-byte ATT-header overhead.
+       BlueNRG-LP doesn't seem to raise ACI_ATT_EXCHANGE_MTU_RESP_EVENT
+       on this firmware variant, so g_att_mtu stays at the default 23.
+       Empirical probe: try 100 bytes as a floor — if the chip accepts
+       larger notifies than the supposed-23-byte MTU, throughput jumps
+       ~5×. If it refuses, notify_try will return -1 and the FSM aborts
+       cleanly with stall — no corruption, just a clear failure signal
+       in errlog and we roll back. */
+    uint16_t chunk_max = (g_att_mtu > 23) ? (uint16_t)(g_att_mtu - 3) : 240;
+    if (chunk_max > sizeof(g_fsm.buf)) chunk_max = sizeof(g_fsm.buf);
+    pl_fx_status_t s = SDFat_Read(&g_fsm.f, g_fsm.buf, chunk_max, &got);
     if (s != PL_FX_OK) {
       fsm_emergency_exit(SM_IO_ERROR, "sdread");
       return;
@@ -1252,6 +1320,31 @@ void BLE_Tick(void)
           g_battery_notify_ms  = HAL_GetTick() - BATTERY_PERIOD_MS;  /* notify soon */
           snprintf(buf, sizeof(buf), "ble: battery subscribed=%d",
                    g_battery_subscribed);
+          ErrLog_Write(buf);
+        }
+      } else if (ecode == 0x0C17) {
+        /* ACI_ATT_EXCHANGE_MTU_RESP_EVENT — the BlueNRG-LP just
+           negotiated a new ATT MTU with the connected client. Earlier
+           errlogs showed this event arriving as n=8 (= 4 bytes of
+           payload after the standard 4-byte vendor header), which on
+           BlueNRG-LP firmware means the payload is just (server_rx_mtu)
+           at evt[6..7] with no conn_handle. Some firmware variants
+           include conn_handle first, so we also check evt[8..9] as a
+           fallback and pick whichever yields a plausible MTU value. */
+        uint16_t mtu_a = (uint16_t)(evt[6] | (evt[7] << 8));
+        uint16_t mtu_b = (n >= 10) ? (uint16_t)(evt[8] | (evt[9] << 8)) : 0;
+        uint16_t mtu   = (mtu_a >= 23 && mtu_a <= 247) ? mtu_a :
+                         (mtu_b >= 23 && mtu_b <= 247) ? mtu_b : 0;
+        if (mtu) {
+          g_att_mtu = mtu;
+          snprintf(buf, sizeof(buf), "ble: att_mtu=%u (n=%d ev6=%02x%02x ev8=%02x%02x)",
+                   mtu, n, evt[7], evt[6],
+                   (n >= 10) ? evt[9] : 0, (n >= 10) ? evt[8] : 0);
+          ErrLog_Write(buf);
+        } else {
+          snprintf(buf, sizeof(buf), "ble: mtu event but no plausible value (n=%d ev6=%02x%02x ev8=%02x%02x)",
+                   n, evt[7], evt[6],
+                   (n >= 10) ? evt[9] : 0, (n >= 10) ? evt[8] : 0);
           ErrLog_Write(buf);
         }
       } else {
