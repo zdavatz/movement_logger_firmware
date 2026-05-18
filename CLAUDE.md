@@ -57,6 +57,18 @@ GET_MODE` (see DESIGN.md table).
 - Sensors: LSM6DSV16X (SPI2), LIS2MDL + LPS22DF + STTS22H on I²C2,
   STC3115 fuel gauge on I²C4. GPS u-blox MAX-M10S on UART4 @ 38400 baud,
   captured by DMA-circular into a 512 B ring.
+- **GPS wiring (authoritative — verified against ST schematic Rev 3
+  Fig. 3 + UM3133 Rev 7).** The box has **no STMod+ connector**; UART4
+  (PA0/PA1) is exposed only on **JP2, the STLINK programming connector**
+  (Samtec FTSH-107-01-L-D, 2×7, 1.27 mm). JP2 **pin 13 = UART4_RX =
+  PA1** (MCU in), **pin 14 = UART4_TX = PA0** (MCU out), **pin 7 & 11 =
+  GND**, **pin 1 = the 1V8 rail** (JTAG pull-up ref — *not* 3.3 V, not a
+  supply). GPS 3.3 V must come from the **JP4** extension-board rail
+  (domain switch on 3 V), meter-verified; never from any JP2 pin. Pins
+  4/6/8/10/12 are SWD/NRST — don't bridge. Don't re-derive this from the
+  schematic; the full hand-soldering procedure (incl. the mandatory
+  pre-solder continuity checks and the harmless TX/RX-swap fallback) is
+  in **`GPS_SOLDERING.md`** / `pdf/GPS_SOLDERING.pdf`.
 - Power: Li-Po + wireless charging. **Hall sensor + magnet are wired as
   a hardware supply-rail interrupter**, not as a signal to the MCU. The
   firmware has no sleep modes — only "running" or "no power" — and no

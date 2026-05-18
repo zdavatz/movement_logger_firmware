@@ -11,3 +11,9 @@
 
 # macOS
 .DS_Store
+
+# ST-copyrighted reference PDFs kept locally under pdf/ for offline use
+# but NOT redistributed in this GPLv3 repo (README links ST to obtain
+# them). Only our own GPS_SOLDERING.pdf is tracked.
+/pdf/steval-mkboxpro-schematic.pdf
+/pdf/um3133-sensortilebox-pro.pdf

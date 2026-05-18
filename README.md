@@ -9,6 +9,7 @@ Bare-metal firmware for the **STEVAL-MKBOXPRO Rev_C** (SensorTile.box PRO) runni
 - **[REQUIREMENTS.md](REQUIREMENTS.md)** — *what* the firmware must do (sensor rates, modes, BLE protocol obligations, watchdog behavior).
 - **[DESIGN.md](DESIGN.md)** — *how* (GATT UUIDs, FileSync wire protocol, SensorStream byte layout, HCI command sequence, on-SD CSV schemas).
 - **[CLAUDE.md](CLAUDE.md)** — invariants, hard rules, and gotchas accumulated during bring-up. Worth reading before making non-trivial changes.
+- **[GPS_SOLDERING.md](GPS_SOLDERING.md)** ([PDF](pdf/GPS_SOLDERING.pdf)) — step-by-step manual for hand-soldering the u-blox MAX-M10S GPS to the box's JP2 programming connector (UART4). Read before touching the iron.
 
 ## Supported hardware
 
@@ -19,7 +20,7 @@ Bare-metal firmware for the **STEVAL-MKBOXPRO Rev_C** (SensorTile.box PRO) runni
 
 MCU: STM32U585AIIxQ (Cortex-M33 @ 160 MHz, HSI→PLL). BLE: BlueNRG-LP on SPI1, polled (EXTI11 intentionally unused — see CLAUDE.md). Sensors: LSM6DSV16X / LIS2MDL / LPS22DF / STTS22H / STC3115 / [u-blox MAX-M10S](https://www.u-blox.com/en/product/max-m10s-module) GPS receiver. Power: Li-Po + wireless charging; Hall sensor + magnet wired as a hardware supply-rail interrupter (no MCU sleep modes).
 
-The GPS receiver is **not on the STEVAL-MKBOXPRO** — it is a separate [u-blox MAX-M10S](https://www.u-blox.com/en/product/max-m10s-module) module wired to UART4 @ 38400 baud (e.g. a [MAX-M10S breakout from SparkFun](https://www.sparkfun.com/products/18037) or any MAX-M10S carrier). See CLAUDE.md / DESIGN.md for the wiring and the u-blox config sequence.
+The GPS receiver is **not on the STEVAL-MKBOXPRO** — it is a separate [u-blox MAX-M10S](https://www.u-blox.com/en/product/max-m10s-module) module wired to UART4 @ 38400 baud (e.g. a [MAX-M10S breakout from SparkFun](https://www.sparkfun.com/products/18037) or any MAX-M10S carrier). UART4 is brought out on the **JP2 programming connector** (the box has no STMod+): pin 13 = RX (MCU PA1), pin 14 = TX (MCU PA0), pin 7/11 = GND. **3.3 V logic only** — GPS power comes from the JP4 3 V rail, never from JP2. Full procedure in **[GPS_SOLDERING.md](GPS_SOLDERING.md)**; see also CLAUDE.md / DESIGN.md for the u-blox config sequence.
 
 ## Build
 
