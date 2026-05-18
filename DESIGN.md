@@ -68,18 +68,35 @@ payload.
 | `0x01` | `LIST` | none | Request a listing of the SD root. |
 | `0x02` | `READ` | `<name>\0[<offset:u32-LE>]` | Read `<name>` from byte `<offset>` to EOF. `<name>` is a NUL-terminated ASCII 8.3 filename. The 4-byte little-endian offset is optional — absent (write ends at the NUL) means `offset = 0` = whole file. A resumed transfer after a dropped link sends `offset = bytes already received`. Works on the *active* session's files too — returns a consistent snapshot up to the last 1 Hz flush. |
 | `0x03` | `DELETE` | `<name>\0` | Delete the file. `<name>` NUL-terminated. Returns single-byte status. |
-| `0x04` | `STOP_LOG` | none | Optional: flush + close the current session and rotate to the next `SensNNN+1.csv`. **Not required for READ** — it exists only as a file-rotation convenience. Logging resumes immediately with the new session. |
+| `0x04` | `STOP_LOG` | none | Flush + close the current session. No FileData reply (host re-checks via LIST). |
+| `0x05` | `START_LOG` | `[<dur:u32-LE>]` | MANUAL-mode session start. Opens the next `SensNNN.csv` set; if `dur` (seconds) is given and non-zero, the box auto-closes the session after it and goes idle again. `dur` absent / 0 = run until `STOP_LOG` or power loss. OK-no-op if a session is already active (re-arms the deadline). Returns single-byte status. |
+| `0x06` | `SET_MODE` | `<mode:u8>` | `0` = AUTO, `1` = MANUAL. Persisted to `LOGMODE.CFG` on the SD root and applied immediately (AUTO + idle → start a session now; MANUAL never stops a running session). Returns single-byte status. |
+| `0x07` | `GET_MODE` | none | Box replies one byte on FileData: `0` = AUTO, `1` = MANUAL. |
 | any other | reserved | — | Box replies `0xE3 BAD_REQUEST` on FileData. |
 
-**No mode switch.** There is deliberately no STREAM_START / STREAM_STOP
-and no LOG-vs-STREAM mode. SD logging is *always on* — there is no state
-the box can be left in where it silently stops recording. Live streaming
-(Section 3) is a side effect of a client subscribing to the SensorStream
-CCCD, runs concurrently with logging, and stops on its own when the
-client unsubscribes or disconnects. The earlier mutually-exclusive-mode
-design was inherited from the ThreadX firmware (where BLE and SDMMC could
-not coexist); the polling architecture here has no such constraint, so
-the mode — and its lost-session failure mode — is simply removed.
+**LOG mode: AUTO (default) vs MANUAL.** There is still no STREAM_START /
+STREAM_STOP and no LOG-vs-STREAM mode — live streaming (Section 3) is a
+side effect of a client subscribing to the SensorStream CCCD and runs
+concurrently with logging. What *is* configurable is **when SD logging
+starts**:
+
+- **AUTO** (default, and the behaviour when `LOGMODE.CFG` is absent or
+  unreadable): a session opens automatically on every cold boot. There
+  is no state the box can be left in where it silently stops recording —
+  this is the data-safe default and matches the original always-on
+  design (the mutually-exclusive LOG/STREAM mode inherited from the
+  ThreadX firmware is gone; the polling architecture has no BLE↔SDMMC
+  constraint).
+- **MANUAL**: the box stays idle on cold boot and only records after a
+  host `START_LOG`, for the requested fixed duration. **Deliberate
+  tradeoff:** in MANUAL the box can be powered yet not recording, so a
+  forgotten `START_LOG` (or no host in range) silently loses the run.
+  This is opt-in, set by the host app via `SET_MODE`, never the default.
+
+The mode is persisted on the SD card (`LOGMODE.CFG`, a one-line text
+file — first byte `m`/`M` ⇒ manual, anything else ⇒ auto) so it survives
+the hard power-cycle (F-PWR-5). Changing it needs no power-cycle:
+`SET_MODE` applies at once.
 
 ### Box → host (FileData notifies)
 

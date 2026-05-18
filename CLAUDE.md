@@ -30,13 +30,19 @@ Don't re-derive anything that's already pinned in those docs — change
 the doc first if the requirement actually shifted (REQUIREMENTS.md
 Section 10 meta-rule 3).
 
-**One material requirements-vs-design divergence to be aware of:**
-REQUIREMENTS.md still describes two **mutually exclusive** modes
-(`LOG` / `STREAM`) with `STREAM_START` / `STREAM_STOP` opcodes.
-DESIGN.md v0.2 supersedes this: SD logging is **always on**, and live
-streaming is a side-effect of a client subscribing to the SensorStream
-CCCD (no mode switch, no opcodes). The PR description marks this
-"no-mode decision" explicit. Follow DESIGN.md.
+**Logging modes (REQUIREMENTS.md Section 2 + DESIGN.md "Host → box"
+reconciled):** there is no LOG/STREAM mode — SD logging and the
+SensorStream notify run concurrently (streaming is a side-effect of a
+client subscribing to the CCCD). What *is* configurable is **when SD
+logging starts**: `AUTO` (default — session on every cold boot, the
+data-safe always-on behaviour; also the fallback when `LOGMODE.CFG` is
+absent/unreadable) vs `MANUAL` (boot idle, record only on host
+`START_LOG [dur]` for a fixed duration). The mode is set by the host app
+via the `SET_MODE` opcode (`0x06`), reported by `GET_MODE` (`0x07`),
+and persisted in `LOGMODE.CFG` on the SD root. `MANUAL` is opt-in and
+carries a deliberate silent-data-loss tradeoff (forgotten `START_LOG`
+= lost run). Opcodes: `0x05 START_LOG`, `0x06 SET_MODE`, `0x07
+GET_MODE` (see DESIGN.md table).
 
 ## Hardware target
 

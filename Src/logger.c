@@ -25,6 +25,16 @@ static PL_File g_bat;
 static int     g_active = 0;
 static int     g_session = -1;
 
+/* Persisted log-mode. SD config is a tiny text file on the root; the
+   first byte is all that matters ('m'/'M' = manual, anything else =
+   auto). g_mode is the cache: -1 = not read yet. */
+#define LOGMODE_CFG_NAME "LOGMODE.CFG"
+static int      g_mode = -1;
+
+/* MANUAL-mode auto-stop deadline (HAL_GetTick() ms). 0 = no deadline
+   (AUTO mode, or a MANUAL session started with duration 0). */
+static uint32_t g_stop_at_ms = 0;
+
 /* Last-read baro sample is held between baro polls (25 Hz) so each 100 Hz
    sensor row gets the most recent pressure/temperature without re-reading. */
 static PL_BaroSample g_baro_cache;
@@ -72,6 +82,82 @@ int Logger_Init(void)
 }
 
 int Logger_IsActive(void) { return g_active; }
+
+int Logger_GetMode(void)
+{
+  if (g_mode >= 0) return g_mode;            /* cached */
+
+  g_mode = LOGGER_MODE_AUTO;                 /* safe default */
+  if (SDFat_IsMounted()) {
+    PL_File f;
+    if (SDFat_OpenRead(&f, LOGMODE_CFG_NAME) == PL_FX_OK) {
+      char c = 0;
+      uint32_t got = 0;
+      if (SDFat_Read(&f, &c, 1, &got) == PL_FX_OK && got == 1 &&
+          (c == 'm' || c == 'M')) {
+        g_mode = LOGGER_MODE_MANUAL;
+      }
+      SDFat_Close(&f);
+    }
+  }
+  ErrLog_Writef("logger: mode = %s",
+                g_mode == LOGGER_MODE_MANUAL ? "manual" : "auto");
+  return g_mode;
+}
+
+int Logger_SetMode(int manual)
+{
+  manual = manual ? 1 : 0;
+
+  /* Overwrite by delete + recreate — the SD layer is append-only with
+     no truncate. NOT_FOUND on delete is fine (first time). */
+  SDFat_Delete(LOGMODE_CFG_NAME);
+  PL_File f;
+  if (SDFat_OpenAppend(&f, LOGMODE_CFG_NAME) != PL_FX_OK) {
+    ErrLog_Write("logger: SetMode open fail");
+    return -1;
+  }
+  const char *txt = manual ? "manual\n" : "auto\n";
+  pl_fx_status_t s = SDFat_Append(&f, txt, (uint32_t)strlen(txt));
+  SDFat_Flush(&f);
+  SDFat_Close(&f);
+  if (s != PL_FX_OK) {
+    ErrLog_Write("logger: SetMode write fail");
+    return -1;
+  }
+
+  g_mode = manual ? LOGGER_MODE_MANUAL : LOGGER_MODE_AUTO;
+  ErrLog_Writef("logger: mode set to %s", manual ? "manual" : "auto");
+
+  /* Apply now. AUTO + idle → start recording immediately so the user
+     doesn't have to power-cycle. MANUAL never stops a running session
+     (would be silent data loss); it just takes effect on the next boot
+     / next session boundary. */
+  if (!manual && !g_active) {
+    g_stop_at_ms = 0;
+    if (Logger_Init() != 0) ErrLog_Write("logger: SetMode auto-start fail");
+  }
+  return 0;
+}
+
+int Logger_StartSession(uint32_t duration_s)
+{
+  if (g_active) {
+    /* Already recording — re-arm the deadline so a repeated START_LOG
+       extends rather than errors. */
+    g_stop_at_ms = duration_s ? (HAL_GetTick() + duration_s * 1000U) : 0;
+    ErrLog_Writef("logger: StartSession (already active) dur=%lus",
+                  (unsigned long)duration_s);
+    return 0;
+  }
+  if (Logger_Init() != 0) {
+    ErrLog_Write("logger: StartSession init fail");
+    return -1;
+  }
+  g_stop_at_ms = duration_s ? (HAL_GetTick() + duration_s * 1000U) : 0;
+  ErrLog_Writef("logger: StartSession dur=%lus", (unsigned long)duration_s);
+  return 0;
+}
 
 static void emit_sensor_row(const PL_ImuSample *imu,
                             const PL_MagSample *mag,
@@ -154,6 +240,18 @@ static void emit_bat_row(const PL_FuelSample *fuel)
 void Logger_Tick(void)
 {
   if (!g_active) return;
+
+  /* MANUAL-mode fixed-duration session: close + go idle when the
+     deadline passes. AUTO sessions never set g_stop_at_ms. Compare as
+     signed delta so a HAL_GetTick() wrap (49.7 days) can't strand a
+     session open forever. */
+  if (g_stop_at_ms != 0 &&
+      (int32_t)(HAL_GetTick() - g_stop_at_ms) >= 0) {
+    g_stop_at_ms = 0;
+    ErrLog_Write("logger: session duration reached — stopping");
+    Logger_Stop();
+    return;
+  }
 
   if (sched_due(PL_SCHED_BARO, PL_CADENCE_BARO)) {
     BARO_Read(&g_baro_cache);

@@ -80,6 +80,9 @@
 #define FSYNC_OP_READ       0x02
 #define FSYNC_OP_DELETE     0x03
 #define FSYNC_OP_STOP_LOG   0x04
+#define FSYNC_OP_START_LOG  0x05   /* [<dur:u32-LE>] start a MANUAL session */
+#define FSYNC_OP_SET_MODE   0x06   /* <mode:u8> 0=auto 1=manual, persisted   */
+#define FSYNC_OP_GET_MODE   0x07   /* → 1-byte reply 0=auto 1=manual         */
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
 #define FSYNC_ST_BUSY       0xB0
@@ -766,6 +769,46 @@ static void ble_process_command(void)
        (per CLAUDE.md wire protocol). */
     ErrLog_Write("ble: cmd STOP_LOG");
     Logger_Stop();
+  } else if (op == FSYNC_OP_START_LOG) {
+    /* START_LOG [<dur:u32-LE>]: open a session (MANUAL mode) and, if a
+       non-zero duration is given, auto-stop after it. Duration absent →
+       0 → run until STOP_LOG / power loss. 1-byte status reply. */
+    uint32_t dur = 0;
+    if (g_cmd_len >= 5) {
+      dur = (uint32_t)g_cmd_buf[1]
+          | ((uint32_t)g_cmd_buf[2] << 8)
+          | ((uint32_t)g_cmd_buf[3] << 16)
+          | ((uint32_t)g_cmd_buf[4] << 24);
+    }
+    int rc = Logger_StartSession(dur);
+    uint8_t st = (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
+    ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+    snprintf(buf, sizeof(buf), "ble: START_LOG dur=%lus rc=%d st=0x%02x",
+             (unsigned long)dur, rc, st);
+    ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_SET_MODE) {
+    /* SET_MODE <mode:u8>: 0 = auto, 1 = manual. Persisted to the SD
+       config; applied immediately. 1-byte status reply. */
+    if (g_cmd_len < 2) {
+      uint8_t st = FSYNC_ST_BAD_REQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: SET_MODE bad request (no mode byte)");
+    } else {
+      int manual = (g_cmd_buf[1] != 0) ? 1 : 0;
+      int rc = Logger_SetMode(manual);
+      uint8_t st = (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      snprintf(buf, sizeof(buf), "ble: SET_MODE %s rc=%d st=0x%02x",
+               manual ? "manual" : "auto", rc, st);
+      ErrLog_Write(buf);
+    }
+  } else if (op == FSYNC_OP_GET_MODE) {
+    /* GET_MODE → single byte: 0 = auto, 1 = manual. */
+    uint8_t m = (Logger_GetMode() == LOGGER_MODE_MANUAL) ? 1 : 0;
+    ble_notify_try(g_filedata_handle + 1, &m, 1, 500);
+    snprintf(buf, sizeof(buf), "ble: GET_MODE → %s",
+             m ? "manual" : "auto");
+    ErrLog_Write(buf);
   } else {
     snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x (not yet handled)", op);
     ErrLog_Write(buf);

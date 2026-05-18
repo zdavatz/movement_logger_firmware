@@ -121,7 +121,12 @@ int main(void)
     } else {
       ErrLog_Write("gps: ok (MAX-M10S UART4)");
     }
-    if (Logger_Init() != 0) {
+    /* MANUAL mode: stay idle on cold boot — no session until the host
+       sends START_LOG. AUTO (default, also when LOGMODE.CFG is absent):
+       open a session immediately, the original always-on behaviour. */
+    if (Logger_GetMode() == LOGGER_MODE_MANUAL) {
+      ErrLog_Write("logger: manual mode — idle until START_LOG");
+    } else if (Logger_Init() != 0) {
       ErrLog_Write("logger: init FAIL");
       beep_pattern(800, 6, 100, 100);
     } else {

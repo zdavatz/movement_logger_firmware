@@ -41,19 +41,25 @@ bug-prone to debug in our use case.
 
 ## 2. Operating modes
 
-The firmware has two **mutually exclusive** operating modes. Default at
-power-up is `LOG`. The host switches modes by writing an opcode on the
-FileCmd characteristic.
+There is **no** LOG-vs-STREAM mode switch (superseded — see DESIGN.md
+"Host → box"). SD logging and BLE live streaming run **concurrently**:
+FileSync (LIST/READ/DELETE) and the SensorStream notify are always
+available while connected; streaming is simply a side effect of a client
+subscribing to the SensorStream CCCD and stops when it unsubscribes.
 
-| Mode | Sensors | SD writes | BLE FileSync | BLE Live stream | BLE Battery status |
-|---|---|---|---|---|---|
-| `LOG` | read at native rates | yes — to `Sens/Gps/Bat*.csv` | active (LIST/READ/DELETE) | off | active |
-| `STREAM` | read at native rates | none (active CSV files closed) | paused | active — packed sample per notify | active |
+The one configurable behaviour is **when SD logging starts**, set by the
+host app via the `SET_MODE` opcode and persisted on the SD card
+(`LOGMODE.CFG`):
 
-Mode transitions:
-- Power-on → `LOG`.
-- Host writes `STREAM_START` opcode → switch to `STREAM`.
-- Host writes `STREAM_STOP`, or disconnects, or stays disconnected for >5 s → revert to `LOG`.
+| Log mode | On cold boot | Session start | Session end |
+|---|---|---|---|
+| `AUTO` (default) | session opens automatically | immediate, no host needed | never (always recording) — data-safe default |
+| `MANUAL` | idle, **not recording** | host `START_LOG [dur]` | after `dur` s, or `STOP_LOG`, or power loss |
+
+`AUTO` is the default and the fallback whenever `LOGMODE.CFG` is absent
+or unreadable. `MANUAL` is opt-in and carries a deliberate tradeoff: the
+box can be powered yet not recording, so a forgotten `START_LOG` loses
+the run silently.
 
 ---
 
@@ -65,7 +71,7 @@ Mode transitions:
 |---|---|
 | F-PWR-1 | **Hardware power switch via Hall sensor.** The Hall sensor (or its latching circuit) physically interrupts the supply rail to the MCU. Magnet present = supply broken = MCU fully off. Magnet absent = supply applied = MCU cold-boots. No sleep modes in firmware — only "running" or "no power". |
 | F-PWR-2 | Magnet is mounted inside the transport case. Behavior: box in case → MCU off, wireless charger tops up battery. Box out of case → MCU cold-boots, logging starts. |
-| F-PWR-3 | Logging begins immediately on cold boot. No user interaction needed. Target boot-to-active ≤ 1 s. |
+| F-PWR-3 | In `AUTO` log mode (default): logging begins immediately on cold boot, no user interaction needed, target boot-to-active ≤ 1 s. In `MANUAL`: the box boots idle and starts only on host `START_LOG` (see Section 2). |
 | F-PWR-4 | Acoustic feedback: one short beep right after `main()` enters its loop, so the user hears the box wake up. |
 | F-PWR-5 | **Graceful shutdown is not possible** — power dies the moment the magnet returns. Therefore: (a) the on-SD format tolerates sudden truncation (CSV is fine — last line may be partial, post-processor discards it); (b) flush cadence bounds worst-case data loss to ≤ 1 s of sensor samples (see F-LOG-5). |
 | F-PWR-6 | **Wireless charging** runs entirely independent of the MCU: the receiver IC / coil drive the charging path from the case's inductive transmitter directly into the Li-Po. No firmware participation. No USB-C cable involvement at the user level. |
@@ -75,7 +81,7 @@ Mode transitions:
 
 | ID | Requirement |
 |---|---|
-| F-LOG-1 | While in LOG mode, continuously log to SD card. |
+| F-LOG-1 | While a session is active (always in `AUTO`; between `START_LOG` and its deadline in `MANUAL`), continuously log to SD card. |
 | F-LOG-2 | Sensors and rates: |
 |         | • LSM6DSV16X accelerometer @ 100 Hz (XYZ, ±4 g, 0.122 mg/LSB) |
 |         | • LSM6DSV16X gyroscope @ 100 Hz (XYZ, ±500 dps, 17.5 mdps/LSB) |
