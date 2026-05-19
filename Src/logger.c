@@ -239,18 +239,27 @@ static void emit_bat_row(const PL_FuelSample *fuel)
 
 void Logger_Tick(void)
 {
-  if (!g_active) return;
+  /* Live-snapshot acquisition runs every tick even when no SD session
+     is active, so the BLE SensorStream stays alive while idle and
+     between MANUAL sessions. The old `if (!g_active) return;` here
+     froze g_last_* whenever g_active==0 (MANUAL mode, after STOP_LOG,
+     or any idle state introduced by the AUTO/MANUAL log-mode split),
+     so every BLE client — Android and desktop alike — saw a stale /
+     zero live feed. SD writes, flush and the duration deadline below
+     stay gated on g_active: g_sens/g_gps/g_bat are closed when idle
+     and must never be touched then. */
 
   /* MANUAL-mode fixed-duration session: close + go idle when the
      deadline passes. AUTO sessions never set g_stop_at_ms. Compare as
      signed delta so a HAL_GetTick() wrap (49.7 days) can't strand a
-     session open forever. */
-  if (g_stop_at_ms != 0 &&
+     session open forever. Only meaningful for a live session; fall
+     through afterwards so this same tick still refreshes the snapshot
+     (no early return — that was the bug). */
+  if (g_active && g_stop_at_ms != 0 &&
       (int32_t)(HAL_GetTick() - g_stop_at_ms) >= 0) {
     g_stop_at_ms = 0;
     ErrLog_Write("logger: session duration reached — stopping");
     Logger_Stop();
-    return;
   }
 
   if (sched_due(PL_SCHED_BARO, PL_CADENCE_BARO)) {
@@ -262,7 +271,7 @@ void Logger_Tick(void)
     if (IMU_Read(&imu) == 0 && MAG_Read(&mag) == 0 && g_baro_cache.valid) {
       g_last_imu = imu;
       g_last_mag = mag;
-      emit_sensor_row(&imu, &mag, &g_baro_cache);
+      if (g_active) emit_sensor_row(&imu, &mag, &g_baro_cache);
     }
   }
 
@@ -276,7 +285,7 @@ void Logger_Tick(void)
          antenna or open-sky-blocked moment writes "ghost" rows with
          the last-known lat/lon and nsat=0 / hdop=99.9 — confusing the
          visualisation tools that interpret each row as a real fix. */
-      if (f.fix_q > 0) emit_gps_row(&f);
+      if (g_active && f.fix_q > 0) emit_gps_row(&f);
     }
   }
 
@@ -309,11 +318,11 @@ void Logger_Tick(void)
     PL_FuelSample fuel;
     if (FUEL_Read(&fuel) == 0) {
       g_last_fuel = fuel;
-      emit_bat_row(&fuel);
+      if (g_active) emit_bat_row(&fuel);
     }
   }
 
-  if (sched_due(PL_SCHED_FLUSH, PL_CADENCE_FLUSH)) {
+  if (g_active && sched_due(PL_SCHED_FLUSH, PL_CADENCE_FLUSH)) {
     SDFat_Flush(&g_sens);
     SDFat_Flush(&g_gps);
     SDFat_Flush(&g_bat);
