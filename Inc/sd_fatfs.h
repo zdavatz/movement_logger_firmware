@@ -28,6 +28,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "stm32u5xx_hal.h"
 
 typedef enum {
   PL_FX_OK = 0,
@@ -106,5 +107,12 @@ pl_fx_status_t SDFat_Seek(PL_File *file, uint32_t offset);
 
 /* Delete a file: free its FAT cluster chain and mark the dir entry 0xE5. */
 pl_fx_status_t SDFat_Delete(const char *name);
+
+/* Raw HAL_SD handle accessor — exposed for USB MSC, which speaks SCSI
+   block-level to the host PC and bypasses our FatFs entirely. Returns
+   NULL if SDFat_Mount has not run. Sole owner of HAL_SD calls is still
+   sd_fatfs.c; usb_msc.c is the one sanctioned exception, gated on
+   UsbMsc_IsMounted() so it cannot race the logger's own writes. */
+SD_HandleTypeDef *SDFat_RawHandle(void);
 
 #endif /* PL_SD_FATFS_H */

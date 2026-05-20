@@ -125,8 +125,10 @@ predecessor stack hit):
 
 - **Polling-only.** No application-level ISRs. Permitted exceptions are
   listed in F-ARCH-7: SysTick (1 ms tick), IWDG (no ISR, just resets),
-  and the WWDG early-warning ISR (last-gasp errlog + beep before reset).
-  Anything else — SPI/UART/I²C/SDMMC/EXTI/DMA-complete — runs polled.
+  the WWDG early-warning ISR (last-gasp errlog + beep before reset),
+  the UART4 RX byte IRQ for GPS NMEA, and (Phase 9, Issue #5) OTG_FS
+  for USB MSC enumeration timing. Anything else — SPI/I²C/SDMMC/EXTI/
+  DMA-complete — runs polled.
 - **No dynamic allocation after `init()`.** `malloc`/`free` are not
   linked in. All buffers are static; sizes are budgeted in DESIGN.md §10.
 - **Single owners.** Only `sd_fatfs.c` touches the SD/FatFs. Only

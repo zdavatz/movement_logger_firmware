@@ -23,6 +23,7 @@
 #include "gps.h"
 #include "logger.h"
 #include "ble.h"
+#include "usb_msc.h"
 
 /* Captured *before* HAL clears anything so the error log can decode the
    reset reason in ErrLog_Init(). */
@@ -136,6 +137,17 @@ int main(void)
       ErrLog_Write("ble: init FAIL");
       beep_pattern(2000, 7, 60, 80);
     }
+    /* Phase 9: USB MSC. Comes up after SD + logger so the capacity
+       callback can read card geometry, and after BLE so a USB-tethered
+       host doesn't race the wireless one. If a host is already
+       connected at boot, tud_mount_cb will fire shortly and the logger
+       will immediately stop — same path as a plug-in during runtime. */
+    if (!UsbMsc_Init()) {
+      ErrLog_Write("usb: init FAIL");
+      beep_pattern(2000, 8, 60, 80);
+    } else {
+      ErrLog_Write("usb: ok (MSC)");
+    }
     ErrLog_Flush();
   }
 
@@ -144,6 +156,11 @@ int main(void)
   for (;;)
   {
     Watchdog_Tick();
+    /* USB first — TinyUSB needs prompt task pumping to keep enumeration
+       and SCSI traffic flowing. Logger_Tick gates its SD writes on
+       UsbMsc_IsMounted() so order matters: tud_task() updates the
+       mount state, then Logger_Tick reads it. */
+    UsbMsc_Tick();
     Logger_Tick();
     GPS_Tick();
     BLE_Tick();

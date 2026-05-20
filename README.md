@@ -35,6 +35,19 @@ make clean && make            # outputs: build/PumpLogger.elf, build/firmware.bi
 
 Each `make` bumps `STM32CubeIDE/.build_counter` and bakes the value into the ErrLog boot banner via `-DPL_BUILD_NUM=N`, so it's obvious which binary is on the box.
 
+## Read the SD card over USB-C (Phase 9, v0.0.9+)
+
+Power the box on (magnet attached) and plug it into a host over USB-C — the microSD enumerates as a standard USB mass-storage drive. No button, no DFU dance:
+
+```sh
+lsblk            # find the new device (e.g. /dev/sda1, label PUMPTSUERI)
+sudo mount /dev/sda1 /mnt
+```
+
+While the host has the drive mounted, the box pauses its own SD writes (two filesystem drivers can't share the card). Eject / unplug and the logger automatically resumes the previous mode (AUTO → new session, MANUAL → wait for `START_LOG`). BLE FileSync remains the wireless path; they coexist but are mutually exclusive at runtime.
+
+See REQUIREMENTS.md F-USB-1..6, DESIGN.md §14, and [issue #5](https://github.com/zdavatz/movement_logger_firmware/issues/5) for the full design.
+
 ## Flash via DFU
 
 Hold the user button while plugging USB-C to enter STM32 DFU mode:

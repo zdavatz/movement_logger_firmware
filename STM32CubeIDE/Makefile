@@ -22,7 +22,9 @@ INCLUDES = \
   -I$(ROOT)/Drivers/STM32U5xx_HAL_Driver/Inc \
   -I$(ROOT)/Drivers/STM32U5xx_HAL_Driver/Inc/Legacy \
   -I$(ROOT)/Drivers/CMSIS/Device/ST/STM32U5xx/Include \
-  -I$(ROOT)/Drivers/CMSIS/Include
+  -I$(ROOT)/Drivers/CMSIS/Include \
+  -I$(ROOT)/Middlewares/Third_Party/tinyusb/src \
+  -I$(ROOT)/Middlewares/Third_Party/tinyusb/src/portable/synopsys/dwc2
 
 # Build counter — bumps on every `make` invocation, baked into the binary
 # via -DPL_BUILD_NUM=N so ErrLog's boot banner shows "build #N" and the
@@ -73,10 +75,24 @@ C_SOURCES = \
   $(APP)/Src/ble.c \
   $(APP)/Src/stream.c \
   $(APP)/Src/battery.c \
+  $(APP)/Src/usb_msc.c \
+  $(APP)/Src/usb_descriptors.c \
   $(APP)/Src/stm32u5xx_it.c \
   $(APP)/Src/system_stm32u5xx.c \
   Application/User/syscalls.c \
   Application/User/sysmem.c
+
+# TinyUSB middleware (Phase 9 — Issue #5). DWC2 driver + device core +
+# MSC class only. CDC is gated off via CFG_TUD_CDC=0 in tusb_config.h
+# so its sources don't need linking even though they're present in the
+# vendored tree.
+C_SOURCES += \
+  $(ROOT)/Middlewares/Third_Party/tinyusb/src/tusb.c \
+  $(ROOT)/Middlewares/Third_Party/tinyusb/src/common/tusb_fifo.c \
+  $(ROOT)/Middlewares/Third_Party/tinyusb/src/device/usbd.c \
+  $(ROOT)/Middlewares/Third_Party/tinyusb/src/class/msc/msc_device.c \
+  $(ROOT)/Middlewares/Third_Party/tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c \
+  $(ROOT)/Middlewares/Third_Party/tinyusb/src/portable/synopsys/dwc2/dwc2_common.c
 
 # STM32 HAL — Phase 3 adds I²C, SPI, UART, SD, IWDG to the Phase 2 set.
 C_SOURCES += \

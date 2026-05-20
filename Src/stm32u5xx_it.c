@@ -14,6 +14,7 @@
   */
 
 #include "main.h"
+#include "tusb.h"
 
 void NMI_Handler(void)            { while (1) {} }
 void HardFault_Handler(void)      { while (1) {} }
@@ -36,4 +37,17 @@ void GPS_UART_IRQHandler(void);
 void UART4_IRQHandler(void)
 {
   GPS_UART_IRQHandler();
+}
+
+/* OTG_FS global IRQ — forwarded to TinyUSB's device interrupt handler.
+   F-ARCH-7 sanctioned exception #2 (Phase 9 / Issue #5): USB enumeration
+   requires fast (<100 µs) response to bus events; polling tud_task at
+   the 1 ms main-loop cadence is not fast enough for the bus reset /
+   set-address handshake. NVIC priority set in usb_msc.c::usb_msc_hw_init.
+   Counter g_otg_fs_irq_count lives in usb_msc.c. */
+extern volatile uint32_t g_otg_fs_irq_count;
+void OTG_FS_IRQHandler(void)
+{
+  g_otg_fs_irq_count++;
+  tud_int_handler(0);
 }

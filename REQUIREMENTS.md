@@ -81,7 +81,7 @@ the run silently.
 
 | ID | Requirement |
 |---|---|
-| F-LOG-1 | While a session is active (always in `AUTO`; between `START_LOG` and its deadline in `MANUAL`), continuously log to SD card. |
+| F-LOG-1 | While a session is active (always in `AUTO`; between `START_LOG` and its deadline in `MANUAL`), continuously log to SD card. **Exception:** while a USB host has the MSC interface mounted (F-USB-2), the active session is closed and SD writes are paused — two filesystem drivers cannot share the card. Sessions resume automatically on USB disconnect/unmount; motion during the mount window is not recorded (silent data loss tradeoff, analogous to a forgotten `START_LOG` in MANUAL mode). |
 | F-LOG-2 | Sensors and rates: |
 |         | • LSM6DSV16X accelerometer @ 100 Hz (XYZ, ±4 g, 0.122 mg/LSB) |
 |         | • LSM6DSV16X gyroscope @ 100 Hz (XYZ, ±500 dps, 17.5 mdps/LSB) |
@@ -159,7 +159,18 @@ While in STREAM mode this is paused; it resumes on STREAM_STOP / reconnect.
 | F-ERR-3 | Each entry: a ms-since-boot timestamp + (once GPS gives time) a wall-clock UTC timestamp. |
 | F-ERR-4 | Downloadable via BLE FileSync (see F-SYNC-11). |
 
-### 3.9 Architectural principles
+### 3.9 USB Mass Storage (Phase 9)
+
+| ID | Requirement |
+|---|---|
+| F-USB-1 | When plugged into a USB host via USB-C, the box enumerates as a USB 2.0 Full-Speed Mass Storage class device exposing the microSD as a single LUN at 512-byte block granularity. Standard SCSI-2 bulk-only transport — no vendor extensions. |
+| F-USB-2 | The host's mount event (`SET_CONFIGURATION` → MSC ready) takes priority over logging: the firmware flushes + closes the active session, stops emitting rows, and lets the host driver own the card filesystem. On disconnect or host eject the next idle tick resumes the previous log-mode behaviour (AUTO → new session, MANUAL → wait for `START_LOG`). |
+| F-USB-3 | USB-C connection without a host (charger only, no enumeration) does **not** suspend logging. The firmware distinguishes "VBUS present" from "host has set configuration" via TinyUSB's `tud_mount_cb`. |
+| F-USB-4 | BLE FileSync continues to work in parallel with the USB stack when no host is mounted. The two ways to retrieve a session — wireless (FileSync) and wired (MSC) — must coexist without code paths interfering. (In practice they're mutually exclusive at runtime: when MSC is mounted the logger is paused, so no new rows accumulate for FileSync to serve.) |
+| F-USB-5 | The MSC bring-up is bounded — if TinyUSB fails to initialize (e.g. VDDUSB rail issue), the firmware logs the failure to `errlog.txt` and continues without USB. SD logging and BLE are unaffected. |
+| F-USB-6 | Suspend/resume + mount/unmount transitions are logged to `errlog.txt` so a session post-mortem can correlate gaps in the CSV record with USB events. |
+
+### 3.10 Architectural principles
 
 | ID | Requirement |
 |---|---|
@@ -173,6 +184,8 @@ While in STREAM mode this is paused; it resumes on STREAM_STOP / reconnect.
 |          | • **SysTick @ 1 ms** as the system time base. Kept because HAL needs it and the ISR is one counter-increment. |
 |          | • **IWDG** as the hardware loop-alive watchdog — produces no ISR, just resets the chip on miss. Belt-and-suspenders backup if WWDG ISR itself hangs. |
 |          | • **WWDG early-warning ISR**: fires ~50 ms before WWDG would reset. ISR writes a last-gasp error-log line ("watchdog: about to reset, last_task=…"), plays the watchdog-beep pattern, then either returns (letting reset happen naturally) or calls `NVIC_SystemReset()` directly. Lets us preserve the diagnostic on the SD card across the reset. |
+|          | • **OTG_FS_IRQ** (Phase 9): forwarded to TinyUSB's `tud_int_handler(0)` so USB enumeration and bulk transfers meet the host's <100 µs response requirement. Cannot be polled cooperatively — the bus reset → set-address handshake misses its deadline at our 1 ms tick cadence. NVIC priority 13 (between SDMMC1 and UART4-GPS). The TinyUSB device task itself still runs cooperatively from the main loop. |
+|          | • **UART4 RX** for the GPS NMEA byte stream — same rationale as Build #8/#9: DMA-only was unreliable, the per-byte IRQ is bounded (<0.5% CPU at 38400 baud). |
 | F-ARCH-8 | No dynamic memory allocation after init. Heap is off-limits at runtime (see NF-SIZE-3). |
 
 ---

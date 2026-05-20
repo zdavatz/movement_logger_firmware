@@ -321,6 +321,8 @@ pl_fx_status_t SDFat_Mount(void)
 
 int SDFat_IsMounted(void) { return g_mounted; }
 
+SD_HandleTypeDef *SDFat_RawHandle(void) { return g_mounted ? &g_hsd : NULL; }
+
 uint64_t SDFat_FreeBytes(void)
 {
   if (!g_mounted) return 0;

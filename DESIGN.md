@@ -695,7 +695,97 @@ retries if the chip is slow.
 
 ---
 
-## 14. Decisions left for implementation phase
+## 14. USB Mass Storage (Phase 9)
+
+The box exposes its microSD card to a connected USB host as a standard
+SCSI bulk-only MSC drive. Implementation: TinyUSB vendored under
+`Middlewares/Third_Party/tinyusb/` (DWC2 driver + device core + MSC
+class — CDC class present in the tree but disabled at config-time).
+
+### Bring-up sequence (`Src/usb_msc.c`)
+
+Reproduces the proven order from `fp-sns-stbox1/SDDataLogFileX/Core/
+Src/usb_cdc.c`. Every step is load-bearing:
+
+1. `__HAL_RCC_PWR_CLK_ENABLE()` + `HAL_PWREx_EnableVddUSB()` — without
+   the PWR clock the SVMCR write silently no-ops and VDDUSB stays
+   gated; symptom: tud_rhport_init returns OK but no bus events.
+2. Route HSI48 → ICLK selector for the USB peripheral (HSI48 is
+   already running for SDMMC).
+3. CRS auto-trim of HSI48 from USB SOF — HSI48 alone is ±1-2 %, too
+   loose for USB FS spec; CRS locks it within ±0.25 % once a host is
+   on the bus.
+4. `__HAL_RCC_USB_OTG_FS_CLK_ENABLE()`.
+5. GPIO PA11 (D-) / PA12 (D+) on AF10.
+6. NVIC priority 13 for `OTG_FS_IRQn`.
+7. **Manually set `USB_OTG_FS->GUSBCFG |= USB_OTG_GUSBCFG_PHYSEL`** —
+   ST's HAL_PCD_Init does this inside `USB_CoreInit` but TinyUSB's
+   `dwc2_phy_init` does not; without it the data lines stay floating.
+
+Then `tud_rhport_init(0, {DEVICE, FULL_SPEED})`. The cooperative
+`tud_task()` runs from the main loop via `UsbMsc_Tick()`; the
+OTG_FS_IRQ forwards to `tud_int_handler(0)`.
+
+### Descriptors (`Src/usb_descriptors.c`)
+
+- VID/PID: `0xCAFE / 0x4002` (TinyUSB test VID, MSC variant). Will be
+  replaced with a real ywesee-assigned VID/PID before any product
+  release.
+- Device class fields = 0 (class-per-interface, as MSC requires).
+- One interface, two bulk endpoints (`0x01` OUT, `0x81` IN, 64 B FS
+  packet size), `TUD_MSC_DESCRIPTOR()` macro.
+- Strings: "ywesee GmbH" / "PumpLogger SD" / placeholder serial
+  (`0123456789ABCDEF`) / "PumpLogger MSC".
+
+### SCSI callbacks → HAL_SD bridge
+
+| TinyUSB callback | What it does | Bridge target |
+|---|---|---|
+| `tud_msc_inquiry_cb` | Returns vendor/product/rev strings | static `ywesee/PumpLogger SD/0001` |
+| `tud_msc_test_unit_ready_cb` | "Are you ready?" once/sec | `SDFat_IsMounted()` |
+| `tud_msc_capacity_cb` | Block count + block size | `HAL_SD_GetCardInfo(SDFat_RawHandle())` |
+| `tud_msc_read10_cb` | SCSI READ(10) | `HAL_SD_ReadBlocks(...)` |
+| `tud_msc_write10_cb` | SCSI WRITE(10) | `HAL_SD_WriteBlocks(...)` |
+| `tud_msc_start_stop_cb` | Host eject hint | logged + ack |
+| `tud_msc_is_writable_cb` | WP query | `true` |
+
+`SDFat_RawHandle()` is the only sanctioned bypass of the
+single-owner-of-HAL_SD rule (DESIGN.md §9). The serialization argument
+holds because both `tud_msc_*` callbacks and `Logger_Tick`'s
+`SDFat_Append/Flush` calls run from the main loop, never from an ISR —
+the OTG_FS_IRQ just sets TinyUSB internal flags.
+
+### Logger suspension
+
+`tud_mount_cb` fires when the host has set the configuration and is
+about to issue MSC traffic. The callback calls `Logger_Stop()`, which
+flushes + closes the open CSVs and sets `g_active = 0`. The existing
+`g_active` gates in `Logger_Tick` then suppress every `SDFat_*` write
+for the duration of the mount.
+
+`tud_umount_cb` (host eject) and physical USB unplug both end the
+mount. On the next tick, `Logger_Init()` is called and AUTO mode opens
+a fresh session; MANUAL stays idle until the next `START_LOG`.
+
+### State-machine table addendum
+
+Added to §11's audit table:
+
+| Module | States | `g_phase` | Backoff | Resets | Errlog code | Notes |
+|---|---|---|---|---|---|---|
+| `usb_msc` | unmounted ↔ mounted | none (TinyUSB-internal) | n/a | `Logger_Stop` on mount; `Logger_Init` on unmount | `usb: …` | Driven by TinyUSB mount/umount callbacks |
+
+### Memory budget addendum (§10)
+
+| Module | Static RAM | Notes |
+|---|---|---|
+| TinyUSB (usbd + dwc2 + msc) | ~3 KB | endpoint FIFOs, control state, MSC SCSI buffer (1×512 B) |
+
+Total firmware text grew ~15 KB.
+
+---
+
+## 15. Decisions left for implementation phase
 
 Some details we'll decide as we hit them, rather than over-specifying
 here:
@@ -711,6 +801,6 @@ here:
 
 ---
 
-**Next step:** Peter reviews. When DESIGN.md v0.1 is locked, we move to
-**Phase 2: skeleton + boot-beep** — and from there, every phase ends
-with a flashable binary on the actual box.
+**Status:** Phases 1-8 hardware-verified; Phase 9 (USB MSC) added in
+this revision — see §14 above and Issue #5. Every phase ends with a
+flashable binary on the actual box.
