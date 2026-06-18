@@ -42,7 +42,22 @@ via the `SET_MODE` opcode (`0x06`), reported by `GET_MODE` (`0x07`),
 and persisted in `LOGMODE.CFG` on the SD root. `MANUAL` is opt-in and
 carries a deliberate silent-data-loss tradeoff (forgotten `START_LOG`
 = lost run). Opcodes: `0x05 START_LOG`, `0x06 SET_MODE`, `0x07
-GET_MODE` (see DESIGN.md table).
+GET_MODE`, `0x08 SET_TIME` (see DESIGN.md table).
+
+**Host time-sync (`SET_TIME 0x08`, v0.0.10+).** The box has no RTC — the
+CSV `ms` column is a free-running `HAL_GetTick()` counter that starts at 0
+on cold boot. So on every BLE connect the host (iPhone / Android / desktop)
+pushes its current wall-clock millis via `SET_TIME 0x08 <epoch_ms:u64-LE>`,
+and `Logger_WriteSyncMarker` (logger.c) appends a `# SYNC epoch_ms=<u64>
+tick_ms=<HAL_GetTick()>` comment line into the open `SensNNN.csv` AND
+`GpsNNN.csv`, then flushes both. Pairing the host epoch with the box tick
+lets the replay tools (`stbox-viz animate`, the iOS/Android apps) map every
+logged row to absolute wall-clock with zero drift and **without needing a
+GPS fix**. Because the firmware is a single-threaded cooperative superloop,
+`Logger_WriteSyncMarker` is safe to call straight from the BLE command
+handler — `Logger_Tick` and `BLE_Tick` never overlap, so no queue/lock is
+needed. The marker is a `#`-comment line every CSV parser skips as a data
+row; it's a best-effort no-op when no session is open.
 
 ## Hardware target
 

@@ -48,6 +48,16 @@ While the host has the drive mounted, the box pauses its own SD writes (two file
 
 See REQUIREMENTS.md F-USB-1..6, DESIGN.md §14, and [issue #5](https://github.com/zdavatz/movement_logger_firmware/issues/5) for the full design.
 
+## Host time-sync (`SET_TIME 0x08`, v0.0.10+)
+
+The box has no RTC — the CSV `ms` column is a free-running `HAL_GetTick()` counter that starts at 0 on cold boot. So on every BLE connect the host (iPhone / Android / desktop) pushes its current wall-clock millis via `SET_TIME 0x08 <epoch_ms:u64-LE>`, and the firmware appends a marker line into the **open** `SensNNN.csv` and `GpsNNN.csv`:
+
+```
+# SYNC epoch_ms=1750000000000 tick_ms=42137
+```
+
+Pairing the host epoch with the box's free-running `ms` counter lets the replay tools map every logged row to absolute wall-clock with **zero drift and without needing a GPS fix** — the marker shares the host's clock domain with the replay video's `creation_time`, so the data panels line up exactly. The marker is a `#`-comment line every CSV parser skips as a data row; it's a best-effort no-op when no session is open. See DESIGN.md opcode table (0x08).
+
 ## Flash via DFU
 
 Hold the user button while plugging USB-C to enter STM32 DFU mode:
