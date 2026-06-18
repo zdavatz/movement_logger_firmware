@@ -370,6 +370,46 @@ void Logger_FlushAll(void)
   ErrLog_Flush();
 }
 
+int Logger_WriteSyncMarker(uint64_t epoch_ms)
+{
+  /* No open session → nothing to anchor. Host still gets an OK reply. */
+  if (!g_active) return 0;
+
+  /* Format the 64-bit epoch by hand: newlib-nano's printf is built without
+     %llu support (errlog.c sidesteps it the same way, casting to %lu after
+     a divide), so we can't rely on snprintf for a u64. */
+  char dec[24];
+  int  p = (int)sizeof(dec);
+  dec[--p] = '\0';
+  if (epoch_ms == 0u) {
+    dec[--p] = '0';
+  } else {
+    while (epoch_ms > 0u && p > 0) {
+      dec[--p] = (char)('0' + (int)(epoch_ms % 10u));
+      epoch_ms /= 10u;
+    }
+  }
+
+  /* tick_ms is HAL_GetTick() — the SAME free-running ms counter as the CSV
+     `ms` column (imu/fix tick_ms). Pairing it with the host epoch lets the
+     replay tools map every row to absolute wall-clock. A leading '#' makes
+     the line a comment all CSV parsers skip as a data row. Written as one
+     complete \n-terminated Append on the logging thread, so it can never
+     interleave mid-row. */
+  char line[64];
+  int n = snprintf(line, sizeof(line),
+                   "# SYNC epoch_ms=%s tick_ms=%lu\n",
+                   &dec[p], (unsigned long)HAL_GetTick());
+  if (n <= 0) return 0;
+
+  SDFat_Append(&g_sens, line, (uint32_t)n);
+  SDFat_Append(&g_gps,  line, (uint32_t)n);
+  SDFat_Flush(&g_sens);
+  SDFat_Flush(&g_gps);
+  ErrLog_Writef("logger: sync marker tick=%lu", (unsigned long)HAL_GetTick());
+  return 1;
+}
+
 void Logger_Stop(void)
 {
   if (!g_active) return;

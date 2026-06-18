@@ -72,6 +72,7 @@ payload.
 | `0x05` | `START_LOG` | `[<dur:u32-LE>]` | MANUAL-mode session start. Opens the next `SensNNN.csv` set; if `dur` (seconds) is given and non-zero, the box auto-closes the session after it and goes idle again. `dur` absent / 0 = run until `STOP_LOG` or power loss. OK-no-op if a session is already active (re-arms the deadline). Returns single-byte status. |
 | `0x06` | `SET_MODE` | `<mode:u8>` | `0` = AUTO, `1` = MANUAL. Persisted to `LOGMODE.CFG` on the SD root and applied immediately (AUTO + idle → start a session now; MANUAL never stops a running session). Returns single-byte status. |
 | `0x07` | `GET_MODE` | none | Box replies one byte on FileData: `0` = AUTO, `1` = MANUAL. |
+| `0x08` | `SET_TIME` | `<epoch_ms:u64-LE>` | Host pushes its current wall-clock millis (the box has no RTC). The box appends a `# SYNC epoch_ms=<...> tick_ms=<HAL_GetTick()>` comment line into the open `SensNNN.csv` and `GpsNNN.csv`, pairing the phone epoch with the free-running `ms` counter so replay tools can resolve absolute wall-clock with zero drift and without a GPS fix. Sent on every connect. Returns single-byte status (`0x00` even when idle — marker is a best-effort no-op then; `0xE3` if fewer than 8 epoch bytes). |
 | any other | reserved | — | Box replies `0xE3 BAD_REQUEST` on FileData. |
 
 **LOG mode: AUTO (default) vs MANUAL.** There is still no STREAM_START /

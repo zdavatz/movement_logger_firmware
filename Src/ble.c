@@ -83,6 +83,9 @@
 #define FSYNC_OP_START_LOG  0x05   /* [<dur:u32-LE>] start a MANUAL session */
 #define FSYNC_OP_SET_MODE   0x06   /* <mode:u8> 0=auto 1=manual, persisted   */
 #define FSYNC_OP_GET_MODE   0x07   /* → 1-byte reply 0=auto 1=manual         */
+#define FSYNC_OP_SET_TIME   0x08   /* <epoch_ms:u64-LE> phone wall-clock; the
+                                      box stamps a # SYNC anchor into the open
+                                      Sens/Gps CSVs (it has no RTC). 1-byte OK */
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
 #define FSYNC_ST_BUSY       0xB0
@@ -809,6 +812,31 @@ static void ble_process_command(void)
     snprintf(buf, sizeof(buf), "ble: GET_MODE → %s",
              m ? "manual" : "auto");
     ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_SET_TIME) {
+    /* SET_TIME <epoch_ms:u64-LE>: the host (iPhone/Android/desktop) pushes
+       its current wall-clock millis on every connect. The box has no RTC,
+       so we pair this epoch with the free-running HAL_GetTick() ms counter
+       (the same clock as the CSV `ms` column) and write a `# SYNC` anchor
+       line into the open Sens/Gps CSVs. The replay tools then map any row's
+       `ms` to absolute wall-clock with zero drift and no need for a GPS fix.
+       1-byte status reply; OK even when no session is open (marker is a
+       best-effort no-op then). */
+    if (g_cmd_len < 9) {
+      uint8_t st = FSYNC_ST_BAD_REQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: SET_TIME bad request (need 8-byte epoch_ms)");
+    } else {
+      uint64_t epoch_ms = 0;
+      for (int i = 0; i < 8; i++) {
+        epoch_ms |= (uint64_t)g_cmd_buf[1 + i] << (8 * i);
+      }
+      int wrote = Logger_WriteSyncMarker(epoch_ms);
+      uint8_t st = FSYNC_ST_OK;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      snprintf(buf, sizeof(buf), "ble: SET_TIME tick=%lu wrote=%d",
+               (unsigned long)HAL_GetTick(), wrote);
+      ErrLog_Write(buf);
+    }
   } else {
     snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x (not yet handled)", op);
     ErrLog_Write(buf);

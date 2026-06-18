@@ -57,6 +57,17 @@ int  Logger_StartSession(uint32_t duration_s);
 /* Copy the most-recent cached sensor samples. Cheap; no I/O. */
 void Logger_GetSnapshot(PL_Snapshot *out);
 
+/* Stamp a host-clock sync anchor into the open Sens/Gps CSVs. The host
+   pushes its wall-clock `epoch_ms` over BLE (SET_TIME, on every connect);
+   we pair it with the box's free-running HAL_GetTick() ms — the same
+   counter as the `ms` column — and append a `# SYNC epoch_ms=.. tick_ms=..`
+   comment line to both files, then flush. Lets the replay tools resolve
+   absolute wall-clock without an RTC or a GPS fix. Returns 1 if the marker
+   was written, 0 if no session is open (best-effort no-op). Safe to call
+   from the BLE command handler — single-threaded superloop, same thread as
+   Logger_Tick, so no lock is needed. */
+int  Logger_WriteSyncMarker(uint64_t epoch_ms);
+
 /* Gracefully close the active session: flush + close all CSVs, mark the
    logger inactive so Logger_Tick stops writing. After this the SD files are
    complete and safe to read/delete over BLE FileSync. Idempotent. */
