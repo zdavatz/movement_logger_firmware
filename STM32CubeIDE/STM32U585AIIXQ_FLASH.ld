@@ -42,11 +42,19 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);	/* end of "RAM" Ram type memory */
 _Min_Heap_Size = 0x200 ;	/* required amount of heap  */
 _Min_Stack_Size = 0x400 ;	/* required amount of stack */
 
-/* Memories definition */
+/* Memories definition.
+
+   FLASH is confined to bank 1 (the first 1 MB of the 2 MB dual-bank device)
+   so the BLE firmware-update (FOTA) path can stage an incoming image into the
+   inactive bank 2 (0x08100000) while running from bank 1, then activate it by
+   toggling the SWAP_BANK option byte — the classic A/B update (see fwupdate.c).
+   The app is ~73 KB, so 1 MB is ~14× headroom; this LENGTH=1024K guard makes any
+   future growth past a bank fail loudly at link time instead of silently
+   colliding with the staging bank. Was 2048K before FOTA. */
 MEMORY
 {
   RAM	(xrw)	: ORIGIN = 0x20000000,	LENGTH = 768K
-  FLASH	(rx)	: ORIGIN = 0x08000000,	LENGTH = 2048K
+  FLASH	(rx)	: ORIGIN = 0x08000000,	LENGTH = 1024K
 }
 
 /* Sections */

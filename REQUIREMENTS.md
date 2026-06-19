@@ -188,6 +188,22 @@ While in STREAM mode this is paused; it resumes on STREAM_STOP / reconnect.
 |          | • **UART4 RX** for the GPS NMEA byte stream — same rationale as Build #8/#9: DMA-only was unreliable, the per-byte IRQ is bounded (<0.5% CPU at 38400 baud). |
 | F-ARCH-8 | No dynamic memory allocation after init. Heap is off-limits at runtime (see NF-SIZE-3). |
 
+### 3.11 Firmware update over BLE (FOTA) — F-FWU
+
+Added 2026-06-19 (the former OOS-4, moved in-scope). Lets the host apps reflash
+the box wirelessly. **Pending Peter's review** per Section 10 meta-rule 3. Full
+design + wire protocol in DESIGN.md §"Firmware update over BLE (FOTA)".
+
+| ID | Requirement |
+|---|---|
+| F-FWU-1 | The box accepts a new application image over the existing BLE FileSync link via opcodes `FW_BEGIN 0x09` / `FW_DATA 0x0A` / `FW_COMMIT 0x0B` / `FW_ABORT 0x0C`, without opening the case. |
+| F-FWU-2 | **Brick-safe by construction (dual-bank A/B).** The image is streamed into the *inactive* flash bank while the running image keeps executing/logging from the active bank (read-while-write). The running image is never erased or overwritten. A corrupt, truncated, or interrupted upload leaves the box bootable on the previous image. |
+| F-FWU-3 | **Verify-before-activate.** The box recomputes a SHA-256 over the fully-programmed image and compares it to the host-declared digest from `FW_BEGIN`. `SWAP_BANK` is toggled (and the box reset into the new image) only on an exact match; on mismatch the image is discarded and the active bank untouched. |
+| F-FWU-4 | **Runtime-hang rollback.** A verified image that hangs at runtime is reverted automatically: a boot-attempt counter (SD marker `FWPEND.STA`) flips `SWAP_BANK` back to the previous image after `FW_MAX_BOOT_ATTEMPTS` unconfirmed boots; a healthy image confirms itself after `FW_CONFIRM_UPTIME_MS` of stable uptime. |
+| F-FWU-5 | FOTA reuses the FileSync single-outstanding-op model and Section-11 state-machine discipline (deadline + stall + disconnect guards, defined emergency exit, errlog context). It rejects concurrent ops with `BUSY` and never blocks the logger except for the brief inactive-bank erase at `FW_BEGIN` and the SHA pass at `FW_COMMIT`. |
+| F-FWU-6 | **Integrity, not authenticity (current threat model).** SHA-256 protects against corruption/truncation but does not authenticate the sender; this matches OOS-7 (physical-possession-equals-trust) and the fixed BLE PIN. Cryptographic signing (Ed25519) is the upgrade path if the trust model tightens. |
+| F-FWU-7 | The first FOTA-capable image must be flashed once via USB-C DFU (a pre-FOTA image cannot receive an update). USB-C DFU remains the recovery path for the residual brick case (a verified image that hangs before SD mount) — never worse than the pre-FOTA status quo where DFU was the only path. |
+
 ---
 
 ## 4. Non-functional requirements
@@ -296,8 +312,8 @@ Key properties:
 |---|---|---|
 | OOS-1 | Microphone WAV recording | Was unreliable on the modified board, dropped in the current firmware already. |
 | OOS-2 | NFC pairing | Static-PIN BLE is sufficient. |
-| OOS-3 | SD-card firmware update | DFU via USB-C is the supported update path. (SD update has the known bank-swap bug.) |
-| OOS-4 | OTA via BLE | Planned for v2, not v1. |
+| OOS-3 | SD-card firmware update | Still rejected. The supported wireless path is BLE FOTA into the dual-bank inactive bank (F-FWU), not staging a `.bin` on the SD card. |
+| ~~OOS-4~~ → F-FWU | OTA via BLE | **Moved in-scope 2026-06-19** (was "planned for v2"). Implemented as brick-safe dual-bank A/B with SHA-256 verify-before-activate — see F-FWU below and DESIGN.md §"Firmware update over BLE (FOTA)". Pending Peter's review per Section 10 meta-rule 3. |
 | OOS-5 | Multiple board revisions | Rev_C only. Rev_A/B + STWIN.box stay on the old firmware tree. |
 | OOS-6 | PnP-Like sensor manifest, BlueST-SDK V2 | Not used by the GUI. |
 | OOS-7 | Derived-key secure pairing | Static PIN `123456` is sufficient for our threat model (physical possession = trust). |
@@ -326,7 +342,7 @@ revisit the trade-offs.
 | D-9 | Low-battery handling: beep warning at SOC < 10 %, no firmware-side cutoff. | Hardware power switch makes cutoff impossible anyway. Beep nudges user to put the box back in the case. |
 | D-10 | Wireless-charging detection is irrelevant. The MCU is off while charging. | Battery state via STC3115 (F-BAT) is sufficient for GUI feedback. |
 | D-11 | GPS UART4 captured via DMA-circular into a ring buffer, parsed in thread context. | Zero ISR for UART RX, no tight per-byte timing, no overrun risk. Matches F-ARCH-6. |
-| D-12 | Firmware update is DFU via USB-C, requires unscrewing the case. | Acceptable for v1; BLE-OTA pushed to v2. |
+| D-12 | ~~Firmware update is DFU via USB-C, requires unscrewing the case.~~ **Superseded 2026-06-19:** BLE FOTA (F-FWU) is now the primary update path; USB-C DFU remains the recovery path (and is required once, to flash the first FOTA-capable image). | BLE A/B update is brick-safe (verify-before-activate + automatic rollback), so the case-opening DFU is no longer needed for routine updates. |
 | D-13 | Magnetometer readings while in the case (saturated by the switch magnet) are irrelevant because logging is off. | Confirmed: no scenario expects valid mag data inside the case. |
 | D-14 | Live-stream and SD-logging are mutually exclusive modes, not parallel. | Massive design simplification — no contention for SD/SPI bandwidth, no priority decisions. |
 | D-15 | Battery status is its own GATT characteristic, available in both modes. | Decoupled from data-mode so the GUI battery indicator works regardless. |

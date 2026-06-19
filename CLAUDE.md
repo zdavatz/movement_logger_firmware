@@ -127,6 +127,49 @@ The `force-errlog` target in the Makefile recompiles `errlog.c` every
 build so `__DATE__` / `__TIME__` in the boot banner always reflects the
 actual binary. Don't remove it.
 
+## Firmware update over BLE (FOTA) — `fwupdate.c`
+
+The box can be reflashed **wirelessly** from the iOS / Android / desktop apps —
+USB-C DFU is now only the recovery path + the one-time bootstrap of the first
+FOTA-capable image. Implemented in `Src/fwupdate.c` (+ `Src/sha256.c`), wired
+into `ble.c`'s FileSync dispatch as opcodes `0x09 FW_BEGIN` / `0x0A FW_DATA` /
+`0x0B FW_COMMIT` / `0x0C FW_ABORT`. Authoritative spec: **DESIGN.md §"Firmware
+update over BLE (FOTA)"** + **REQUIREMENTS.md F-FWU** (the former OOS-4, moved
+in-scope 2026-06-19, pending Peter's review per the change-doc-first meta-rule).
+
+**Dual-bank A/B, brick-safe.** STM32U585 = 2 × 1 MB banks + `SWAP_BANK` option
+byte. The app is now linked to **one bank** (`STM32U585AIIXQ_FLASH.ld`
+`LENGTH=1024K`, was 2048K) and runs/logs from the active bank while the new image
+streams into the inactive bank (read-while-write). `SWAP_BANK` is toggled + the
+box reset **only after** the whole image is programmed and its **SHA-256** matches
+the host-declared digest — so a corrupt/interrupted upload can never brick the
+box; the old image stays as automatic rollback. **No bootloader** (boot-ROM does
+the swap; app stays linked at `0x08000000`).
+
+**Three brick-safety invariants — do not weaken** (they're load-bearing, see the
+ST gotchas the design is built around):
+
+1. Only ever erase/program the **inactive** bank, computed live from
+   `FLASH->OPTR & FLASH_OPTR_SWAP_BANK` (`swapped ? FLASH_BANK_1 : FLASH_BANK_2`).
+   HAL erase bank numbers follow the swap state — a hardcoded `FLASH_BANK_2`
+   erases the *running* bank once swapped. The inactive bank is always at
+   `0x08100000`.
+2. `SWAP_BANK` toggled only after SHA-256 verify (`FwUpdate_Commit` →
+   `FwUpdate_Activate`). The active bank is never touched on any error path.
+3. Runtime-hang rollback via the SD marker `FWPEND.STA`: `FwUpdate_BootCheck()`
+   (called in `main.c` right after `SDFat_Mount`) bumps a boot counter and
+   reverts the swap after `FW_MAX_BOOT_ATTEMPTS` (5) unconfirmed boots;
+   `FwUpdate_ConfirmBoot()` (called from the superloop) clears it after
+   `FW_CONFIRM_UPTIME_MS` (15 s) of healthy uptime.
+
+SHA-256 is software (`sha256.c`, public-domain, verified against FIPS vectors) —
+the U585 has no HASH peripheral and `HAL_CRC` isn't linked. The FileCmd
+`char_value_length` + `g_cmd_buf` were raised 64 → 244/256 so a phone that
+negotiates a large MTU can push big `FW_DATA` chunks; the offset-based protocol
+works at any chunk size. The IWDG is really **~8 s** (LSI/64, reload 4000) — the
+`config.h` `PL_IWDG_PERIOD_MS 2000` and old `ble.c` "2 s" comments are stale;
+`fw_erase_inactive` feeds `Watchdog_Kick()` per 8 KB page anyway.
+
 ## Architecture in 30 seconds
 
 `main()` runs a single non-preemptive loop driven by the 1 ms SysTick.

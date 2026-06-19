@@ -73,6 +73,10 @@ payload.
 | `0x06` | `SET_MODE` | `<mode:u8>` | `0` = AUTO, `1` = MANUAL. Persisted to `LOGMODE.CFG` on the SD root and applied immediately (AUTO + idle → start a session now; MANUAL never stops a running session). Returns single-byte status. |
 | `0x07` | `GET_MODE` | none | Box replies one byte on FileData: `0` = AUTO, `1` = MANUAL. |
 | `0x08` | `SET_TIME` | `<epoch_ms:u64-LE>` | Host pushes its current wall-clock millis (the box has no RTC). The box appends a `# SYNC epoch_ms=<...> tick_ms=<HAL_GetTick()>` comment line into the open `SensNNN.csv` and `GpsNNN.csv`, pairing the phone epoch with the free-running `ms` counter so replay tools can resolve absolute wall-clock with zero drift and without a GPS fix. Sent on every connect. Returns single-byte status (`0x00` even when idle — marker is a best-effort no-op then; `0xE3` if fewer than 8 epoch bytes). |
+| `0x09` | `FW_BEGIN` | `<image_len:u32-LE><sha256:32>` | Start a firmware-over-BLE update (FOTA, F-FWU). Validates `image_len` ≤ a bank and erases the inactive flash bank. Returns single-byte status: `0x00` ready, `0xB0` busy (another op in flight), `0xE6` image too big, `0xE5` flash-erase failed, `0xE3` malformed (< 37 bytes). See "Firmware update over BLE" below. |
+| `0x0A` | `FW_DATA` | `<offset:u32-LE><bytes…>` | Program a contiguous segment into the inactive bank at `offset`. `offset` must equal the box's current write cursor (a strictly smaller offset is treated as an idempotent retransmit after a lost ACK). On success the box replies a **4-byte** little-endian next-expected-offset (the host's flow-control + resume signal); on error a single byte `0xE7` bad-sequence or `0xE5` flash-program-failed. |
+| `0x0B` | `FW_COMMIT` | none | Flush the final quadword, verify SHA-256 over the staged image, and — on match — activate it (toggle `SWAP_BANK` + reset). Replies `0xA0 FW_READY` then disconnects (the host sees the reset as success and reconnects to the new firmware). On mismatch replies `0xE4`; the running image is untouched. |
+| `0x0C` | `FW_ABORT` | none | Discard the current FOTA session. The partially-written inactive bank is left stale (never activated) and re-erased by the next `FW_BEGIN`. Returns `0x00`. |
 | any other | reserved | — | Box replies `0xE3 BAD_REQUEST` on FileData. |
 
 **LOG mode: AUTO (default) vs MANUAL.** There is still no STREAM_START /
@@ -138,6 +142,11 @@ strictly request-then-response, single-outstanding-request).
 | `0xE1` | NOT_FOUND | Filename not present on SD. |
 | `0xE2` | IO_ERROR | SD read/write failed. |
 | `0xE3` | BAD_REQUEST | Malformed payload (zero-length name, invalid offset, unknown opcode). |
+| `0xA0` | FW_READY | (FOTA) Image verified — box is about to swap banks + reset. **Not an error.** |
+| `0xE4` | FW_HASH_FAIL | (FOTA) Staged image SHA-256 did not match the host-declared digest. Image NOT activated. |
+| `0xE5` | FW_FLASH_FAIL | (FOTA) Inactive-bank erase or program failed. |
+| `0xE6` | FW_TOO_BIG | (FOTA) `image_len` exceeds one flash bank. |
+| `0xE7` | FW_BAD_SEQ | (FOTA) `FW_DATA` offset gap, or `FW_COMMIT` with a short image. |
 
 A 1-byte READ payload is **never** a status byte by coincidence — the
 host distinguishes by checking whether the byte fits the file's
@@ -146,6 +155,73 @@ expected continuation (any value 0–255 is valid file content). The
 expected total length has been received. (A 1-byte file containing
 `0x00` and a 0-byte file with terminator are indistinguishable —
 acceptable corner case.)
+
+### Firmware update over BLE (FOTA) — F-FWU
+
+Implements REQUIREMENTS.md F-FWU (moves the former OOS-4 in-scope; see the
+governance note there). Lets the iOS / Android / desktop apps push a new
+`firmware.bin` to the box over the existing FileSync link instead of opening
+the case for USB-C DFU. Implemented in `fwupdate.c`; wired into `ble.c`'s
+FileSync dispatch as opcodes `0x09`–`0x0C`.
+
+**Dual-bank A/B, brick-safe by construction.** The STM32U585 is a 2 × 1 MB
+dual-bank part with a `SWAP_BANK` option byte: whichever physical bank the
+boot-ROM maps to `0x08000000` is "active", the other is always at `0x08100000`.
+The app is linked to a single bank (`LENGTH=1024K`) and runs/logs from the
+active bank while a new image streams into the **inactive** bank
+(read-while-write, no execution stall). `SWAP_BANK` is toggled **only after**
+the whole image is programmed and its SHA-256 matches the host-declared digest,
+so a corrupt or interrupted upload can never brick the box — the previous image
+stays intact in the other bank as an automatic rollback. There is **no
+bootloader**: the boot-ROM performs the swap.
+
+> **Brick gotcha (do not regress).** `HAL_FLASHEx_Erase` bank numbers follow the
+> live `SWAP_BANK` state, so a hardcoded `FLASH_BANK_2` erases the *running*
+> bank once swapped. `fwupdate.c` computes the inactive bank from `FLASH->OPTR`
+> on every operation (`swapped ? FLASH_BANK_1 : FLASH_BANK_2`).
+
+**Wire protocol.** Host → box (FileCmd `0x09`–`0x0C`, table above):
+
+1. `FW_BEGIN <image_len:u32><sha256:32>` — box erases the inactive-bank pages the
+   image will occupy (one 8 KB page per HAL call, IWDG fed between pages; ≤ ~1 s,
+   a brief logging gap accepted), stores the expected digest, replies `0x00`.
+2. `FW_DATA <offset:u32><bytes…>` — box buffers into 128-bit quadwords and
+   programs them; replies the 4-byte next-expected-offset. **ACK-gated**: the
+   host sends the next chunk only after this ACK, which serialises with the
+   single FileCmd buffer and prevents overrun. A lost ACK → host resends the
+   same offset → box re-ACKs the current cursor idempotently (cheap resume; a
+   dropped *link* aborts the session via the stall watchdog and the host
+   restarts from `FW_BEGIN`). Chunk size is the host's `min(char_value_length
+   244, MTU−3) − 5` — `char_value_length` was raised 64 → 244 so a phone that
+   negotiates a large MTU can push big chunks.
+3. `FW_COMMIT` — box pads the final quadword, recomputes SHA-256 over exactly
+   `image_len` bytes of the inactive bank, and on match notifies `0xA0` then
+   toggles `SWAP_BANK` + resets. The host observes the disconnect as success and
+   reconnects to verify the new build. On mismatch: `0xE4`, session ends, active
+   bank untouched.
+
+**Integrity, not authenticity.** SHA-256 guarantees the activated image is
+exactly what the host sent (no corruption/truncation), but does not
+authenticate the sender — consistent with OOS-7 (physical-possession-equals-
+trust) and the fixed BLE PIN. Signed images (Ed25519) are a future option if the
+trust model tightens; the digest field would become a signature.
+
+**Runtime-hang rollback.** Verify-before-activate covers corruption; a verified
+image that *hangs at runtime* is caught by a boot-attempt counter. `FW_COMMIT`
+drops an SD marker `FWPEND.STA`; `FwUpdate_BootCheck()` (called right after
+`SDFat_Mount()` in `main.c`, before sensor init) bumps the counter each boot and,
+after `FW_MAX_BOOT_ATTEMPTS` (5) unconfirmed boots, flips `SWAP_BANK` back to the
+previous image and resets. A healthy image clears the marker via
+`FwUpdate_ConfirmBoot()` once it has run past `FW_CONFIRM_UPTIME_MS` (15 s). The
+only residual brick path — a verified image that hangs *before* SD mount — is
+the same USB-C DFU recovery that is the sole update path today, so it is never
+worse than the status quo.
+
+**State-machine integration (Section 11).** FOTA reuses the FileSync FSM: a
+session is `FSM_FW_RECV`, rejects other ops with BUSY, rides the same READ
+deadline (600 s) + stall (15 s) + disconnect guards, and `fsm_emergency_exit`
+calls `FwUpdate_Abort()` to drop a partial session (the inactive bank is left
+stale, never activated).
 
 ---
 

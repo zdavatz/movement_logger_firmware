@@ -36,6 +36,7 @@
 #include "logger.h"
 #include "stream.h"
 #include "battery.h"
+#include "fwupdate.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -86,12 +87,29 @@
 #define FSYNC_OP_SET_TIME   0x08   /* <epoch_ms:u64-LE> phone wall-clock; the
                                       box stamps a # SYNC anchor into the open
                                       Sens/Gps CSVs (it has no RTC). 1-byte OK */
+/* Firmware-update-over-BLE (FOTA) opcodes — dual-bank A/B, see fwupdate.c. */
+#define FSYNC_OP_FW_BEGIN   0x09   /* <image_len:u32-LE><sha256:32>; erases the
+                                      inactive bank → 1-byte status            */
+#define FSYNC_OP_FW_DATA    0x0A   /* <offset:u32-LE><bytes…>; programs the bank
+                                      → 4-byte next-expected-offset ACK / 1-byte
+                                      error                                    */
+#define FSYNC_OP_FW_COMMIT  0x0B   /* (none); SHA-verify then swap+reset → sends
+                                      0xA0 then disconnects, or 1-byte error   */
+#define FSYNC_OP_FW_ABORT   0x0C   /* (none); discard session → 1-byte OK      */
+
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
 #define FSYNC_ST_BUSY       0xB0
 #define FSYNC_ST_NOT_FOUND  0xE1
 #define FSYNC_ST_IO_ERROR   0xE2
 #define FSYNC_ST_BAD_REQ    0xE3
+/* Firmware-update status bytes (FileData replies). 0xA0 is a NON-error
+   "verified, about to reset" ack; the 0xE4..0xE7 band are FOTA errors. */
+#define FSYNC_ST_FW_READY        0xA0   /* image verified — activating + reset */
+#define FSYNC_ST_FW_HASH_FAIL    0xE4   /* SHA-256 mismatch — not activated    */
+#define FSYNC_ST_FW_FLASH_FAIL   0xE5   /* erase/program failure               */
+#define FSYNC_ST_FW_TOO_BIG      0xE6   /* image larger than a bank            */
+#define FSYNC_ST_FW_BAD_SEQ      0xE7   /* FW_DATA offset gap / short image    */
 
 /* BlueST FileSync UUIDs (CLAUDE.md). 128-bit, little-endian on the wire. */
 static const uint8_t BLE_SVC_UUID[16] = {
@@ -426,10 +444,14 @@ static int ble_notify_try(uint16_t val_handle, const uint8_t *data,
 /* ----- FileSync command handling ----------------------------------------- */
 
 /* Captured FileCmd write payload, set by the attribute-modified handler and
-   consumed by ble_process_command() at the end of BLE_Tick. */
-static uint8_t  g_cmd_buf[64];
-static uint8_t  g_cmd_len     = 0;
-static uint8_t  g_cmd_pending = 0;
+   consumed by ble_process_command() at the end of BLE_Tick. Sized 256 (was 64)
+   so a client that negotiated a large ATT MTU can push firmware-image chunks
+   of up to char_value_length (244) bytes per FW_DATA write — the per-write ATT
+   limit, not g_att_mtu (which only sizes our outbound notifies), governs
+   inbound writes. g_cmd_len widened to u16 to match. */
+static uint8_t   g_cmd_buf[256];
+static uint16_t  g_cmd_len     = 0;
+static uint8_t   g_cmd_pending = 0;
 
 /* LIST: one notification per root-dir entry, "name,size\n", then a lone
    "\n" terminator. Callback runs inside SDFat_ListRoot's walk. Returns
@@ -485,7 +507,7 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
    one comfortable interval of retry. Failed sends just retry next tick. */
 #define FSM_NOTIFY_BUDGET_MS      50
 
-typedef enum { FSM_IDLE = 0, FSM_READ_STREAM } fsm_state_t;
+typedef enum { FSM_IDLE = 0, FSM_READ_STREAM, FSM_FW_RECV } fsm_state_t;
 
 static struct {
   fsm_state_t state;
@@ -531,6 +553,10 @@ static void fsm_emergency_exit(int code, const char *why)
   ErrLog_Write(buf);
   if (g_fsm.state == FSM_READ_STREAM) {
     SDFat_Close(&g_fsm.f);
+  } else if (g_fsm.state == FSM_FW_RECV) {
+    /* Drop the firmware session — the partially-written inactive bank is left
+       stale and is never activated; the next FW_BEGIN re-erases it. */
+    FwUpdate_Abort();
   }
   /* Best-effort status byte. If the peer is genuinely gone the send
      fails fast (50 ms cap) and we don't care. */
@@ -583,6 +609,11 @@ static void fsm_advance(void)
     fsm_emergency_exit(SM_PEER_GONE, "disconnect");
     return;
   }
+
+  /* Only the READ stream pushes data from here; FW_RECV is host-driven (the
+     firmware programs flash inside the FW_DATA command handler) and just rides
+     the deadline / stall / disconnect guards above. */
+  if (g_fsm.state != FSM_READ_STREAM) return;
 
   /* Read next chunk if our retry buffer is empty. */
   if (g_fsm.buf_len == 0) {
@@ -837,6 +868,114 @@ static void ble_process_command(void)
                (unsigned long)HAL_GetTick(), wrote);
       ErrLog_Write(buf);
     }
+  } else if (op == FSYNC_OP_FW_BEGIN) {
+    /* FW_BEGIN <image_len:u32-LE><sha256:32>: start a firmware-over-BLE update
+       — erase the inactive bank, ready to receive. Rejected with BUSY if any
+       FileSync op (a READ stream or another FW session) is already in flight.
+       The actual flash erase happens synchronously inside FwUpdate_Begin
+       (≤ ~1 s, IWDG fed per page) — a brief logging gap at update time is
+       accepted; the box reboots into new firmware moments later anyway. */
+    if (g_fsm.state != FSM_IDLE) {
+      uint8_t st = FSYNC_ST_BUSY;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+      ErrLog_Write("ble: FW_BEGIN busy — fsm active");
+      return;
+    }
+    if (g_cmd_len < 1 + 4 + 32) {
+      uint8_t st = FSYNC_ST_BAD_REQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: FW_BEGIN bad request (need len+sha256)");
+      return;
+    }
+    uint32_t image_len = (uint32_t)g_cmd_buf[1]
+                       | ((uint32_t)g_cmd_buf[2] << 8)
+                       | ((uint32_t)g_cmd_buf[3] << 16)
+                       | ((uint32_t)g_cmd_buf[4] << 24);
+    fwup_status_t r = FwUpdate_Begin(image_len, &g_cmd_buf[5]);
+    uint8_t st = (r == FWUP_OK)          ? FSYNC_ST_OK
+               : (r == FWUP_ERR_TOO_BIG) ? FSYNC_ST_FW_TOO_BIG
+                                         : FSYNC_ST_FW_FLASH_FAIL;
+    if (r == FWUP_OK) {
+      memset(&g_fsm, 0, sizeof(g_fsm));
+      g_fsm.state              = FSM_FW_RECV;
+      g_fsm.entered_tick       = HAL_GetTick();
+      g_fsm.last_progress_tick = g_fsm.entered_tick;
+      memcpy(g_fsm.name, "fw", 3);
+    }
+    ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+    snprintf(buf, sizeof(buf), "ble: FW_BEGIN len=%lu r=%d st=0x%02x",
+             (unsigned long)image_len, r, st);
+    ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_FW_DATA) {
+    /* FW_DATA <offset:u32-LE><bytes…>: program a contiguous segment into the
+       inactive bank. Success ACK is a 4-byte little-endian next-expected-offset
+       (the host's flow-control + resume signal); errors are a single byte. */
+    if (g_fsm.state != FSM_FW_RECV || !FwUpdate_Active()) {
+      uint8_t st = FSYNC_ST_FW_BAD_SEQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+      ErrLog_Write("ble: FW_DATA with no active session");
+      return;
+    }
+    if (g_cmd_len < 5) {
+      uint8_t st = FSYNC_ST_BAD_REQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+      return;
+    }
+    uint32_t offset = (uint32_t)g_cmd_buf[1]
+                    | ((uint32_t)g_cmd_buf[2] << 8)
+                    | ((uint32_t)g_cmd_buf[3] << 16)
+                    | ((uint32_t)g_cmd_buf[4] << 24);
+    uint32_t dlen = (uint32_t)g_cmd_len - 5;
+    uint32_t next = 0;
+    fwup_status_t r = FwUpdate_Data(offset, &g_cmd_buf[5], dlen, &next);
+    if (r == FWUP_OK) {
+      g_fsm.last_progress_tick = HAL_GetTick();   /* reset the stall watchdog  */
+      uint8_t ack[4] = { (uint8_t)next, (uint8_t)(next >> 8),
+                         (uint8_t)(next >> 16), (uint8_t)(next >> 24) };
+      ble_notify_try(g_filedata_handle + 1, ack, 4, 200);
+    } else {
+      uint8_t st = (r == FWUP_ERR_BAD_SEQ) ? FSYNC_ST_FW_BAD_SEQ
+                                           : FSYNC_ST_FW_FLASH_FAIL;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+      if (r == FWUP_ERR_FLASH) { FwUpdate_Abort(); g_fsm.state = FSM_IDLE; }
+      snprintf(buf, sizeof(buf), "ble: FW_DATA off=%lu r=%d",
+               (unsigned long)offset, r);
+      ErrLog_Write(buf);
+    }
+  } else if (op == FSYNC_OP_FW_COMMIT) {
+    /* FW_COMMIT: SHA-verify the staged image; on match notify 0xA0 then swap
+       banks + reset (the host sees the disconnect as success and reconnects to
+       the new firmware). On mismatch the active bank is untouched. */
+    if (g_fsm.state != FSM_FW_RECV || !FwUpdate_Active()) {
+      uint8_t st = FSYNC_ST_FW_BAD_SEQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
+      ErrLog_Write("ble: FW_COMMIT with no active session");
+      return;
+    }
+    fwup_status_t r = FwUpdate_Commit();
+    if (r == FWUP_OK) {
+      uint8_t st = FSYNC_ST_FW_READY;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: FW_COMMIT verified — activating");
+      HAL_Delay(200);                 /* let the 0xA0 notify drain over the air */
+      FwUpdate_Activate();            /* swap banks + reset — does not return    */
+    } else {
+      uint8_t st = (r == FWUP_ERR_HASH)    ? FSYNC_ST_FW_HASH_FAIL
+                 : (r == FWUP_ERR_BAD_SEQ) ? FSYNC_ST_FW_BAD_SEQ
+                                           : FSYNC_ST_FW_FLASH_FAIL;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      g_fsm.state = FSM_IDLE;
+      snprintf(buf, sizeof(buf), "ble: FW_COMMIT failed r=%d st=0x%02x", r, st);
+      ErrLog_Write(buf);
+    }
+  } else if (op == FSYNC_OP_FW_ABORT) {
+    /* FW_ABORT: discard the session; the stale inactive bank is never
+       activated and the next FW_BEGIN re-erases it. */
+    FwUpdate_Abort();
+    g_fsm.state = FSM_IDLE;
+    uint8_t st = FSYNC_ST_OK;
+    ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+    ErrLog_Write("ble: FW_ABORT");
   } else {
     snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x (not yet handled)", op);
     ErrLog_Write(buf);
@@ -1054,7 +1193,9 @@ int BLE_Init(void)
     if (rc != 0) return -8;
   }
 
-  /* FileCmd char — write w/o response, max 64 bytes (opcode + filename) */
+  /* FileCmd char — write w/o response, max 244 bytes (opcode + filename, or a
+     firmware-image chunk). Raised from 64 so FW_DATA chunks can be as large as
+     a negotiated MTU allows; g_cmd_buf[256] backs it. */
   {
     uint8_t p[26];
     int i = 0;
@@ -1062,7 +1203,7 @@ int BLE_Init(void)
     p[i++] = (uint8_t)(g_svc_handle >> 8);
     p[i++] = 0x02;                            /* UUID type: 128-bit */
     memcpy(&p[i], BLE_FILECMD_UUID, 16); i += 16;
-    p[i++] = 64; p[i++] = 0;                  /* char_value_length = 64 */
+    p[i++] = 244; p[i++] = 0;                 /* char_value_length = 244 */
     p[i++] = BLE_PROP_WRITE | BLE_PROP_WRITE_NO_RSP;  /* accept both write types */
     p[i++] = 0x00;                            /* security: none */
     p[i++] = 0x01;                            /* gatt_evt_mask: attribute modified */
@@ -1370,7 +1511,7 @@ void BLE_Tick(void)
           if (cap > sizeof(g_cmd_buf)) cap = sizeof(g_cmd_buf);
           if ((int)(12 + cap) <= n) {
             memcpy(g_cmd_buf, &evt[12], cap);
-            g_cmd_len     = (uint8_t)cap;
+            g_cmd_len     = cap;
             g_cmd_pending = 1;
           }
         }

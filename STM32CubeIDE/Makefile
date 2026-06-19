@@ -73,6 +73,8 @@ C_SOURCES = \
   $(APP)/Src/gps.c \
   $(APP)/Src/logger.c \
   $(APP)/Src/ble.c \
+  $(APP)/Src/fwupdate.c \
+  $(APP)/Src/sha256.c \
   $(APP)/Src/stream.c \
   $(APP)/Src/battery.c \
   $(APP)/Src/usb_msc.c \

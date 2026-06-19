@@ -24,6 +24,7 @@
 #include "logger.h"
 #include "ble.h"
 #include "usb_msc.h"
+#include "fwupdate.h"
 
 /* Captured *before* HAL clears anything so the error log can decode the
    reset reason in ErrLog_Init(). */
@@ -92,6 +93,12 @@ int main(void)
   } else {
     Buzzer_Beep(3000U, 60U);
     ErrLog_Init();
+    /* Firmware-update rollback check (runs before sensors so a reverting boot
+       is as quick as possible). If a BLE-flashed image was swapped in but never
+       confirmed healthy after FW_MAX_BOOT_ATTEMPTS resets, this flips SWAP_BANK
+       back to the previous image and resets — never returns in that case. SD is
+       mounted (we're in the SD-OK branch) so the pending marker is readable. */
+    FwUpdate_BootCheck();
     if (FUEL_Init() != 0) {
       ErrLog_Write("fuel: init FAIL");
       beep_pattern(2000, 4, 60, 80);
@@ -164,6 +171,12 @@ int main(void)
     Logger_Tick();
     GPS_Tick();
     BLE_Tick();
+
+    /* Once the box has run stably past FW_CONFIRM_UPTIME_MS, mark a freshly
+       BLE-flashed image healthy so the boot-attempt rollback won't revert it.
+       Self-gating one-shot — cheap no-op on every later call and when no update
+       is pending. */
+    FwUpdate_ConfirmBoot();
 
     /* Green-LED pattern based on GPS fix quality. Phase advances every
        125 ms; eight 125 ms slots = one second per cycle. Pattern table:
