@@ -160,6 +160,14 @@ static uint16_t          g_battery_handle  = 0;
 /* Current connection handle (0 = no active connection). Set in BLE_Tick on
    HCI_LE_Connection_Complete; cleared on Disconnection_Complete. */
 static uint16_t          g_conn_handle     = 0;
+/* Wall-clock (HAL tick) of the last evidence the peer is still alive, used by
+   the peer-gone watchdog (issue #4). Refreshed on connect, on every inbound
+   write from the peer, and on every SUCCESSFUL notify — a notify only
+   succeeds when the BlueNRG TX buffer drains, which only happens when the
+   peer ACKs at the link layer, so a drained notify is positive proof the
+   peer is still there (covers a passive live-stream viewer that never writes
+   back). 0 while disconnected. */
+static uint32_t          g_last_peer_seen_ms = 0;
 /* Negotiated ATT MTU for the active connection. Default 23 (=20-byte
    notify payload) per BLE spec; updated to actual negotiated value
    when the BlueNRG-LP emits ACI_ATT_EXCHANGE_MTU_RESP_EVENT (0x0C17)
@@ -413,7 +421,14 @@ static int ble_notify(uint16_t val_handle, const uint8_t *data, uint16_t len)
   p[i++] = (uint8_t)(len & 0xFF);
   p[i++] = (uint8_t)(len >> 8);
   if (len > 0) { memcpy(&p[i], data, len); i += len; }
-  return ble_aci_cmd(ACI_OP_GATT_SRV_NOTIFY, p, (uint16_t)i, NULL, 0);
+  int rc = ble_aci_cmd(ACI_OP_GATT_SRV_NOTIFY, p, (uint16_t)i, NULL, 0);
+  /* A drained notify = the peer ACKed at the link layer = it's alive. Feed
+     the peer-gone watchdog (issue #4) so a passive listener that never
+     writes back still counts as present. Failures (TX buffer full because
+     the peer stopped ACKing) deliberately do NOT refresh — that's exactly
+     the silent-drop signal the watchdog needs. */
+  if (rc == 0) g_last_peer_seen_ms = HAL_GetTick();
+  return rc;
 }
 
 /* Notify with bounded congestion handling. The BlueNRG-LP TX buffer holds
@@ -501,6 +516,17 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
 #define FSM_READ_DEADLINE_MS   600000
 #define FSM_STALL_DEADLINE_MS   15000
 
+/* Peer-gone watchdog (issue #4): max time we tolerate being connected with
+   NO evidence the peer is alive before forcing disconnect + re-advertise.
+   Sits comfortably above the longest legitimate silence between liveness
+   signals — a battery-only subscriber's notify period (60 s) — so a passive
+   live-stream/battery viewer is never falsely dropped, while a genuinely
+   vanished peer (iOS lock-screen, BT power-nap) is recovered within ~90 s.
+   The host clients (iOS/Android/desktop) hold their reconnect open and
+   resume the moment the box re-advertises, so ~90 s box-side recovery is
+   well within tolerance. */
+#define PEER_GONE_DEADLINE_MS   90000
+
 /* Per-chunk notify budget INSIDE fsm_advance. Short on purpose: each
    BLE_Tick may eat at most this much wall-clock so Logger_Tick stays
    responsive. Typical macOS connection interval is 30 ms; 50 ms is
@@ -543,6 +569,28 @@ static int ble_hci_disconnect(uint16_t conn_handle, uint8_t reason)
   return ble_hci_send(frame, sizeof(frame));
 }
 
+/* Force-tear-down a connection the chip still thinks is alive, then re-arm
+   advertising — WITHOUT waiting for a Disconnection_Complete event that may
+   never come. This is Build #57's belt-and-suspenders recovery (HCI_Disconnect
+   + local state clear + re-advertise), extracted so both fsm_emergency_exit
+   and the peer-gone watchdog (issue #4) share one proven sequence. No-op if
+   already disconnected. */
+static void ble_recover_lost_peer(const char *why)
+{
+  if (g_conn_handle == 0) return;
+  uint16_t ch = g_conn_handle;
+  int hd_rc  = ble_hci_disconnect(ch, 0x13);       /* reason: Remote User */
+  HAL_Delay(500);                                  /* give chip time to process */
+  g_conn_handle        = 0;
+  g_stream_subscribed  = 0;
+  g_battery_subscribed = 0;
+  int adv_rc = ble_adv_enable();
+  char buf[96];
+  snprintf(buf, sizeof(buf), "ble: peer-recover hci_disc=0x%04x rc=%d re-adv=%d why=%s",
+           ch, hd_rc, adv_rc, why);
+  ErrLog_Write(buf);
+}
+
 static void fsm_emergency_exit(int code, const char *why)
 {
   uint32_t held_ms = HAL_GetTick() - g_fsm.entered_tick;
@@ -567,26 +615,12 @@ static void fsm_emergency_exit(int code, const char *why)
     ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
   }
   /* Recovery for the "stall" / "deadline" / "sdread" cases: if our local
-     g_conn_handle is still set, the chip thinks the connection is
-     alive — we need to actively tear it down AND re-arm advertising.
-     Build #56 only sent HCI_Disconnect and relied on the chip to emit
-     Disconnection_Complete back — but in real-world testing (Mac BT
-     toggled off), the chip never raised that event, so re-advertising
-     never fired and the box stayed invisible. Build #57 belt-and-
-     suspenders: HCI_Disconnect AND a direct local re-arm without
-     waiting for any chip event. */
-  if (g_conn_handle != 0) {
-    uint16_t ch = g_conn_handle;
-    int hd_rc  = ble_hci_disconnect(ch, 0x13);       /* reason: Remote User */
-    HAL_Delay(500);                                  /* give chip time to process */
-    g_conn_handle        = 0;
-    g_stream_subscribed  = 0;
-    g_battery_subscribed = 0;
-    int adv_rc = ble_adv_enable();
-    snprintf(buf, sizeof(buf), "fsm: hci_disc=0x%04x rc=%d, re-adv rc=%d",
-             ch, hd_rc, adv_rc);
-    ErrLog_Write(buf);
-  }
+     g_conn_handle is still set, the chip thinks the connection is alive —
+     actively tear it down AND re-arm advertising. (Build #56 relied on the
+     chip emitting Disconnection_Complete, but with Mac BT toggled off the
+     chip never raised it; Build #57's direct re-arm fixed that.) Shared with
+     the peer-gone watchdog via ble_recover_lost_peer. */
+  ble_recover_lost_peer(why);
   g_fsm.state = FSM_IDLE;
 }
 
@@ -1436,6 +1470,19 @@ void BLE_Tick(void)
      (not gated on irq_high) so progress happens even on quiet links. */
   fsm_advance();
 
+  /* Peer-gone watchdog (issue #4). The Disconnection_Complete handler
+     re-advertises, but only if the chip raises that event — on a SILENT drop
+     (iOS lock-screen suspend, BT power-nap) it often doesn't, leaving the box
+     stuck connected-in-limbo and invisible to scans until a power-cycle. The
+     FSM stall guard (15 s) already covers an ACTIVE transfer; this covers the
+     IDLE-connected case it can't see. Runs every tick (before the irq_high
+     early-return) so it fires on a dead-quiet link. fsm_advance() above may
+     have already cleared g_conn_handle, so this won't double-fire. */
+  if (g_conn_handle != 0 &&
+      (HAL_GetTick() - g_last_peer_seen_ms) >= PEER_GONE_DEADLINE_MS) {
+    ble_recover_lost_peer("peer-gone watchdog");
+  }
+
   if (!irq_high()) return;
 
   uint8_t evt[260];
@@ -1455,6 +1502,7 @@ void BLE_Tick(void)
         uint8_t  st = evt[4];
         uint16_t ch = (uint16_t)(evt[5] | (evt[6] << 8));
         g_conn_handle = ch;
+        g_last_peer_seen_ms = HAL_GetTick();   /* arm the peer-gone watchdog */
         snprintf(buf, sizeof(buf), "ble: connected st=%d conn=0x%04x sub=0x%02x",
                  st, ch, evt[3]);
         ErrLog_Write(buf);
@@ -1498,6 +1546,7 @@ void BLE_Tick(void)
            evt[10..11] = attr_data_length
            evt[12..]   = attr_data */
       if (ecode == 0x0C01 && n >= 12) {
+        g_last_peer_seen_ms = HAL_GetTick();   /* inbound write = peer alive */
         uint16_t attr = (uint16_t)(evt[8]  | (evt[9]  << 8));
         uint16_t dlen = (uint16_t)(evt[10] | (evt[11] << 8));
         uint8_t  op   = (n >= 13) ? evt[12] : 0;
