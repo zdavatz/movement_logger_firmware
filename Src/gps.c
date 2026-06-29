@@ -340,6 +340,17 @@ int GPS_Init(void)
   g_rx_head   = 0;
   g_rx_tail   = 0;
 
+#if PL_USB_GPS_HOST
+  /* USB-host GNSS build: the receiver is the USB-CDC dongle, fed via
+     GPS_FeedBytes() from usb_gps_host.c — NOT the soldered UART4 module.
+     Skip UART4 bring-up entirely so we don't waste 3.5 s hunting a baud
+     lock on a port with no module, and don't latch the red-LED warning
+     for a GPS we're not using. The parser state above is all GPS_Tick
+     needs; the ring is filled over USB. */
+  extern void ErrLog_Write(const char *msg);
+  ErrLog_Write("gps: source = USB-CDC host (UART4 skipped)");
+  return 0;
+#else
   __HAL_RCC_UART4_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
@@ -480,6 +491,7 @@ int GPS_Init(void)
                 (unsigned long)locked_baud,
                 (unsigned long)(1000U / meas_ms));
   return 0;
+#endif /* PL_USB_GPS_HOST */
 }
 
 /* ---------- IRQ + callbacks --------------------------------------------- */
@@ -500,6 +512,25 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     g_rx_dropped++;  /* ring full — main loop fell behind */
   }
   HAL_UART_Receive_IT(huart, &g_rx_byte, 1);
+}
+
+/* Phase 10: push externally-sourced NMEA bytes (USB-CDC GNSS host) into the
+   same ring the UART IRQ feeds, so the parser in GPS_Tick is source-agnostic.
+   Single-producer like the UART path — in a USB-host-GPS build UART4 RX is
+   not armed, so there is no contention on g_rx_head. Drops on ring-full,
+   same as the UART path. */
+void GPS_FeedBytes(const uint8_t *buf, uint16_t len)
+{
+  if (!buf) return;
+  for (uint16_t i = 0; i < len; i++) {
+    uint16_t next = (uint16_t)((g_rx_head + 1u) % GPS_RX_RING_SIZE);
+    if (next != g_rx_tail) {
+      g_rx_ring[g_rx_head] = buf[i];
+      g_rx_head = next;
+    } else {
+      g_rx_dropped++;  /* ring full — main loop fell behind */
+    }
+  }
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)

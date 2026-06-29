@@ -39,15 +39,26 @@ void UART4_IRQHandler(void)
   GPS_UART_IRQHandler();
 }
 
-/* OTG_FS global IRQ — forwarded to TinyUSB's device interrupt handler.
+/* OTG_FS global IRQ — forwarded to TinyUSB.
    F-ARCH-7 sanctioned exception #2 (Phase 9 / Issue #5): USB enumeration
-   requires fast (<100 µs) response to bus events; polling tud_task at
-   the 1 ms main-loop cadence is not fast enough for the bus reset /
-   set-address handshake. NVIC priority set in usb_msc.c::usb_msc_hw_init.
-   Counter g_otg_fs_irq_count lives in usb_msc.c. */
-extern volatile uint32_t g_otg_fs_irq_count;
+   requires fast (<100 µs) response to bus events; polling the task at the
+   1 ms main-loop cadence is not fast enough for the bus reset / set-address
+   handshake. NVIC priority set in the USB module's hw init.
+   Device build (Phase 9 MSC) → tud_int_handler; host build (Phase 10
+   USB-GPS, PL_USB_GPS_HOST) → tuh_int_handler. The host-probe diagnostic
+   polls and never arms this IRQ, so the device path is harmless there. */
+#if PL_USB_GPS_HOST
+extern volatile uint32_t g_otg_fs_irq_count;  /* lives in usb_gps_host.c */
+void OTG_FS_IRQHandler(void)
+{
+  g_otg_fs_irq_count++;
+  tuh_int_handler(0);
+}
+#else
+extern volatile uint32_t g_otg_fs_irq_count;  /* lives in usb_msc.c */
 void OTG_FS_IRQHandler(void)
 {
   g_otg_fs_irq_count++;
   tud_int_handler(0);
 }
+#endif

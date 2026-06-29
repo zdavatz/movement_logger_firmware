@@ -25,6 +25,9 @@ typedef struct {
 
 int  GPS_Init(void);
 void GPS_Tick(void);
+/* Phase 10: feed NMEA bytes from an external source (USB-CDC GNSS host) into
+   the same RX ring the UART4 IRQ uses. GPS_Tick parses them identically. */
+void GPS_FeedBytes(const uint8_t *buf, uint16_t len);
 int  GPS_GetLatestFix(PL_GpsFix *out);
 /* True if a fresh fix was published since last Get-call. Auto-cleared. */
 uint8_t GPS_FixUpdated(void);

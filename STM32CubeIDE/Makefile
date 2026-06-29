@@ -45,10 +45,26 @@ BUILD_COUNTER := $(shell \
 # Override per build: `make GPS_ANTENNA_BEEP=1`.
 GPS_ANTENNA_BEEP ?= 0
 
+# USB host-mode connect probe — diagnostic build. When 1, OTG_FS comes up in
+# HOST mode and polls the port for a plugged-in device (does the box see the
+# GPS dongle on USB-C?) instead of the production USB-MSC device. Reports via
+# buzzer + SD errlog. Default 0 (production MSC). See Src/usb_host_probe.c.
+# Override per build: `make USB_HOST_PROBE=1`.
+USB_HOST_PROBE ?= 0
+
+# USB-host GNSS build (Phase 10). When 1, OTG_FS comes up in HOST mode and
+# enumerates a USB-CDC GNSS dongle, forwarding its NMEA into gps.c — instead
+# of the Phase 9 USB-MSC device. Selects host TinyUSB sources (see C_SOURCES)
+# and flips CFG_TUH/CFG_TUD in tusb_config.h. Default 0 (MSC device).
+# Mutually exclusive with USB_HOST_PROBE. Override: `make USB_GPS_HOST=1`.
+USB_GPS_HOST ?= 0
+
 CFLAGS = $(CPU) $(DEFS) $(INCLUDES) -O2 -Wall -Wno-format -Wno-unused-function \
          -fdata-sections -ffunction-sections -g3 \
          -DPL_BUILD_NUM=$(BUILD_COUNTER) \
-         -DPL_GPS_ANTENNA_BEEP=$(GPS_ANTENNA_BEEP)
+         -DPL_GPS_ANTENNA_BEEP=$(GPS_ANTENNA_BEEP) \
+         -DPL_USB_HOST_PROBE=$(USB_HOST_PROBE) \
+         -DPL_USB_GPS_HOST=$(USB_GPS_HOST)
 
 LDSCRIPT = STM32U585AIIXQ_FLASH.ld
 LDFLAGS  = $(CPU) -T$(LDSCRIPT) -Wl,--gc-sections \
@@ -75,24 +91,39 @@ C_SOURCES = \
   $(APP)/Src/ble.c \
   $(APP)/Src/stream.c \
   $(APP)/Src/battery.c \
-  $(APP)/Src/usb_msc.c \
-  $(APP)/Src/usb_descriptors.c \
+  $(APP)/Src/usb_host_probe.c \
   $(APP)/Src/stm32u5xx_it.c \
   $(APP)/Src/system_stm32u5xx.c \
   Application/User/syscalls.c \
   Application/User/sysmem.c
 
-# TinyUSB middleware (Phase 9 — Issue #5). DWC2 driver + device core +
-# MSC class only. CDC is gated off via CFG_TUD_CDC=0 in tusb_config.h
-# so its sources don't need linking even though they're present in the
-# vendored tree.
-C_SOURCES += \
-  $(ROOT)/Middlewares/Third_Party/tinyusb/src/tusb.c \
-  $(ROOT)/Middlewares/Third_Party/tinyusb/src/common/tusb_fifo.c \
-  $(ROOT)/Middlewares/Third_Party/tinyusb/src/device/usbd.c \
-  $(ROOT)/Middlewares/Third_Party/tinyusb/src/class/msc/msc_device.c \
-  $(ROOT)/Middlewares/Third_Party/tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c \
-  $(ROOT)/Middlewares/Third_Party/tinyusb/src/portable/synopsys/dwc2/dwc2_common.c
+# TinyUSB middleware. The OTG core is one role per build, so the role-
+# specific class + portable sources are selected by USB_GPS_HOST:
+#   USB_GPS_HOST=1  → HOST: TinyUSB host core + CDC-host + hcd_dwc2 (Phase 10)
+#   default (0)     → DEVICE: TinyUSB device core + MSC class + dcd_dwc2 (Ph.9)
+# tusb_config.h flips CFG_TUH/CFG_TUD on the same PL_USB_GPS_HOST flag, so the
+# unused side's sources must not be linked (they reference the other role's
+# config and would fail / bloat). tusb.c + tusb_fifo.c + dwc2_common.c are
+# common to both.
+TUSB = $(ROOT)/Middlewares/Third_Party/tinyusb/src
+C_SOURCES += $(TUSB)/tusb.c $(TUSB)/common/tusb_fifo.c \
+             $(TUSB)/portable/synopsys/dwc2/dwc2_common.c
+
+ifeq ($(USB_GPS_HOST),1)
+  # Phase 10 host-GPS build.
+  C_SOURCES += $(APP)/Src/usb_gps_host.c \
+               $(TUSB)/host/usbh.c \
+               $(TUSB)/host/hub.c \
+               $(TUSB)/class/cdc/cdc_host.c \
+               $(TUSB)/portable/synopsys/dwc2/hcd_dwc2.c
+else
+  # Phase 9 USB-MSC device build (also the base for the host-probe diagnostic).
+  C_SOURCES += $(APP)/Src/usb_msc.c \
+               $(APP)/Src/usb_descriptors.c \
+               $(TUSB)/device/usbd.c \
+               $(TUSB)/class/msc/msc_device.c \
+               $(TUSB)/portable/synopsys/dwc2/dcd_dwc2.c
+endif
 
 # STM32 HAL — Phase 3 adds I²C, SPI, UART, SD, IWDG to the Phase 2 set.
 C_SOURCES += \

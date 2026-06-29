@@ -24,6 +24,8 @@
 #include "logger.h"
 #include "ble.h"
 #include "usb_msc.h"
+#include "usb_host_probe.h"
+#include "usb_gps_host.h"
 
 /* Captured *before* HAL clears anything so the error log can decode the
    reset reason in ErrLog_Init(). */
@@ -137,6 +139,29 @@ int main(void)
       ErrLog_Write("ble: init FAIL");
       beep_pattern(2000, 7, 60, 80);
     }
+#if PL_USB_HOST_PROBE
+    /* Diagnostic build (make USB_HOST_PROBE=1): instead of the MSC device,
+       bring OTG_FS up in HOST mode and poll the port for a plugged-in
+       device. Answers "does the box see the GPS dongle on USB-C?" on real
+       silicon. See usb_host_probe.h. Mutually exclusive with MSC — one OTG
+       core can be host or device, not both. */
+    if (!UsbHostProbe_Init()) {
+      ErrLog_Write("usbh: init FAIL");
+      beep_pattern(2000, 8, 60, 80);
+    }
+    ErrLog_Flush();
+#elif PL_USB_GPS_HOST
+    /* Phase 10 (make USB_GPS_HOST=1): OTG_FS host mode, enumerate a USB-CDC
+       GNSS dongle and forward its NMEA into gps.c. Replaces the MSC device
+       for this build. */
+    if (!UsbGpsHost_Init()) {
+      ErrLog_Write("usbg: init FAIL");
+      beep_pattern(2000, 8, 60, 80);
+    } else {
+      ErrLog_Write("usbg: ok (host GNSS)");
+    }
+    ErrLog_Flush();
+#else
     /* Phase 9: USB MSC. Comes up after SD + logger so the capacity
        callback can read card geometry, and after BLE so a USB-tethered
        host doesn't race the wireless one. If a host is already
@@ -149,6 +174,7 @@ int main(void)
       ErrLog_Write("usb: ok (MSC)");
     }
     ErrLog_Flush();
+#endif
   }
 
   Watchdog_Init();
@@ -156,11 +182,20 @@ int main(void)
   for (;;)
   {
     Watchdog_Tick();
+#if PL_USB_HOST_PROBE
+    /* Host-probe diagnostic: poll the OTG host port for a connect event. */
+    UsbHostProbe_Tick();
+#elif PL_USB_GPS_HOST
+    /* Phase 10: pump the USB host stack; CDC rx callback feeds gps.c. Runs
+       before GPS_Tick so freshly-forwarded NMEA is parsed the same tick. */
+    UsbGpsHost_Tick();
+#else
     /* USB first — TinyUSB needs prompt task pumping to keep enumeration
        and SCSI traffic flowing. Logger_Tick gates its SD writes on
        UsbMsc_IsMounted() so order matters: tud_task() updates the
        mount state, then Logger_Tick reads it. */
     UsbMsc_Tick();
+#endif
     Logger_Tick();
     GPS_Tick();
     BLE_Tick();
