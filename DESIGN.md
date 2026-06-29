@@ -407,9 +407,42 @@ Then start the HCI sequence above.
 
 ### Filesystem
 
-- FAT32. FatFs library (not FileX). Single-volume mount.
+- FAT32, MBR or bare-BPB, single-volume mount. **Hand-rolled minimal
+  append-only writer** (`sd_fatfs.c`) on top of polled `HAL_SD` — *not*
+  FatFs/FileX. Just enough FAT32 to create / append / flush / read /
+  delete 8.3 files in the root directory.
 - Long filenames disabled (8.3 only) — smaller code, no Unicode tables.
-- Cluster cache 4 KB.
+  The writer never creates *or* cleans up LFN entries, so a card
+  previously used on macOS/Windows can carry orphaned LFNs whose stale
+  checksums make a host file browser show the wrong name↔content pairing.
+  Cosmetic on-box (the firmware walks 8.3 short entries only); **reformat
+  a reused card FAT32 before a field run** to clear host/old-firmware junk.
+- Cluster cache 4 KB (single-sector FAT page, write-through, mirrored to
+  FAT #2 when the volume has ≥2 FATs).
+
+### Crash-consistency (F-PWR-5)
+
+The box loses power abruptly at any instant (Hall-sensor supply
+interrupter, no graceful shutdown), so every on-disk metadata update must
+fail safe. **Invariant: commit the resource before the reference, and
+remove the reference before the resource.**
+
+- **Create** (`create_file_entry`): allocate the cluster, persist
+  `FAT[fc]=EOC` *and* zero the body, *then* write the referencing
+  directory entry. A cut in between leaves a lost cluster (FAT≠0,
+  unreferenced), never a directory entry pointing at a cluster the FAT
+  still calls free.
+- **Delete** (`SDFat_Delete`): mark the directory entry `0xE5` and persist
+  it *first*, *then* free the FAT chain. A cut in between leaves orphaned
+  clusters, never a freed cluster still referenced by a live entry.
+
+This prevents the **cross-link** class — a directory entry resolving into
+another file's data — that the previous ordering produced under abrupt
+power cuts (a field box's `GpsNNN.csv` read back `SensNNN` bytes). The
+residual failure mode is now **lost clusters** that slowly shrink free
+space; reclaiming them (and self-healing a card that already cross-linked)
+needs a mount-time consistency pass — **TODO, tracked as a follow-up**.
+Until then a periodic reformat recovers the space.
 
 ### `SensNNN.csv` (one row per sample, 100 Hz)
 

@@ -120,8 +120,10 @@ static pl_fx_status_t fat_load_page_for_cluster(uint32_t cluster, uint32_t *page
     /* Write back current page AND the corresponding entry in FAT #1 (so the
        two FATs stay in sync after every modification — minimal but correct). */
     if (sd_write_block(g_fatpage_lba, g_fatpage) != HAL_OK) return PL_FX_ERR_IO;
-    uint32_t alt = g_fatpage_lba + g_fat_size_secs;
-    (void)sd_write_block(alt, g_fatpage);
+    if (g_num_fats >= 2) {
+      uint32_t alt = g_fatpage_lba + g_fat_size_secs;
+      (void)sd_write_block(alt, g_fatpage);
+    }
     sd_wait_idle();
     g_fatpage_dirty = 0;
   }
@@ -156,8 +158,10 @@ static pl_fx_status_t fat_flush_page(void)
 {
   if (!g_fatpage_dirty || !g_fatpage_lba) return PL_FX_OK;
   if (sd_write_block(g_fatpage_lba, g_fatpage) != HAL_OK) return PL_FX_ERR_IO;
-  uint32_t alt = g_fatpage_lba + g_fat_size_secs;
-  (void)sd_write_block(alt, g_fatpage);
+  if (g_num_fats >= 2) {
+    uint32_t alt = g_fatpage_lba + g_fat_size_secs;
+    (void)sd_write_block(alt, g_fatpage);
+  }
   sd_wait_idle();
   g_fatpage_dirty = 0;
   return PL_FX_OK;
@@ -470,10 +474,26 @@ static pl_fx_status_t create_file_entry(const char name83[11],
       for (int i = 0; i < 512; i += 32) {
         uint8_t f = g_scratch[i];
         if (f == 0x00 || f == 0xE5) {
-          /* Allocate first cluster for the new file. */
+          /* Allocate the first cluster for the new file. */
           uint32_t fc = fat_alloc_one();
           if (fc == 0) return PL_FX_ERR_FULL;
 
+          /* Crash-safety: commit the RESOURCE before the REFERENCE. Persist
+             FAT[fc]=EOC and zero the cluster body FIRST, and only then write
+             the directory entry that points at fc. The box has no graceful
+             shutdown, so a power cut between the two must fail safe: this order
+             leaves at worst a lost cluster (FAT!=0, unreferenced, reclaimable),
+             never a live dir entry pointing at a cluster the FAT still calls
+             free — the precondition for a cross-link. (Zeroing the body
+             clobbers g_scratch, so the dir sector is re-read before the entry
+             write.) */
+          if (fat_flush_page() != PL_FX_OK) return PL_FX_ERR_IO;
+          memset(g_scratch, 0, 512);
+          uint32_t flba = cluster_to_lba(fc);
+          (void)sd_write_block(flba, g_scratch);
+          sd_wait_idle();
+
+          if (sd_read_block(lba + s, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
           memset(&g_scratch[i], 0, 32);
           memcpy(&g_scratch[i], name83, 11);
           g_scratch[i + 11] = 0x20;             /* attr = archive */
@@ -490,15 +510,6 @@ static pl_fx_status_t create_file_entry(const char name83[11],
 
           if (sd_write_block(lba + s, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
           sd_wait_idle();
-
-          /* Zero out the first cluster's first sector so the file body starts
-             empty (avoids garbage from a previous deleted file). */
-          memset(g_scratch, 0, 512);
-          uint32_t flba = cluster_to_lba(fc);
-          (void)sd_write_block(flba, g_scratch);
-          sd_wait_idle();
-          /* Flush FAT page in case fat_alloc_one left it dirty. */
-          fat_flush_page();
 
           *first_cluster_out = fc;
           *dir_block_out     = lba + s;
@@ -812,9 +823,22 @@ pl_fx_status_t SDFat_Delete(const char *name)
   walk_root(find_cb, &c);
   if (!c.ok) return PL_FX_ERR_NOT_FOUND;
 
-  /* Free the cluster chain: walk first→next, marking each cluster 0 (free).
+  /* Crash-safety: remove the REFERENCE before freeing the RESOURCE. Mark the
+     directory entry deleted (0xE5) and persist it FIRST, then free the FAT
+     cluster chain. The box has no graceful shutdown, so a power cut between
+     the two must fail safe: this order leaves at worst orphaned clusters
+     (FAT!=0, no dir entry — reclaimable), never a freed cluster still
+     referenced by a live entry, which a later session's fat_alloc_one would
+     re-hand-out and cross-link into the wrong file. */
+  if (sd_read_block(c.found.dir_block, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  g_scratch[c.found.dir_idx * 32u] = 0xE5;
+  if (sd_write_block(c.found.dir_block, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  sd_wait_idle();
+
+  /* Now free the cluster chain: walk first→next, marking each cluster 0 (free).
      Capture `next` before zeroing the current entry. A zero or invalid
-     first_cluster means the file body was never allocated — skip. */
+     first_cluster means the file body was never allocated — the loop is a
+     no-op. */
   uint32_t cluster = c.found.first_cluster;
   while (cluster >= 2 && cluster < 0x0FFFFFF8u) {
     uint32_t next;
@@ -823,12 +847,6 @@ pl_fx_status_t SDFat_Delete(const char *name)
     cluster = next;
   }
   if (fat_flush_page() != PL_FX_OK) return PL_FX_ERR_IO;
-
-  /* Mark the directory entry deleted (first byte 0xE5). */
-  if (sd_read_block(c.found.dir_block, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
-  g_scratch[c.found.dir_idx * 32u] = 0xE5;
-  if (sd_write_block(c.found.dir_block, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
-  sd_wait_idle();
 
   /* Reclaim the freed clusters on the next allocation. */
   if (c.found.first_cluster >= 2 && c.found.first_cluster < g_alloc_hint) {

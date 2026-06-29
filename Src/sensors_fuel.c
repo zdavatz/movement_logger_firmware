@@ -59,8 +59,24 @@ int FUEL_Init(void)
   HAL_I2CEx_ConfigAnalogFilter(&g_hi2c4, I2C_ANALOGFILTER_ENABLE);
   HAL_I2CEx_ConfigDigitalFilter(&g_hi2c4, 0);
 
-  if (HAL_I2C_IsDeviceReady(&g_hi2c4, PL_STC3115_I2C_ADDR, 3, 200) != HAL_OK)
-    return -2;
+  /* The STC3115 can be slow to ACK right after a cold power-up (battery just
+     plugged in, wireless-charger rail still settling). Probe a few rounds with
+     a short settle between them instead of a single shot, so a slow-but-alive
+     gauge isn't written off as dead — which would leave BatNNN.csv header-only
+     for the whole boot (logger.c emit_bat_row only runs on FUEL_Read()==0).
+     The outer loop IS the retry mechanism, so the HAL call uses Trials=1 (no
+     stacked retry), and there is no settle after the final probe. Boot-time
+     only: runs before Watchdog_Init and never from the superloop, so the
+     worst-case ~0.7 s on a dead gauge is harmless. */
+  int ready = 0;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (HAL_I2C_IsDeviceReady(&g_hi2c4, PL_STC3115_I2C_ADDR, 1, 100) == HAL_OK) {
+      ready = 1;
+      break;
+    }
+    if (attempt < 4) HAL_Delay(50);   /* settle before next probe; none after the last */
+  }
+  if (!ready) return -2;
 
   /* Default-mode init: GG_RUN=1, FORCE_CC=0, ADC res = 14 bit. */
   if (wr(REG_MODE, 0x10) != 0) return -3;   /* CC mode, GG run */
