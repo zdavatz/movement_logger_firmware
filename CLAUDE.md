@@ -254,6 +254,40 @@ is the local watchdog). Host clients (iOS/Android/desktop) auto-reconnect on
 re-advertise. **Don't lower the 90 s** without re-checking it against every
 notify cadence (stream 2 s, battery 60 s). See `Src/ble.c` and issue #4.
 
+## Large-file FileSync stability (v0.0.15+) — `ble.c`
+
+**The "connection often gets lost when syncing very large files (700 KB+)" fix.**
+A big READ is thousands of 240 B notifies and can sit on-air for minutes; two
+things made long files drop far more than short ones:
+
+1. **On-air time.** The box never asked the central for a faster connection
+   interval, so throughput was whatever the central defaulted to — minutes per
+   file, and every extra second is another chance for a transient RF/host drop.
+   Fix: ~1 s after connect, `BLE_Tick` fires one **L2CAP connection-parameter
+   update request** (`ble_request_fast_conn_params`, ACI opcode `0xFD81`) asking
+   for **15–30 ms** interval, latency 0, 4 s supervision timeout. It's deferred
+   via `g_conn_param_due_ms` (set on connect, cleared on disconnect/recover) so
+   it never races pairing or re-enters the connection-complete handler. Best-
+   effort: Android/Linux honour it, macOS often imposes its own — harmless no-op
+   then. Logged as `ble: conn-param-req fast 15-30ms rc=…`.
+
+2. **The 15 s stall watchdog force-disconnected on legitimate host pauses.**
+   During a long READ the host pauses draining for many seconds (writing the
+   growing mirror to disk/SQLite, app briefly backgrounded, macOS BT power-nap);
+   the shared 15 s stall in `fsm_advance` then tore the link down. READ now uses
+   `FSM_READ_STALL_DEADLINE_MS` (**45 s**); FW_RECV keeps the tighter 15 s (a
+   firmware upload is host-driven and should push steadily). 45 s stays below
+   the 90 s peer-gone watchdog (which, gated on real liveness evidence, still
+   catches a genuinely vanished peer) and the 600 s read deadline, and a truly-
+   dead link is caught far sooner by the chip's LL supervision timeout raising
+   `Disconnection_Complete`.
+
+Both levers are throughput/exposure reductions, not protocol changes — the
+host apps already resume a dropped transfer from `offset = bytes-on-disk`
+(desktop `run_sync_diff`), so these just make drops rare instead of frequent.
+**Don't raise the READ stall above the 90 s peer-gone deadline** — that would
+let a genuinely idle-connected limbo survive. See `Src/ble.c` and issue #4.
+
 ## Known WIP edges (per the PR description)
 
 These are scheduled for cleanup in Phase 8; don't be surprised by them

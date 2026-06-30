@@ -11,8 +11,8 @@
 #define PUMPLOGGER_CONFIG_H
 
 /* Firmware identification --------------------------------------------------*/
-#define PL_FW_NAME             "PumpLogger"
-#define PL_FW_VERSION          "0.0.14"
+#define PL_FW_NAME             "MovementLogger"
+#define PL_FW_VERSION          "0.0.15"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/

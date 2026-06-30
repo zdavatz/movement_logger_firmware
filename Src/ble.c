@@ -76,6 +76,13 @@
 #define ACI_OP_GATT_SRV_WRITE_HANDLE_VALUE    0xFD06   /* OCF=0x106 */
 #define ACI_OP_GATT_SRV_NOTIFY                0xFD2F   /* OCF=0x12F */
 
+/* L2CAP — peripheral-initiated connection-parameter update request. We use
+   it right after connect to pull the central onto a fast connection interval
+   so large FileSync READs spend far less time on-air (fewer chances for a
+   transient link drop). Best-effort: the central may accept, counter, or
+   ignore it. OCF=0x181 (BlueNRG-LP ACI L2CAP group). */
+#define ACI_OP_L2CAP_CONN_PARAM_UPDATE_REQ    0xFD81   /* OCF=0x181 */
+
 /* FileSync wire protocol (CLAUDE.md) */
 #define FSYNC_OP_LIST       0x01
 #define FSYNC_OP_READ       0x02
@@ -168,6 +175,13 @@ static uint16_t          g_conn_handle     = 0;
    peer is still there (covers a passive live-stream viewer that never writes
    back). 0 while disconnected. */
 static uint32_t          g_last_peer_seen_ms = 0;
+/* Deferred connection-parameter-update trigger. Set to a future HAL tick on
+   connect; when that tick arrives BLE_Tick fires one L2CAP param-update
+   request to pull the central onto a fast interval, then clears this back to
+   0. We defer ~1 s past connect so the request doesn't race the PIN/pairing
+   handshake and isn't issued from inside the connection-complete event
+   handler. Cleared on disconnect. 0 = nothing pending. */
+static uint32_t          g_conn_param_due_ms = 0;
 /* Negotiated ATT MTU for the active connection. Default 23 (=20-byte
    notify payload) per BLE spec; updated to actual negotiated value
    when the BlueNRG-LP emits ACI_ATT_EXCHANGE_MTU_RESP_EVENT (0x0C17)
@@ -516,6 +530,21 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
 #define FSM_READ_DEADLINE_MS   600000
 #define FSM_STALL_DEADLINE_MS   15000
 
+/* READ-stream stall tolerance (v0.0.15). Separate from the 15 s stall used
+   for FW_RECV: during a long file READ the host legitimately pauses draining
+   for many seconds at a time — writing the growing mirror to disk / SQLite,
+   the app briefly backgrounded, a macOS BT power-nap. The old shared 15 s
+   stall force-disconnected the link on those pauses, and on a 700 KB+ file
+   (minutes on-air) it hit one often — the "connection often gets lost when
+   syncing very large files" report. 45 s rides those pauses out. It stays
+   safely below the 90 s peer-gone watchdog (which, gated on real liveness
+   evidence, still catches a genuinely vanished peer) and the 600 s read
+   deadline, and a truly-dead link is caught far sooner by the chip's own LL
+   supervision timeout (≈4 s once the conn-param request above lands) raising
+   Disconnection_Complete. FW_RECV keeps the tighter 15 s — a firmware upload
+   is host-driven and should push steadily. */
+#define FSM_READ_STALL_DEADLINE_MS  45000
+
 /* Peer-gone watchdog (issue #4): max time we tolerate being connected with
    NO evidence the peer is alive before forcing disconnect + re-advertise.
    Sits comfortably above the longest legitimate silence between liveness
@@ -584,11 +613,43 @@ static void ble_recover_lost_peer(const char *why)
   g_conn_handle        = 0;
   g_stream_subscribed  = 0;
   g_battery_subscribed = 0;
+  g_conn_param_due_ms  = 0;
   int adv_rc = ble_adv_enable();
   char buf[96];
   snprintf(buf, sizeof(buf), "ble: peer-recover hci_disc=0x%04x rc=%d re-adv=%d why=%s",
            ch, hd_rc, adv_rc, why);
   ErrLog_Write(buf);
+}
+
+/* Ask the central to switch to a fast connection interval. A large FileSync
+   READ (700 KB+) is many thousands of notifies; at a slow interval the
+   transfer is on-air for minutes, and every extra second on-air is another
+   chance for a transient RF/host drop. Requesting 15–30 ms shrinks that
+   window several-fold on stacks that honour it (Android, Linux/BlueZ; macOS
+   often imposes its own, in which case this is a harmless no-op). Best-effort
+   and fire-once: the L2CAP signalling result arrives later as an async event
+   we don't need to act on — we only care that the request went out.
+
+   Units: interval = 1.25 ms, supervision timeout = 10 ms.
+     min=12 → 15 ms, max=24 → 30 ms, latency=0, timeout=400 → 4 s.
+   The 4 s supervision timeout lets the chip notice a truly-dead link on its
+   own; the box's stall + peer-gone watchdogs remain the application backstop. */
+static int ble_request_fast_conn_params(void)
+{
+  if (g_conn_handle == 0) return -1;
+  uint8_t p[10];
+  uint16_t i = 0;
+  p[i++] = (uint8_t)(g_conn_handle & 0xFF);
+  p[i++] = (uint8_t)(g_conn_handle >> 8);
+  p[i++] = 12;  p[i++] = 0;        /* interval_min = 12 × 1.25 ms = 15 ms */
+  p[i++] = 24;  p[i++] = 0;        /* interval_max = 24 × 1.25 ms = 30 ms */
+  p[i++] = 0;   p[i++] = 0;        /* slave latency = 0                   */
+  p[i++] = 144; p[i++] = 1;        /* timeout = 400 × 10 ms = 4 s (0x0190) */
+  int rc = ble_aci_cmd(ACI_OP_L2CAP_CONN_PARAM_UPDATE_REQ, p, i, NULL, 0);
+  char buf[64];
+  snprintf(buf, sizeof(buf), "ble: conn-param-req fast 15-30ms rc=%d", rc);
+  ErrLog_Write(buf);
+  return rc;
 }
 
 static void fsm_emergency_exit(int code, const char *why)
@@ -635,7 +696,10 @@ static void fsm_advance(void)
     fsm_emergency_exit(SM_TIMEOUT, "deadline");
     return;
   }
-  if (now - g_fsm.last_progress_tick >= FSM_STALL_DEADLINE_MS) {
+  uint32_t stall_deadline = (g_fsm.state == FSM_READ_STREAM)
+                            ? FSM_READ_STALL_DEADLINE_MS   /* 45 s — ride out host disk/app pauses */
+                            : FSM_STALL_DEADLINE_MS;       /* 15 s — FW upload should push steadily */
+  if (now - g_fsm.last_progress_tick >= stall_deadline) {
     fsm_emergency_exit(SM_PEER_GONE, "stall");
     return;
   }
@@ -1474,13 +1538,23 @@ void BLE_Tick(void)
      re-advertises, but only if the chip raises that event — on a SILENT drop
      (iOS lock-screen suspend, BT power-nap) it often doesn't, leaving the box
      stuck connected-in-limbo and invisible to scans until a power-cycle. The
-     FSM stall guard (15 s) already covers an ACTIVE transfer; this covers the
-     IDLE-connected case it can't see. Runs every tick (before the irq_high
+     FSM stall guard (45 s read / 15 s FW) already covers an ACTIVE transfer;
+     this covers the IDLE-connected case it can't see. Runs every tick (before the irq_high
      early-return) so it fires on a dead-quiet link. fsm_advance() above may
      have already cleared g_conn_handle, so this won't double-fire. */
   if (g_conn_handle != 0 &&
       (HAL_GetTick() - g_last_peer_seen_ms) >= PEER_GONE_DEADLINE_MS) {
     ble_recover_lost_peer("peer-gone watchdog");
+  }
+
+  /* Deferred fast-conn-param request (v0.0.15). Fired once ~1 s after connect,
+     outside the connection-complete event handler, so it doesn't race pairing
+     or re-enter event reading. Shrinks the on-air time of big FileSync READs
+     so transient drops are far less likely. Self-clearing one-shot. */
+  if (g_conn_param_due_ms != 0 && g_conn_handle != 0 &&
+      (int32_t)(HAL_GetTick() - g_conn_param_due_ms) >= 0) {
+    ble_request_fast_conn_params();
+    g_conn_param_due_ms = 0;
   }
 
   if (!irq_high()) return;
@@ -1503,6 +1577,7 @@ void BLE_Tick(void)
         uint16_t ch = (uint16_t)(evt[5] | (evt[6] << 8));
         g_conn_handle = ch;
         g_last_peer_seen_ms = HAL_GetTick();   /* arm the peer-gone watchdog */
+        g_conn_param_due_ms = HAL_GetTick() + 1000;  /* request fast interval ~1 s in */
         snprintf(buf, sizeof(buf), "ble: connected st=%d conn=0x%04x sub=0x%02x",
                  st, ch, evt[3]);
         ErrLog_Write(buf);
@@ -1517,6 +1592,7 @@ void BLE_Tick(void)
       g_conn_handle        = 0;
       g_stream_subscribed  = 0;
       g_battery_subscribed = 0;
+      g_conn_param_due_ms  = 0;   /* cancel any pending conn-param request */
       /* Tear down any in-flight READ — frees the SD file handle + writes
          an "aborted code=2" marker to the errlog so we know post-mortem
          why the transfer ended. fsm_advance would catch this too on
