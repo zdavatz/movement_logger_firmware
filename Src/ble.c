@@ -1547,10 +1547,14 @@ void BLE_Tick(void)
     ble_recover_lost_peer("peer-gone watchdog");
   }
 
-  /* Deferred fast-conn-param request (v0.0.15). Fired once ~1 s after connect,
-     outside the connection-complete event handler, so it doesn't race pairing
-     or re-enter event reading. Shrinks the on-air time of big FileSync READs
-     so transient drops are far less likely. Self-clearing one-shot. */
+  /* Deferred fast-conn-param request — DISABLED in v0.0.16. It is never armed
+     anymore (see the connect handler), so this is dead-on-purpose: the request
+     fired straight into the central's post-connect subscribe/LIST burst and
+     ble_aci_cmd discarded those events, killing live view + file list on macOS.
+     Kept (never-true guard) so the helper/define stay referenced for a proper
+     fix later — the real bug is ble_aci_cmd eating async events while polling
+     for its CommandComplete; until that's reworked, no command may be issued
+     from BLE_Tick during the connect/subscribe window. */
   if (g_conn_param_due_ms != 0 && g_conn_handle != 0 &&
       (int32_t)(HAL_GetTick() - g_conn_param_due_ms) >= 0) {
     ble_request_fast_conn_params();
@@ -1577,7 +1581,14 @@ void BLE_Tick(void)
         uint16_t ch = (uint16_t)(evt[5] | (evt[6] << 8));
         g_conn_handle = ch;
         g_last_peer_seen_ms = HAL_GetTick();   /* arm the peer-gone watchdog */
-        g_conn_param_due_ms = HAL_GetTick() + 1000;  /* request fast interval ~1 s in */
+        /* v0.0.16: do NOT arm the fast-conn-param request here. In v0.0.15 it
+           fired ~1 s after connect — exactly when the central subscribes to the
+           live-stream CCCD and sends LIST — and ble_aci_cmd's receive loop
+           silently DISCARDED those inbound ATTRIBUTE_MODIFIED events while
+           waiting (up to 1 s) for its own CommandComplete. Result on macOS: no
+           live view + no file list on every connect. The request gave no macOS
+           benefit anyway (the central imposes its own interval), so it's
+           disabled. See the conn-param block in BLE_Tick. */
         snprintf(buf, sizeof(buf), "ble: connected st=%d conn=0x%04x sub=0x%02x",
                  st, ch, evt[3]);
         ErrLog_Write(buf);
