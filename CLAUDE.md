@@ -218,6 +218,42 @@ predecessor stack hit):
   `Src/ble.c` around the GAP init + write block and
   zdavatz/movement_logger_firmware#1 for the macOS symptom.
 
+## BLE peer-gone watchdog (v0.0.13+) — `ble.c`
+
+**The "connected-in-limbo" deadlock + its fix (issue #4).** The box is BLE
+peripheral-only with a **polled** BlueNRG-LP (EXTI11 deliberately off). When a
+central drops the link **uncleanly** — iOS lock-screen suspend, BT power-nap,
+app force-quit, carried out of range — the chip **often never raises
+`Disconnection_Complete`**. The only paths that cleared `g_conn_handle` and
+re-advertised were (a) that event and (b) the FileSync FSM's stall/deadline/
+disconnect guards — but `fsm_advance()` returns immediately when
+`g_fsm.state == FSM_IDLE`, so **the idle-connected case (app subscribed, no
+active READ) had no recovery.** Result: `g_conn_handle` stayed set, the
+superloop kept logging (so the IWDG kept being fed — **no reset**), and the box
+was invisibly "connected", unreconnectable without a power-cycle. The
+must-power-cycle symptom is the tell that it's a BLE-layer limbo, **not** a
+brown-out reset (a BOR self-recovers in ~8 s). Field-reported repeatedly;
+the original v0.0.13 close only covered the active-transfer path.
+
+**Fix (shipped v0.0.13):** an application-level peer-gone watchdog in
+`BLE_Tick`, independent of the FSM. `g_last_peer_seen_ms` is refreshed on
+connect, on any inbound write (`ACI_GATT_SRV_ATTRIBUTE_MODIFIED`, ecode
+0x0C01), and on every **successful** `ble_notify` — a notify only drains once
+the peer ACKs at the link layer, so it also covers a passive live-stream viewer
+that never writes back. If connected with no liveness evidence for
+`PEER_GONE_DEADLINE_MS` (**90 s** — deliberately above the 60 s battery-only
+notify period so a battery-only subscriber isn't false-dropped) it calls
+`ble_recover_lost_peer()`. That helper is **Build #57's proven teardown**
+(`ble_hci_disconnect` + clear `g_conn_handle`/subscriptions + `ble_adv_enable`)
+**extracted and now shared** by both `fsm_emergency_exit` and the watchdog — one
+recovery sequence, two callers. The watchdog runs every tick *before* the
+`irq_high()` early-return so it fires on a dead-quiet link; `fsm_advance()` may
+have already cleared `g_conn_handle`, so it won't double-fire. No new IRQ, no
+conn-param/supervision-timeout request (macOS ignores those — the robust lever
+is the local watchdog). Host clients (iOS/Android/desktop) auto-reconnect on
+re-advertise. **Don't lower the 90 s** without re-checking it against every
+notify cadence (stream 2 s, battery 60 s). See `Src/ble.c` and issue #4.
+
 ## Known WIP edges (per the PR description)
 
 These are scheduled for cleanup in Phase 8; don't be surprised by them

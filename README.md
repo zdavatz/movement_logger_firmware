@@ -58,6 +58,12 @@ The box has no RTC — the CSV `ms` column is a free-running `HAL_GetTick()` cou
 
 Pairing the host epoch with the box's free-running `ms` counter lets the replay tools map every logged row to absolute wall-clock with **zero drift and without needing a GPS fix** — the marker shares the host's clock domain with the replay video's `creation_time`, so the data panels line up exactly. The marker is a `#`-comment line every CSV parser skips as a data row; it's a best-effort no-op when no session is open. See DESIGN.md opcode table (0x08).
 
+## BLE connection auto-recovery (v0.0.13+)
+
+The box is BLE peripheral-only with a polled BlueNRG-LP (no link-layer ISR). If a central drops the link **uncleanly** — iOS lock-screen suspend, BT power-nap, app force-quit, carried out of range — the chip often never raises `Disconnection_Complete`. Before v0.0.13 the firmware could then sit "connected-in-limbo": still logging to SD, but stuck advertising-off and invisible to any new scan, unrecoverable without a power-cycle.
+
+A **peer-gone watchdog** (`Src/ble.c`) closes this gap: `g_last_peer_seen_ms` is refreshed on connect, on any inbound write, and on every **successful** notify (a notify only drains once the peer ACKs at the link layer, so it also covers a passive live-stream viewer that never writes back). If the box stays connected with no liveness evidence for **90 s** (`PEER_GONE_DEADLINE_MS`, safely above the 60 s battery-only notify period to avoid false drops), it force-disconnects and re-advertises on its own — no power-cycle, no app restart. SD logging is never affected. Host clients (iOS, Android, desktop) auto-reconnect on re-advertise. See CLAUDE.md "BLE peer-gone watchdog" and [issue #4](https://github.com/zdavatz/movement_logger_firmware/issues/4).
+
 ## Flash via DFU
 
 Hold the user button while plugging USB-C to enter STM32 DFU mode:
