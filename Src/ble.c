@@ -37,6 +37,7 @@
 #include "stream.h"
 #include "battery.h"
 #include "fwupdate.h"
+#include "gps.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -103,6 +104,11 @@
 #define FSYNC_OP_FW_COMMIT  0x0B   /* (none); SHA-verify then swap+reset → sends
                                       0xA0 then disconnects, or 1-byte error   */
 #define FSYNC_OP_FW_ABORT   0x0C   /* (none); discard session → 1-byte OK      */
+
+/* GPS-bridge opcodes — desktop GPS Debug tab's BLE transport (see gps.c).
+   Fire-and-forget, no FileData reply (legacy hosts/firmware ignore them). */
+#define FSYNC_OP_GPS_BRIDGE 0x0D   /* <u8> 1=on/0=off; relay u-blox UBX over BLE */
+#define FSYNC_OP_GPS_TX     0x0E   /* <raw bytes>; host → u-blox UART (UBX polls) */
 
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
@@ -1074,9 +1080,41 @@ static void ble_process_command(void)
     uint8_t st = FSYNC_ST_OK;
     ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
     ErrLog_Write("ble: FW_ABORT");
+  } else if (op == FSYNC_OP_GPS_BRIDGE) {
+    /* GPS_BRIDGE <u8 on>: start/stop relaying raw u-blox UBX over BLE for
+       the desktop antenna survey. Fire-and-forget — no FileData reply. The
+       bridged UBX frames are drained to notifies in ble_gps_bridge_tick(). */
+    uint8_t on = (g_cmd_len >= 2) ? g_cmd_buf[1] : 0;
+    GPS_BridgeSet(on);
+    snprintf(buf, sizeof(buf), "ble: GPS_BRIDGE %s", on ? "on" : "off");
+    ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_GPS_TX) {
+    /* GPS_TX <raw bytes>: forward the host's UBX poll frames straight to the
+       u-blox UART. Replies come back as bridged FileData notifies. */
+    if (g_cmd_len > 1) {
+      GPS_BridgeTx(&g_cmd_buf[1], (uint16_t)(g_cmd_len - 1));
+    }
   } else {
     snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x (not yet handled)", op);
     ErrLog_Write(buf);
+  }
+}
+
+/* Drain captured UBX frames to FileData notifies while the survey bridge is
+   active. Runs from BLE_Tick after fsm_advance(); only when no FileSync op is
+   in flight, so bridge traffic and a READ never interleave on FileData. On
+   disconnect the bridge is turned off (restores the module to NMEA-only). */
+static void ble_gps_bridge_tick(void)
+{
+  if (!GPS_BridgeActive()) return;
+  if (g_conn_handle == 0) { GPS_BridgeSet(0); return; }
+  if (g_fsm.state != FSM_IDLE) return;
+  uint8_t buf[160];
+  for (int i = 0; i < 4; i++) {
+    uint16_t n = GPS_BridgeRead(buf, sizeof(buf));
+    if (n == 0) break;
+    /* Congested → leave the rest in the ring for the next tick. */
+    if (ble_notify_try(g_filedata_handle + 1, buf, n, 100) != 0) break;
   }
 }
 
@@ -1533,6 +1571,11 @@ void BLE_Tick(void)
      internal deadline + stall + disconnect guards. Runs unconditionally
      (not gated on irq_high) so progress happens even on quiet links. */
   fsm_advance();
+
+  /* Relay any captured u-blox UBX frames to the GPS-survey host (no-op
+     unless the bridge is active). Sits after fsm_advance so it only sends
+     when the FileSync FSM is idle. */
+  ble_gps_bridge_tick();
 
   /* Peer-gone watchdog (issue #4). The Disconnection_Complete handler
      re-advertises, but only if the chip raises that event — on a SILENT drop

@@ -44,4 +44,22 @@ typedef enum {
 } pl_gps_quality_t;
 pl_gps_quality_t GPS_LastFixQuality(void);
 
+/* ---------- BLE GPS bridge (GPS Debug tab over BLE) ----------------------
+   Lets the desktop run its u-blox UBX survey (antenna/mounting diagnostics)
+   over the box's BLE link instead of a serial cable — no opening the box.
+
+   The host polls the receiver directly: UBX poll frames arrive over BLE and
+   are written straight to the module UART by GPS_BridgeTx; complete UBX reply
+   frames are captured out of the RX stream into a relay buffer that the BLE
+   layer drains with GPS_BridgeRead and notifies back. NMEA keeps flowing to
+   the SD logger the whole time — enabling the bridge only *adds* UBX output
+   on the port (CFG via $PUBX,41), it never disables NMEA.
+
+   The bridge is volatile (never persisted): a power-cycle leaves the module
+   back at NMEA-only, and the BLE layer also disables it on disconnect. */
+void     GPS_BridgeSet(uint8_t on);                        /* enable/disable */
+uint8_t  GPS_BridgeActive(void);
+void     GPS_BridgeTx(const uint8_t *data, uint16_t len);  /* host → module UART */
+uint16_t GPS_BridgeRead(uint8_t *out, uint16_t max);       /* captured UBX → out */
+
 #endif

@@ -49,6 +49,32 @@ static volatile uint32_t g_latest_valid_tick;   /* HAL_GetTick() of last status=
 static volatile uint32_t g_diag_gga;
 static volatile uint32_t g_diag_errors;        /* UART RX error callbacks invoked */
 
+/* Baud the module locked to in GPS_Init — needed by the bridge's $PUBX,41
+   reconfigure (it must keep the same baud, only flip the output protocol). */
+static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
+
+/* ---------- BLE GPS bridge state ---------------------------------------- */
+static volatile uint8_t g_bridge;                 /* survey bridge active */
+
+/* Relay ring: complete UBX reply frames captured from the RX stream, drained
+   by the BLE layer (GPS_BridgeRead). Sized to hold a couple of the largest
+   poll replies (NAV-SIG with many signals ≈ 650 B). */
+#define GPS_UBX_RING_SIZE 2048
+static uint8_t  g_ubx_ring[GPS_UBX_RING_SIZE];
+static uint16_t g_ubx_head;                       /* push (GPS_Tick) */
+static uint16_t g_ubx_tail;                       /* pop  (BLE tick) */
+static uint32_t g_ubx_dropped;
+
+/* UBX frame-capture state machine, run on the RX stream while bridging.
+   Stages the current frame in g_cap, then bulk-pushes 8+len bytes to the
+   ring. Mirrors the desktop UbxParser sync hunt; NMEA bytes never trigger
+   the 0xB5 sync so they stay out of the relay. */
+#define GPS_CAP_MAX 1024
+static uint8_t  g_cap[GPS_CAP_MAX];
+static uint16_t g_cap_st;
+static uint16_t g_cap_len;
+static uint16_t g_cap_got;
+
 /* ---------- UBX builder (only used in Init, polling TX) ----------------- */
 
 static void ubx_send(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len)
@@ -218,6 +244,108 @@ static void process_byte(uint8_t b)
   } else {
     g_linelen = 0;
   }
+}
+
+/* ---------- BLE GPS bridge ---------------------------------------------- */
+
+/* $PUBX,41 to flip the port's output protocol mask while keeping baud and
+   input mask. `ubx_on` → outMask 0x0003 (UBX+NMEA) so the survey's poll
+   replies are emitted alongside the NMEA the SD logger needs; off → 0x0002
+   (NMEA only), the normal logging state. Travels as NMEA so it lands even if
+   UBX input were ever disabled (same rationale as send_pubx_port_cfg). */
+static void gps_set_ubx_output(uint8_t ubx_on)
+{
+  const char *outmask = ubx_on ? "0003" : "0002";
+  char body[64];
+  int n = snprintf(body, sizeof(body), "PUBX,41,1,0003,%s,%lu,0",
+                   outmask, (unsigned long)g_locked_baud);
+  if (n <= 0) return;
+  uint8_t cs = 0;
+  for (int i = 0; i < n; i++) cs ^= (uint8_t)body[i];
+  char full[80];
+  int m = snprintf(full, sizeof(full), "$%s*%02X\r\n", body, cs);
+  if (m > 0) HAL_UART_Transmit(&g_huart4, (uint8_t *)full, (uint16_t)m, 200);
+}
+
+/* Push a complete captured UBX frame into the relay ring. Whole-frame or
+   nothing: if the ring can't hold it, drop it (the host re-polls next
+   second) rather than relay a truncated frame the host would reject. */
+static void bridge_push(const uint8_t *buf, uint16_t n)
+{
+  uint16_t free_sp = (uint16_t)((g_ubx_tail - g_ubx_head - 1u) % GPS_UBX_RING_SIZE);
+  if (n > free_sp) { g_ubx_dropped++; return; }
+  for (uint16_t i = 0; i < n; i++) {
+    g_ubx_ring[g_ubx_head] = buf[i];
+    g_ubx_head = (uint16_t)((g_ubx_head + 1u) % GPS_UBX_RING_SIZE);
+  }
+}
+
+/* Feed one RX byte to the UBX frame extractor while bridging. On a complete
+   frame, stage 8+len bytes (sync..checksum) and hand them to bridge_push.
+   The host re-verifies the checksum, so we relay the frame as-is. */
+static void bridge_capture(uint8_t b)
+{
+  switch (g_cap_st) {
+    case 0:
+      if (b == 0xB5) { g_cap[0] = 0xB5; g_cap_st = 1; }
+      break;
+    case 1:
+      if (b == 0x62)      { g_cap[1] = 0x62; g_cap_st = 2; }
+      else if (b != 0xB5) { g_cap_st = 0; }   /* repeated 0xB5 stays armed */
+      break;
+    case 2: g_cap[2] = b; g_cap_st = 3; break;                 /* class */
+    case 3: g_cap[3] = b; g_cap_st = 4; break;                 /* id */
+    case 4: g_cap[4] = b; g_cap_len = b; g_cap_st = 5; break;  /* len lo */
+    case 5: g_cap[5] = b; g_cap_len |= (uint16_t)b << 8;       /* len hi */
+            g_cap_got = 0;
+            if (g_cap_len > (uint16_t)(GPS_CAP_MAX - 8)) g_cap_st = 0;
+            else g_cap_st = g_cap_len ? 6 : 7;
+            break;
+    case 6: g_cap[6 + g_cap_got] = b;
+            if (++g_cap_got >= g_cap_len) g_cap_st = 7;
+            break;
+    case 7: g_cap[6 + g_cap_len] = b; g_cap_st = 8; break;     /* ck_a */
+    case 8: g_cap[6 + g_cap_len + 1] = b;                      /* ck_b */
+            bridge_push(g_cap, (uint16_t)(8 + g_cap_len));
+            g_cap_st = 0;
+            break;
+    default: g_cap_st = 0; break;
+  }
+}
+
+void GPS_BridgeSet(uint8_t on)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  if (on) {
+    /* Fresh capture + relay state for this survey. */
+    g_cap_st = 0; g_cap_len = 0; g_cap_got = 0;
+    g_ubx_head = g_ubx_tail = 0; g_ubx_dropped = 0;
+    g_bridge = 1;
+    gps_set_ubx_output(1);
+  } else {
+    g_bridge = 0;
+    gps_set_ubx_output(0);
+  }
+  ErrLog_Writef("gps: bridge %s @%lu baud", on ? "ON" : "off",
+                (unsigned long)g_locked_baud);
+}
+
+uint8_t GPS_BridgeActive(void) { return g_bridge; }
+
+void GPS_BridgeTx(const uint8_t *data, uint16_t len)
+{
+  if (!data || !len) return;
+  HAL_UART_Transmit(&g_huart4, (uint8_t *)data, len, 200);
+}
+
+uint16_t GPS_BridgeRead(uint8_t *out, uint16_t max)
+{
+  uint16_t n = 0;
+  while (n < max && g_ubx_tail != g_ubx_head) {
+    out[n++] = g_ubx_ring[g_ubx_tail];
+    g_ubx_tail = (uint16_t)((g_ubx_tail + 1u) % GPS_UBX_RING_SIZE);
+  }
+  return n;
 }
 
 /* ---------- HW init ----------------------------------------------------- */
@@ -475,6 +603,9 @@ int GPS_Init(void)
   int save_rc = ubx_send_retry(0x06, 0x09, save_p, sizeof(save_p), 3);
   ErrLog_Writef("gps: cfg-cfg-save %s", (save_rc == 0) ? "ACK" : "FAIL");
 
+  /* Remember the locked baud for the BLE bridge's $PUBX,41 reconfigure. */
+  g_locked_baud = locked_baud;
+
   /* RX IRQ stays armed across all the listen/ack calls. */
   ErrLog_Writef("gps: ready @%lu baud, rate=%luHz",
                 (unsigned long)locked_baud,
@@ -516,11 +647,14 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
 void GPS_Tick(void)
 {
-  /* Drain the IRQ-filled ring buffer through the NMEA parser. */
+  /* Drain the IRQ-filled ring buffer through the NMEA parser. While the BLE
+     survey bridge is active, the same bytes also feed the UBX frame
+     extractor so poll replies get relayed — NMEA logging is unaffected. */
   while (g_rx_head != g_rx_tail) {
     uint8_t b = g_rx_ring[g_rx_tail];
     g_rx_tail = (uint16_t)((g_rx_tail + 1u) % GPS_RX_RING_SIZE);
     process_byte(b);
+    if (g_bridge) bridge_capture(b);
     g_diag_bytes++;
   }
 }
