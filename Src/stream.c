@@ -63,5 +63,5 @@ void Stream_Pack(const PL_Snapshot *s, uint8_t logging_active,
   /* bit 1 (low_battery) is owned by the battery module — Phase 7 */
   if (logging_active)    flags |= 0x04;   /* bit 2: logging_active */
   out[44] = flags;
-  out[45] = 0x00;                          /* reserved */
+  out[45] = s->gps.cn0_max;                /* GPS strongest C/N0 (dB-Hz), 0 = no data */
 }

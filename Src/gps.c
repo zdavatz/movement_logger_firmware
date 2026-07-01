@@ -202,6 +202,35 @@ static int nmea_split(char *line, char *fields[], int max_fields)
   return n;
 }
 
+/* GSV per-satellite C/N0 roll-up. GSV arrives as a multi-sentence burst (one
+   group per constellation) between GGAs; we accumulate the strongest C/N0 and
+   the count of tracked (C/N0-bearing) satellites, then parse_gga commits them
+   to g_latest at the once-per-epoch GGA boundary and resets. Stays 0 when the
+   module emits no GSV, so cn0_max reads a clean "no data" on legacy setups.
+   RX-only — nothing is sent to the module — so it works even when the
+   box->module command line is dead (the exact case that blocks the UBX survey). */
+static uint8_t g_gsv_cn0_max;    /* strongest C/N0 seen this epoch (dB-Hz) */
+static uint8_t g_gsv_nsat_sig;   /* satellites with a C/N0 this epoch */
+
+/* $xxGSV,numMsg,msgNum,numSV,{svid,elev,azim,cno}...  (up to 4 sats/sentence;
+   an optional trailing signalId in NMEA 4.11 is naturally ignored — a lone
+   field never completes a 4-tuple). Every talker (GP/GL/GA/GB/GQ) maps to type
+   "GSV" via nmea_handle_line's tag+2, so one branch covers all constellations.
+   Empty cno = satellite in view but not tracked. */
+static void parse_gsv(char *fields[], int n)
+{
+  if (n < 4) return;
+  for (int i = 4; i + 3 < n; i += 4) {
+    const char *cno_s = fields[i + 3];
+    if (!cno_s || !*cno_s) continue;         /* satellite not tracked */
+    int cno = atoi(cno_s);
+    if (cno <= 0) continue;
+    if (cno > 99) cno = 99;
+    if (g_gsv_nsat_sig < 255) g_gsv_nsat_sig++;
+    if ((uint8_t)cno > g_gsv_cn0_max) g_gsv_cn0_max = (uint8_t)cno;
+  }
+}
+
 static void parse_rmc(char *fields[], int n)
 {
   if (n < 10) return;
@@ -236,6 +265,13 @@ static void parse_gga(char *fields[], int n)
 {
   if (n < 10) return;
   g_diag_gga++;
+  /* Commit the C/N0 rolled up from this epoch's GSV burst and reset for the
+     next. GGA is the once-per-epoch boundary; cn0_max stays 0 when the module
+     emits no GSV, so the field reads a clean "no data" rather than stale. */
+  g_latest.cn0_max      = g_gsv_cn0_max;
+  g_latest.sats_in_view = g_gsv_nsat_sig;
+  g_gsv_cn0_max  = 0;
+  g_gsv_nsat_sig = 0;
   g_latest.fix_q   = (uint8_t)atoi(fields[6]);
   g_latest.num_sat = (uint8_t)atoi(fields[7]);
   g_latest.hdop    = (float)strtod(fields[8], NULL);
@@ -258,6 +294,7 @@ static void nmea_handle_line(char *line)
   const char *type = tag + 2;
   if      (strncmp(type, "RMC", 3) == 0) parse_rmc(fields, n);
   else if (strncmp(type, "GGA", 3) == 0) parse_gga(fields, n);
+  else if (strncmp(type, "GSV", 3) == 0) parse_gsv(fields, n);
 }
 
 static void process_byte(uint8_t b)

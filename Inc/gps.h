@@ -21,6 +21,8 @@ typedef struct {
   float    hdop;
   uint32_t tick_ms;
   uint8_t  valid;
+  uint8_t  cn0_max;          /* strongest satellite C/N0 (dB-Hz) from GSV; 0 = no data */
+  uint8_t  sats_in_view;     /* satellites reporting a C/N0 in the last GSV burst */
 } PL_GpsFix;
 
 int  GPS_Init(void);

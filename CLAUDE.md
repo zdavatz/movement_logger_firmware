@@ -359,6 +359,12 @@ that SHA as the stable base.
 
 ## Backlog (separate task, not in this branch)
 
-- GPS per-satellite signal strength (C/N0) + satellite count. Needs GSV
-  sentences re-enabled in the u-blox config and a parser added in
-  `gps.c`.
+- GPS per-satellite signal strength (C/N0) + satellite count — **done in
+  v0.0.19** (`parse_gsv` in `gps.c`). The module already emits GSV at its
+  NMEA default, so no config write is needed (module→box RX direction);
+  `parse_gga` commits the per-epoch strongest C/N0 (`cn0_max`) and
+  tracked-sat count (`sats_in_view`) into `PL_GpsFix`, the Gps CSV
+  (`cn0_max,sats_in_view` columns), and SensorStream byte 45. RX-only, so
+  it works even when the box→module command line is dead (unlike the UBX
+  GPS Debug survey, which needs the box→module TX path). A full
+  per-satellite C/N0 table is still future work.

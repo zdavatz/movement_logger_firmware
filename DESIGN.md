@@ -265,7 +265,7 @@ offset  size  field                   units             source
  42       1   gps_fix_q               0=none 1=GPS …    u-blox NMEA GGA
  43       1   gps_nsat                # satellites
  44       1   flags                   bit field         see below
- 45       1   reserved                0x00
+ 45       1   gps_cn0_max             dB-Hz (u8)        strongest satellite C/N0 from GSV; 0 = no data
 ```
 
 **flags** (bit 0 = LSB):

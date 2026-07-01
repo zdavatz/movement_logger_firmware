@@ -64,7 +64,7 @@ int Logger_Init(void)
   snprintf(name, sizeof(name), "GPS%03d.CSV", g_session);
   if (SDFat_OpenAppend(&g_gps, name) != PL_FX_OK) return -4;
   snprintf(hdr, sizeof(hdr),
-           "ms,utc,lat,lon,alt_m,speed_kmh,course_deg,fix_q,nsat,hdop\n");
+           "ms,utc,lat,lon,alt_m,speed_kmh,course_deg,fix_q,nsat,hdop,cn0_max,sats_in_view\n");
   SDFat_Append(&g_gps, hdr, (uint32_t)strlen(hdr));
 
   snprintf(name, sizeof(name), "BAT%03d.CSV", g_session);
@@ -216,13 +216,14 @@ static void emit_gps_row(const PL_GpsFix *fix)
 
   char row[180];
   int n = snprintf(row, sizeof(row),
-                   "%lu,%s,%ld.%06ld,%ld.%06ld,%ld,%ld.%01ld,%ld.%01ld,%u,%u,%ld.%01ld\n",
+                   "%lu,%s,%ld.%06ld,%ld.%06ld,%ld,%ld.%01ld,%ld.%01ld,%u,%u,%ld.%01ld,%u,%u\n",
                    (unsigned long)fix->tick_ms, fix->utc,
                    lat_i, lat_f, lon_i, lon_f, alt_i,
                    spd_i / 10, spd_i % 10,
                    cog_i / 10, cog_i % 10,
                    (unsigned)fix->fix_q, (unsigned)fix->num_sat,
-                   hdop_i / 10, hdop_i % 10);
+                   hdop_i / 10, hdop_i % 10,
+                   (unsigned)fix->cn0_max, (unsigned)fix->sats_in_view);
   if (n > 0) SDFat_Append(&g_gps, row, (uint32_t)n);
 }
 
