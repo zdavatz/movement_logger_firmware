@@ -288,6 +288,49 @@ host apps already resume a dropped transfer from `offset = bytes-on-disk`
 **Don't raise the READ stall above the 90 s peer-gone deadline** — that would
 let a genuinely idle-connected limbo survive. See `Src/ble.c` and issue #4.
 
+## Post-drop re-advertise recovery (v0.0.20+) — `ble.c`
+
+**The "box invisible until power-cycle after a *large-file* mid-READ drop" fix.**
+This is the recovery counterpart to the stability levers above: those make drops
+*rare*; this makes the box always come *back* after one. Root cause was a
+one-shot dead-end that only bit long transfers:
+
+1. **`ble_aci_cmd` ate the disconnect event.** During a big READ the box calls
+   `ble_notify` → `ble_aci_cmd` on essentially every tick, and `ble_aci_cmd`'s
+   response-poll loop **discarded every HCI event that wasn't its
+   CommandComplete** — including `Disconnection_Complete` (`0x04 0x05`). So a
+   drop mid-transfer was silently eaten, the clean `0x05` re-advertise handler
+   never ran, and the box thought it was still connected. Small files return to
+   IDLE in ~1–2 s so the drop landed *outside* the notify loop and recovered
+   cleanly; large files stayed in the loop for minutes → dead-end. Fix: the poll
+   loop now **latches** `Disconnection_Complete` (`g_disconnect_latched`) instead
+   of discarding it; `BLE_Tick` drains the latch right after `fsm_advance()` and
+   runs the same teardown (clear handles, `fsm_emergency_exit` if not IDLE,
+   re-advertise) — immediate recovery instead of waiting the 90 s peer-gone
+   watchdog.
+2. **`ble_recover_lost_peer` was a one-shot.** It zeroed `g_conn_handle` *before*
+   advertising was confirmed and did a **single unretried** `ble_adv_enable()`;
+   that also disarmed the peer-gone watchdog (gated on `g_conn_handle != 0`), and
+   nothing periodically re-armed advertising. One failed re-advertise — exactly
+   what a saturated ACL TX queue right after a big transfer produces — left the
+   box emitting **no connectable ADV**, unreachable by *any* central (desktop or
+   mobile) until reboot. Fix: it now retries the re-advertise ×3 and re-enters
+   when disconnected-but-not-advertising.
+3. **New durable backstop: periodic advertising re-arm.** `BLE_Tick` now
+   re-enables advertising every `ADV_REARM_INTERVAL_MS` (**3 s**) whenever the box
+   is *not connected and not confirmed on air*, so a failed re-advertise can
+   never wedge the box until a power-cycle. Tracked by `g_adv_active` (true iff
+   the last `ble_adv_enable()` succeeded — distinct from `g_advertising`, the
+   never-reset boot flag; cleared on connect). The re-arm self-stops once adv is
+   confirmed up. **Don't gate the re-arm on `g_advertising`** (the boot flag) —
+   it must run whenever off-air.
+
+The desktop side complements this with retrieve-by-identifier + a held pending
+connect (`movement_logger_desktop` v0.0.36/0.0.37), but **no host change can
+reach a box emitting no connectable ADV** — the re-advertise re-arm here is the
+actual fix for that tail. Look for `ble: periodic re-adv rc=0` /
+`ble: latched-disconnect re-adv=0` in `ERRLOG.LOG` as proof the dead-end is gone.
+
 ## Known WIP edges (per the PR description)
 
 These are scheduled for cleanup in Phase 8; don't be surprised by them
