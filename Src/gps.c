@@ -103,6 +103,38 @@ static void gps_cfg_port_uart1(uint32_t baud)
   ubx_send(0x06, 0x00, p, sizeof(p));
 }
 
+/* ---------- UBX-CFG-VALSET: M10-native protocol enable ------------------ */
+
+/* On the MAX-M10S (M10 generation) the legacy $PUBX,41 / UBX-CFG-PRT output
+   protocol mask is unreliable — the port keeps emitting NMEA-only even after
+   we ask for UBX+NMEA, so the survey's poll requests never get a UBX reply
+   (the "no NAV-PVT reply" symptom over the BLE bridge). The M10-native config
+   interface (UBX-CFG-VALSET, key/value) does take. We flip the UBX in/out
+   protocol on UART1 in the RAM layer only (non-persistent — the module reverts
+   to its saved NMEA-only state on the next power cycle, keeping the "never
+   reconfigure the receiver persistently" invariant). */
+#define CFG_UART1INPROT_UBX   0x10730001UL
+#define CFG_UART1OUTPROT_UBX  0x10740001UL
+
+static int ubx_send_retry(uint8_t cls, uint8_t id, const uint8_t *payload,
+                          uint16_t len, int retries);
+
+/* Set one boolean (L-type, 1-byte) config key in the RAM layer, ACK-verified.
+   Returns 0 on ACK, -1 on timeout/NAK after retries. */
+static int gps_cfg_valset_bool(uint32_t key, uint8_t val)
+{
+  uint8_t p[9];
+  p[0] = 0x00;                    /* version 0 */
+  p[1] = 0x01;                    /* layers: RAM only (non-persistent) */
+  p[2] = 0x00; p[3] = 0x00;       /* reserved */
+  p[4] = (uint8_t)(key);
+  p[5] = (uint8_t)(key >> 8);
+  p[6] = (uint8_t)(key >> 16);
+  p[7] = (uint8_t)(key >> 24);
+  p[8] = val ? 0x01 : 0x00;
+  return ubx_send_retry(0x06, 0x8A, p, sizeof(p), 2);
+}
+
 /* $PUBX,41 — u-blox proprietary NMEA sentence that configures a UART
    port (baudrate + inProtoMask + outProtoMask). Critically, this
    travels as NMEA, so it's accepted by the module even when its
@@ -321,13 +353,28 @@ void GPS_BridgeSet(uint8_t on)
     g_cap_st = 0; g_cap_len = 0; g_cap_got = 0;
     g_ubx_head = g_ubx_tail = 0; g_ubx_dropped = 0;
     g_bridge = 1;
+    /* Step 1: $PUBX,41 (travels as NMEA) re-enables UBX *input* even if the
+       persisted config locked the port to NMEA-only input — otherwise the
+       CFG-VALSET below would itself be dropped by the module. */
     gps_set_ubx_output(1);
+    HAL_Delay(50);
+    /* Step 2: M10-native, ACK-verified — force UBX in+out ON on UART1 (RAM).
+       This is the lever $PUBX,41 alone doesn't reliably pull on the M10S; the
+       ACK/FAIL below in the errlog tells us definitively whether it took. */
+    int in_rc  = gps_cfg_valset_bool(CFG_UART1INPROT_UBX, 1);
+    int out_rc = gps_cfg_valset_bool(CFG_UART1OUTPROT_UBX, 1);
+    ErrLog_Writef("gps: bridge ON @%lu baud (valset in=%s out=%s)",
+                  (unsigned long)g_locked_baud,
+                  (in_rc == 0) ? "ACK" : "FAIL",
+                  (out_rc == 0) ? "ACK" : "FAIL");
   } else {
     g_bridge = 0;
+    /* Restore NMEA-only output for the SD logger. RAM-only, best-effort — a
+       power cycle would clear it anyway; the ACK doesn't matter here. */
+    (void)gps_cfg_valset_bool(CFG_UART1OUTPROT_UBX, 0);
     gps_set_ubx_output(0);
+    ErrLog_Writef("gps: bridge off @%lu baud", (unsigned long)g_locked_baud);
   }
-  ErrLog_Writef("gps: bridge %s @%lu baud", on ? "ON" : "off",
-                (unsigned long)g_locked_baud);
 }
 
 uint8_t GPS_BridgeActive(void) { return g_bridge; }
