@@ -160,6 +160,22 @@ static const uint8_t BLE_BATTERY_UUID[16] = {
 /* ----- State ------------------------------------------------------------- */
 static SPI_HandleTypeDef g_hspi1;
 static uint8_t           g_advertising = 0;
+/* True iff the LAST ble_adv_enable() succeeded — i.e. the chip is actually on
+   air. Distinct from g_advertising (set once at boot, never cleared, meaning
+   "did we ever start"). Cleared on connect (the chip stops advertising the
+   instant a central connects). Consulted by the periodic re-arm in BLE_Tick so
+   that ONE failed re-advertise (e.g. a saturated ACL TX queue after a big
+   transfer drop) no longer wedges the box until a power-cycle. See issue:
+   large-file mid-READ drop left the box emitting no connectable ADV. */
+static uint8_t           g_adv_active      = 0;
+static uint32_t          g_adv_last_try_ms = 0;
+/* FW-6b: set when ble_aci_cmd's poll loop sees a Disconnection_Complete
+   (0x04 0x05) while waiting for its CommandComplete — instead of silently
+   discarding it (which left a mid-transfer drop invisible to the normal
+   event handler, so recovery waited for the 90 s peer-gone watchdog). Drained
+   at the top of BLE_Tick, which runs the same teardown as the 0x05 handler
+   for an immediate re-advertise. */
+static volatile uint8_t  g_disconnect_latched = 0;
 
 /* GATT handles captured during BLE_Init from ACI add_service / add_char
    responses. cmd_handle is what the host writes commands to; data_handle
@@ -380,6 +396,12 @@ static int ble_aci_cmd(uint16_t opcode, const uint8_t *payload, uint16_t plen,
     if (n <= 0) { HAL_Delay(2); continue; }
     if (n < 7) continue;
     if (evt[0] != 0x04) continue;
+    /* FW-6b: don't DISCARD a Disconnection_Complete that lands while we poll
+       for our CommandComplete (happens constantly during a big READ, where
+       ble_notify → ble_aci_cmd runs every tick). Latch it so BLE_Tick can
+       re-advertise immediately instead of waiting out the 90 s peer-gone
+       watchdog. Still `continue` — this is not our CommandComplete. */
+    if (evt[1] == 0x05) { g_disconnect_latched = 1; continue; }
     if (evt[1] != 0x0E) continue;
     uint16_t evt_op = (uint16_t)(evt[4] | (evt[5] << 8));
     if (evt_op != opcode) continue;
@@ -404,7 +426,13 @@ static int ble_aci_cmd(uint16_t opcode, const uint8_t *payload, uint16_t plen,
 static int ble_adv_enable(void)
 {
   uint8_t p[6] = { 0x01, 0x01, 0x00, 0x00, 0x00, 0x00 };
-  return ble_aci_cmd(ACI_OP_GAP_SET_ADV_ENABLE, p, sizeof(p), NULL, 0);
+  int rc = ble_aci_cmd(ACI_OP_GAP_SET_ADV_ENABLE, p, sizeof(p), NULL, 0);
+  /* Record whether the chip is actually advertising now, so the periodic
+     re-arm in BLE_Tick can retry a FAILED re-advertise instead of leaving
+     the box silent-until-reboot. */
+  g_adv_active      = (rc == 0) ? 1 : 0;
+  g_adv_last_try_ms = HAL_GetTick();
+  return rc;
 }
 
 /* Write a characteristic's stored value (offset 0). Two uses:
@@ -562,6 +590,13 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
    well within tolerance. */
 #define PEER_GONE_DEADLINE_MS   90000
 
+/* Advertising re-arm interval: how often BLE_Tick retries a FAILED
+   re-advertise when the box is not connected and not on air. The durable
+   backstop against "invisible until power-cycle" — one failed re-advertise
+   (saturated ACL TX after a big-transfer drop) is retried every 3 s instead
+   of wedging the box forever. Self-stops once advertising is confirmed up. */
+#define ADV_REARM_INTERVAL_MS   3000
+
 /* Per-chunk notify budget INSIDE fsm_advance. Short on purpose: each
    BLE_Tick may eat at most this much wall-clock so Logger_Tick stays
    responsive. Typical macOS connection interval is 30 ms; 50 ms is
@@ -612,15 +647,33 @@ static int ble_hci_disconnect(uint16_t conn_handle, uint8_t reason)
    already disconnected. */
 static void ble_recover_lost_peer(const char *why)
 {
-  if (g_conn_handle == 0) return;
+  /* Already fully recovered (disconnected AND confirmed on air) → nothing to
+     do. NOTE: the old guard was `if (g_conn_handle == 0) return;`, which made
+     this a one-shot dead-end — once it zeroed g_conn_handle below, a FAILED
+     re-advertise could never be retried here, and the peer-gone watchdog
+     (gated on g_conn_handle != 0) was disarmed too. Now we also re-enter when
+     the handle is 0 but we are NOT advertising, so a failed re-advertise gets
+     another try. */
+  if (g_conn_handle == 0 && g_adv_active) return;
   uint16_t ch = g_conn_handle;
-  int hd_rc  = ble_hci_disconnect(ch, 0x13);       /* reason: Remote User */
-  HAL_Delay(500);                                  /* give chip time to process */
+  int hd_rc = 0;
+  if (ch != 0) {
+    hd_rc = ble_hci_disconnect(ch, 0x13);          /* reason: Remote User */
+    HAL_Delay(500);                                /* give chip time to process */
+  }
   g_conn_handle        = 0;
   g_stream_subscribed  = 0;
   g_battery_subscribed = 0;
   g_conn_param_due_ms  = 0;
-  int adv_rc = ble_adv_enable();
+  /* Retry the re-advertise: a saturated ACL TX queue right after a big
+     transfer can fail the first enable. Without this retry (and the periodic
+     re-arm in BLE_Tick) a single failure left the box invisible until a
+     power-cycle. ble_adv_enable() sets g_adv_active. */
+  int adv_rc = -1;
+  for (int i = 0; i < 3 && adv_rc != 0; i++) {
+    adv_rc = ble_adv_enable();
+    if (adv_rc != 0) HAL_Delay(200);
+  }
   char buf[96];
   snprintf(buf, sizeof(buf), "ble: peer-recover hci_disc=0x%04x rc=%d re-adv=%d why=%s",
            ch, hd_rc, adv_rc, why);
@@ -1572,6 +1625,31 @@ void BLE_Tick(void)
      (not gated on irq_high) so progress happens even on quiet links. */
   fsm_advance();
 
+  /* FW-6b: consume a Disconnection_Complete that ble_aci_cmd's poll loop
+     latched (and would otherwise have discarded) while we were mid-notify
+     during a transfer. Runs the same teardown as the normal 0x05 handler so
+     recovery is immediate instead of waiting for the 90 s peer-gone watchdog.
+     Placed right after fsm_advance() (which drove the notify that ate the
+     event) so a mid-READ drop is handled the same tick. */
+  if (g_disconnect_latched) {
+    g_disconnect_latched = 0;
+    g_conn_handle        = 0;
+    g_stream_subscribed  = 0;
+    g_battery_subscribed = 0;
+    g_conn_param_due_ms  = 0;
+    if (g_fsm.state != FSM_IDLE) {
+      fsm_emergency_exit(SM_PEER_GONE, "latched disconnect");
+    }
+    int arc = -1;
+    for (int i = 0; i < 3 && arc != 0; i++) {
+      arc = ble_adv_enable();                 /* sets g_adv_active */
+      if (arc != 0) HAL_Delay(200);
+    }
+    char b3[64];
+    snprintf(b3, sizeof(b3), "ble: latched-disconnect re-adv=%d", arc);
+    ErrLog_Write(b3);
+  }
+
   /* Relay any captured u-blox UBX frames to the GPS-survey host (no-op
      unless the bridge is active). Sits after fsm_advance so it only sends
      when the FileSync FSM is idle. */
@@ -1588,6 +1666,22 @@ void BLE_Tick(void)
   if (g_conn_handle != 0 &&
       (HAL_GetTick() - g_last_peer_seen_ms) >= PEER_GONE_DEADLINE_MS) {
     ble_recover_lost_peer("peer-gone watchdog");
+  }
+
+  /* Periodic advertising re-arm — the durable fix for "invisible until
+     power-cycle". INDEPENDENT of g_conn_handle: if we are not connected and
+     not confirmed on air, re-enable advertising on a timer, so a FAILED
+     recovery re-advertise (e.g. saturated ACL TX right after a big-transfer
+     drop) is retried instead of leaving the box silent forever. This runs
+     because BLE_Tick's `if (!g_advertising) return;` at the top stays false
+     (g_advertising is the boot flag, never reset) — do NOT gate this on it.
+     ble_adv_enable() updates g_adv_active, so this self-stops once adv is up. */
+  if (g_conn_handle == 0 && !g_adv_active &&
+      (HAL_GetTick() - g_adv_last_try_ms) >= ADV_REARM_INTERVAL_MS) {
+    int rc = ble_adv_enable();
+    char b2[64];
+    snprintf(b2, sizeof(b2), "ble: periodic re-adv rc=%d", rc);
+    ErrLog_Write(b2);
   }
 
   /* Deferred fast-conn-param request — DISABLED in v0.0.16. It is never armed
@@ -1623,6 +1717,7 @@ void BLE_Tick(void)
         uint8_t  st = evt[4];
         uint16_t ch = (uint16_t)(evt[5] | (evt[6] << 8));
         g_conn_handle = ch;
+        g_adv_active  = 0;                      /* chip stops advertising on connect */
         g_last_peer_seen_ms = HAL_GetTick();   /* arm the peer-gone watchdog */
         /* v0.0.16: do NOT arm the fast-conn-param request here. In v0.0.15 it
            fired ~1 s after connect — exactly when the central subscribes to the
