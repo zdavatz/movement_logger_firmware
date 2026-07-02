@@ -632,6 +632,16 @@ static struct {
   PL_File     f;
   uint32_t    sent;                 /* bytes notified to host so far */
   uint32_t    file_size;            /* total size, for done-marker */
+  /* Host-requested stream cap in bytes (v0.0.24), 0 = to-EOF (legacy).
+     Without it a READ of the ACTIVE session file streams until SDFat_Read
+     hits EOF — but the logger keeps appending, so the stream chases the
+     growing file and delivers MORE bytes than the host's LIST-size
+     expectation. The host finishes its file at the expected count and
+     issues the next READ; our excess bytes then land inside THAT file's
+     content on the host — Peter's GPS057/BAT057 full of SENS rows
+     (02.07.2026). The host now sends how many bytes it wants; we stop
+     exactly there. */
+  uint32_t    stream_cap;
   char        name[16];
   uint8_t     buf[244];             /* current chunk in flight; sized for max ATT MTU (247-3) */
   uint16_t    buf_len;              /* 0 = need to read fresh next call */
@@ -794,6 +804,21 @@ static void fsm_advance(void)
 
   /* Read next chunk if our retry buffer is empty. */
   if (g_fsm.buf_len == 0) {
+    /* Host-capped stream (v0.0.24): stop exactly at the requested byte
+       count even though the file may have grown past it — the logger keeps
+       appending to the active session file, and without this cap the
+       stream chases the growing EOF and over-delivers into the host's
+       next queued download (see the stream_cap field doc). */
+    if (g_fsm.stream_cap != 0 && g_fsm.sent >= g_fsm.stream_cap) {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "fsm: %s done sent=%lu size=%lu (cap)",
+               g_fsm.name, (unsigned long)g_fsm.sent,
+               (unsigned long)g_fsm.file_size);
+      ErrLog_Write(msg);
+      SDFat_Close(&g_fsm.f);
+      g_fsm.state = FSM_IDLE;
+      return;
+    }
     uint32_t got = 0;
     /* Dynamic chunk size: ATT_MTU minus 3-byte ATT-header overhead.
        BlueNRG-LP doesn't seem to raise ACI_ATT_EXCHANGE_MTU_RESP_EVENT
@@ -805,6 +830,10 @@ static void fsm_advance(void)
        in errlog and we roll back. */
     uint16_t chunk_max = (g_att_mtu > 23) ? (uint16_t)(g_att_mtu - 3) : 240;
     if (chunk_max > sizeof(g_fsm.buf)) chunk_max = sizeof(g_fsm.buf);
+    if (g_fsm.stream_cap != 0) {
+      uint32_t left = g_fsm.stream_cap - g_fsm.sent;
+      if ((uint32_t)chunk_max > left) chunk_max = (uint16_t)left;
+    }
     pl_fx_status_t s = SDFat_Read(&g_fsm.f, g_fsm.buf, chunk_max, &got);
     if (s != PL_FX_OK) {
       fsm_emergency_exit(SM_IO_ERROR, "sdread");
@@ -882,6 +911,7 @@ static void ble_process_command(void)
 
     char     name[16];
     uint32_t offset = 0;
+    uint32_t cap    = 0;   /* 0 = to-EOF (legacy hosts) */
 
     if (g_cmd_len <= 1) {
       /* Bare 0x02 with no filename is malformed by spec — reject. The
@@ -912,6 +942,18 @@ static void ble_process_command(void)
                  | ((uint32_t)g_cmd_buf[nul + 2] << 8)
                  | ((uint32_t)g_cmd_buf[nul + 3] << 16)
                  | ((uint32_t)g_cmd_buf[nul + 4] << 24);
+        }
+        /* Optional stream-length cap right after the offset (v0.0.24):
+           READ <name>\0<offset:u32><len:u32>. The host sends exactly how
+           many bytes it expects (its LIST-size diff), so a READ of the
+           actively-growing session file cannot over-deliver and bleed
+           into the host's next queued download. Absent → 0 → stream to
+           EOF, the legacy behaviour. */
+        if (g_cmd_len >= nul + 9) {
+          cap = (uint32_t)g_cmd_buf[nul + 5]
+              | ((uint32_t)g_cmd_buf[nul + 6] << 8)
+              | ((uint32_t)g_cmd_buf[nul + 7] << 16)
+              | ((uint32_t)g_cmd_buf[nul + 8] << 24);
         }
       }
       if (nlen == 0 || nlen > sizeof(name) - 1) {
@@ -946,10 +988,12 @@ static void ble_process_command(void)
     g_fsm.entered_tick       = HAL_GetTick();
     g_fsm.last_progress_tick = g_fsm.entered_tick;
     g_fsm.file_size          = f_open.size;
+    g_fsm.stream_cap         = cap;
     memcpy(g_fsm.name, name, sizeof(g_fsm.name));
 
-    snprintf(buf, sizeof(buf), "fsm: READ '%s' start off=%lu size=%lu",
-             name, (unsigned long)offset, (unsigned long)f_open.size);
+    snprintf(buf, sizeof(buf), "fsm: READ '%s' start off=%lu size=%lu cap=%lu",
+             name, (unsigned long)offset, (unsigned long)f_open.size,
+             (unsigned long)cap);
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_DELETE) {
     /* DELETE <name>: free the file's clusters + mark the dir entry
