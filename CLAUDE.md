@@ -331,6 +331,24 @@ reach a box emitting no connectable ADV** — the re-advertise re-arm here is th
 actual fix for that tail. Look for `ble: periodic re-adv rc=0` /
 `ble: latched-disconnect re-adv=0` in `ERRLOG.LOG` as proof the dead-end is gone.
 
+## Host-requested disconnect (v0.0.22+) — `0x0F`, `ble.c`
+
+**The "Mac-disconnect makes the box invisible to the iPhone" fix.** On macOS the
+desktop's `cancelPeripheralConnection` tears down only the *app's* view of the
+link; `bluetoothd` keeps the ACL alive with LL keepalives, so the box never sees
+`LL_TERMINATE`, its supervision timer never fires, and it stays connected-in-limbo
+advertising non-connectably — the next central (the iPhone) then can't connect
+until a box power-cycle. iOS tears the link down for real, so it never triggers
+this (Peter: "Mac-disconnect blockiert das iPhone; iPhone-disconnect lässt den Mac
+problemlos neu verbinden"). There is no CoreBluetooth API for the host to force
+the physical teardown. Fix: the desktop sends a new fire-and-forget opcode
+**`0x0F FSYNC_OP_DISCONNECT`** right before it cancels; the FileData dispatch
+routes it to **`ble_recover_lost_peer("host disconnect")`** — the same proven
+`HCI_Disconnect`-from-the-box-side (real `LL_TERMINATE`) + re-advertise path the
+watchdogs use. Purely additive: only the Mac sends `0x0F` (iOS/Android never do,
+so their behaviour is unchanged), and it only affects the current connection.
+Look for `ble: cmd DISCONNECT (host requested)` in `ERRLOG.LOG`.
+
 ## Known WIP edges (per the PR description)
 
 These are scheduled for cleanup in Phase 8; don't be surprised by them

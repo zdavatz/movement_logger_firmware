@@ -110,6 +110,17 @@
 #define FSYNC_OP_GPS_BRIDGE 0x0D   /* <u8> 1=on/0=off; relay u-blox UBX over BLE */
 #define FSYNC_OP_GPS_TX     0x0E   /* <raw bytes>; host → u-blox UART (UBX polls) */
 
+/* Host-requested disconnect (macOS fix). On macOS, cancelPeripheralConnection
+   only tears down the *app's* view of the link — bluetoothd keeps the ACL alive
+   with LL keepalives, so the box never sees LL_TERMINATE, its supervision timer
+   never fires, and it stays "connected-in-limbo" advertising non-connectably.
+   The next central (e.g. the iPhone) then can't connect until a power-cycle.
+   iOS tears the link down for real, so it doesn't need this. The desktop sends
+   this opcode right before it cancels, so the box terminates the link from ITS
+   side (real LL_TERMINATE) and re-advertises — same proven path the watchdogs
+   use. Fire-and-forget, no reply (legacy hosts never send it). */
+#define FSYNC_OP_DISCONNECT 0x0F   /* (none); box HCI-disconnects + re-advertises */
+
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
 #define FSYNC_ST_BUSY       0xB0
@@ -1147,6 +1158,14 @@ static void ble_process_command(void)
     if (g_cmd_len > 1) {
       GPS_BridgeTx(&g_cmd_buf[1], (uint16_t)(g_cmd_len - 1));
     }
+  } else if (op == FSYNC_OP_DISCONNECT) {
+    /* DISCONNECT: the host is done and wants the link gone. On macOS its
+       cancelPeripheralConnection leaves the ACL alive controller-side, so we
+       tear it down ourselves (HCI_Disconnect + re-advertise) — the box then
+       comes back on air connectable for the next central. Fire-and-forget, no
+       reply: the link is about to drop, so an ACK wouldn't arrive anyway. */
+    ErrLog_Write("ble: cmd DISCONNECT (host requested)");
+    ble_recover_lost_peer("host disconnect");
   } else {
     snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x (not yet handled)", op);
     ErrLog_Write(buf);
