@@ -180,6 +180,10 @@ static uint8_t           g_advertising = 0;
    large-file mid-READ drop left the box emitting no connectable ADV. */
 static uint8_t           g_adv_active      = 0;
 static uint32_t          g_adv_last_try_ms = 0;
+/* Consecutive periodic-re-adv failures (BLE_Tick re-arm). At
+   ADV_REARM_MAX_FAILS the re-arm escalates to a full chip re-init — see the
+   escalation comment in BLE_Tick. Reset on any successful enable. */
+static uint8_t           g_adv_fail_streak = 0;
 /* FW-6b: set when ble_aci_cmd's poll loop sees a Disconnection_Complete
    (0x04 0x05) while waiting for its CommandComplete — instead of silently
    discarding it (which left a mid-transfer drop invisible to the normal
@@ -607,6 +611,11 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
    (saturated ACL TX after a big-transfer drop) is retried every 3 s instead
    of wedging the box forever. Self-stops once advertising is confirmed up. */
 #define ADV_REARM_INTERVAL_MS   3000
+/* Consecutive re-adv failures before the re-arm escalates to a full chip
+   re-init (~30 s off-air at the 3 s interval). Low enough that the box comes
+   back before the user reaches for the power switch; high enough that a
+   transient ACL-TX-saturation failure (1-2 rounds) never triggers it. */
+#define ADV_REARM_MAX_FAILS     10
 
 /* Per-chunk notify budget INSIDE fsm_advance. Short on purpose: each
    BLE_Tick may eat at most this much wall-clock so Logger_Tick stays
@@ -1694,13 +1703,57 @@ void BLE_Tick(void)
      drop) is retried instead of leaving the box silent forever. This runs
      because BLE_Tick's `if (!g_advertising) return;` at the top stays false
      (g_advertising is the boot flag, never reset) — do NOT gate this on it.
-     ble_adv_enable() updates g_adv_active, so this self-stops once adv is up. */
+     ble_adv_enable() updates g_adv_active, so this self-stops once adv is up.
+
+     ESCALATION (v0.0.23): retrying the same failing command forever is not a
+     recovery. Field evidence (02.07.2026, ERRLOG): after a macOS mid-READ
+     stall-abort, `peer-recover hci_disc rc=0` but the re-advertise failed
+     rc=211 — and then `periodic re-adv rc=211` every 3 s for minutes until a
+     power-cycle. The chip was wedged in a state ble_adv_enable alone cannot
+     clear (likely still holding the old ACL internally — the macOS central
+     never acked the termination). After ADV_REARM_MAX_FAILS consecutive
+     failures (~30 s off-air) do a FULL chip re-init (NRST + HCI_RESET + GATT/
+     GAP/services/advertising via BLE_Init — same proven boot bring-up,
+     ~4 s, IWDG kicked around it). If even that fails, NVIC_SystemReset():
+     the power-cycle the user would otherwise perform by hand, minus the
+     hand. AUTO mode reopens a session on reboot; MANUAL comes back idle but
+     connectable — in both cases the box is REACHABLE again, which beats a
+     silent brick. */
   if (g_conn_handle == 0 && !g_adv_active &&
       (HAL_GetTick() - g_adv_last_try_ms) >= ADV_REARM_INTERVAL_MS) {
     int rc = ble_adv_enable();
-    char b2[64];
+    char b2[96];
     snprintf(b2, sizeof(b2), "ble: periodic re-adv rc=%d", rc);
     ErrLog_Write(b2);
+    if (rc == 0) {
+      g_adv_fail_streak = 0;
+    } else if (++g_adv_fail_streak >= ADV_REARM_MAX_FAILS) {
+      snprintf(b2, sizeof(b2),
+               "ble: re-adv wedged (rc=%d x%u) — full chip re-init",
+               rc, (unsigned)g_adv_fail_streak);
+      ErrLog_Write(b2);
+      ErrLog_Flush();
+      /* The FSM is already out of any transfer (conn handle is 0 and the
+         disconnect path emergency-exited it), but clear it defensively so
+         the re-init starts from a clean slate. */
+      memset(&g_fsm, 0, sizeof(g_fsm));
+      g_stream_subscribed  = 0;
+      g_battery_subscribed = 0;
+      g_adv_fail_streak    = 0;
+      Watchdog_Kick();
+      int init_rc = BLE_Init();          /* NRST + full bring-up, ~4 s */
+      Watchdog_Kick();
+      snprintf(b2, sizeof(b2), "ble: chip re-init rc=%d", init_rc);
+      ErrLog_Write(b2);
+      if (init_rc != 0) {
+        /* Last rung: reboot the whole box. Reset reason lands in the next
+           boot banner (decode_reset), so this stays diagnosable. */
+        ErrLog_Write("ble: re-init FAILED — system reset");
+        ErrLog_Flush();
+        HAL_Delay(50);
+        NVIC_SystemReset();
+      }
+    }
   }
 
   /* Deferred fast-conn-param request — DISABLED in v0.0.16. It is never armed
