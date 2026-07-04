@@ -14,6 +14,20 @@ static inline void wr16(uint8_t *p, int16_t v)
   p[1] = (uint8_t)((v >> 8) & 0xFF);
 }
 
+/* Saturate a 32-bit value into int16 range instead of letting the cast
+   WRAP. Gyro at ±500 dps packed as centi-dps overflows int16 above
+   327.67 dps — a fast hand rotation is easily > that, and the silent wrap
+   turned a fast spin into a garbage value that made the desktop/iOS live
+   3D preview "explode" and lose orientation. Clamping degrades that to a
+   graceful cap (the preview lags on a very fast flick, then the mag
+   re-anchor recovers) instead of flipping to nonsense. */
+static inline int16_t sat16(int32_t v)
+{
+  if (v > 32767) return 32767;
+  if (v < -32768) return -32768;
+  return (int16_t)v;
+}
+
 static inline void wr32(uint8_t *p, int32_t v)
 {
   p[0] = (uint8_t)(v & 0xFF);
@@ -38,9 +52,9 @@ void Stream_Pack(const PL_Snapshot *s, uint8_t logging_active,
   wr16(&out[6],  (int16_t)(((int32_t)s->imu.ay * 122) / 1000));
   wr16(&out[8],  (int16_t)(((int32_t)s->imu.az * 122) / 1000));
 
-  wr16(&out[10], (int16_t)(((int32_t)s->imu.gx * 175) / 100));
-  wr16(&out[12], (int16_t)(((int32_t)s->imu.gy * 175) / 100));
-  wr16(&out[14], (int16_t)(((int32_t)s->imu.gz * 175) / 100));
+  wr16(&out[10], sat16(((int32_t)s->imu.gx * 175) / 100));
+  wr16(&out[12], sat16(((int32_t)s->imu.gy * 175) / 100));
+  wr16(&out[14], sat16(((int32_t)s->imu.gz * 175) / 100));
 
   wr16(&out[16], (int16_t)(((int32_t)s->mag.mx * 15) / 10));
   wr16(&out[18], (int16_t)(((int32_t)s->mag.my * 15) / 10));

@@ -231,19 +231,17 @@ static volatile uint16_t g_att_mtu         = 23;
    No mode switch — SD logging runs regardless (DESIGN.md Section 2/3). */
 static uint8_t           g_stream_subscribed = 0;
 static uint32_t          g_stream_last_ms    = 0;
-/* SensorStream emit period. 100 ms = 10 Hz: fast enough that the desktop /
-   iOS / Android live 3D box preview moves in real time (the old 2000 ms /
-   0.5 Hz made every update a big discrete jump — the box "losing
-   orientation") and, just as importantly, feeds the hosts' passive 3D
-   hard-iron auto-calibration ~20× more samples per second so it converges
-   in seconds of ordinary handling instead of minutes. The snapshot behind
-   it (g_last_imu/g_last_mag) is already refreshed at 100 Hz in Logger_Tick,
-   so this only changes how often we re-send it — no extra sensor I/O. Well
-   within the link budget: the negotiated connection interval is 15–30 ms,
-   and one 46-byte notify per 100 ms is ~460 B/s. Non-blocking single
-   attempt (below), so a momentarily full TX buffer just drops one 100 ms
-   slot rather than stalling the main loop. */
-#define STREAM_PERIOD_MS 100
+/* SensorStream emit period. 50 ms = 20 Hz: the live 3D box preview + its
+   accel/gyro attitude filter need a high sample rate to track fast rotation
+   smoothly (10 Hz was visibly choppy and the gyro integration ran away on
+   quick flicks). The snapshot behind it (g_last_imu/g_last_mag) is already
+   refreshed at 120 Hz in Logger_Tick, so this only changes how often we
+   re-send it — no extra sensor I/O. Still within the link budget: the
+   negotiated connection interval is 15–30 ms, and one 46-byte notify per
+   50 ms is ~920 B/s. Non-blocking single attempt (below), so a momentarily
+   full TX buffer just drops one slot rather than stalling the main loop.
+   (0.5 Hz → 2 s per update used to make the box "lose orientation".) */
+#define STREAM_PERIOD_MS 50
 
 /* BatteryStatus: stored value updated + (if subscribed) notified once per
    minute, plus immediately on a low-battery flag transition. */
