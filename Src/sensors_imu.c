@@ -190,7 +190,7 @@ int IMU_Init(void)
   imu_write_reg(LSM_REG_CTRL1_XL, 0x07);  /* op_mode_xl=HP, odr_xl=120 Hz */
   imu_write_reg(LSM_REG_CTRL8_XL, 0x01);  /* fs_xl = ±4 g (0.122 mg/LSB — matches emit_sensor_row scaling) */
   imu_write_reg(LSM_REG_CTRL2_G,  0x07);  /* op_mode_g=HP, odr_g=120 Hz */
-  imu_write_reg(LSM_REG_CTRL6_G,  0x02);  /* fs_g = ±500 dps (17.5 mdps/LSB — matches emit_sensor_row) */
+  imu_write_reg(LSM_REG_CTRL6_G,  0x04);  /* fs_g = ±2000 dps (70 mdps/LSB — matches emit_sensor_row + Stream_Pack). Was ±500; raised so fast hand rotations don't saturate the gyro and undercount the host's live 3D heading. Pumpfoil rates are << 500 dps so the 4x coarser resolution is irrelevant for the CSV. */
 
   HAL_Delay(50);
   g_ok = 1;

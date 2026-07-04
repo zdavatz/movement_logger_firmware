@@ -167,10 +167,12 @@ static void emit_sensor_row(const PL_ImuSample *imu,
   int32_t ax_mg = ((int32_t)imu->ax * 122) / 1000;  /* 0.122 mg/LSB at ±4 g */
   int32_t ay_mg = ((int32_t)imu->ay * 122) / 1000;
   int32_t az_mg = ((int32_t)imu->az * 122) / 1000;
-  /* Gyro ±500 dps → 17.5 mdps/LSB */
-  int32_t gx_mdps = ((int32_t)imu->gx * 175) / 10;
-  int32_t gy_mdps = ((int32_t)imu->gy * 175) / 10;
-  int32_t gz_mdps = ((int32_t)imu->gz * 175) / 10;
+  /* Gyro ±2000 dps → 70 mdps/LSB (v0.0.28; was ±500 / 17.5). Output is
+     still mdps — same column/units, 4x coarser, negligible for pumpfoil.
+     Keep in lock-step with CTRL6_G (sensors_imu.c) + Stream_Pack. */
+  int32_t gx_mdps = ((int32_t)imu->gx * 700) / 10;
+  int32_t gy_mdps = ((int32_t)imu->gy * 700) / 10;
+  int32_t gz_mdps = ((int32_t)imu->gz * 700) / 10;
   /* Mag ±50 gauss / 1.5 mgauss/LSB */
   int32_t mx_mg = ((int32_t)mag->mx * 15) / 10;
   int32_t my_mg = ((int32_t)mag->my * 15) / 10;

@@ -49,16 +49,16 @@ void Stream_Pack(const PL_Snapshot *s, uint8_t logging_active,
   wr16(&out[6],  (int16_t)(((int32_t)s->imu.ay * 122) / 1000));
   wr16(&out[8],  (int16_t)(((int32_t)s->imu.az * 122) / 1000));
 
-  /* gyro: DECI-dps (raw * 17.5 mdps/LSB, ÷10) — v0.0.27. Was centi-dps
-     (÷100), which overflowed int16 above 327.67 dps and clamped/wrapped, so
-     a normal hand rotation (peaks well past 327 dps) undercounted and the
-     host's gyro-integrated live heading lost ~12%/turn. Deci-dps covers the
-     full ±500 dps gyro FS in int16 (max ≈ 5000). Host divides by 10 for dps
-     (was /100). CSV path (emit_sensor_row) is unchanged — it packs mdps and
-     is unaffected. */
-  wr16(&out[10], sat16(((int32_t)s->imu.gx * 175) / 1000));
-  wr16(&out[12], sat16(((int32_t)s->imu.gy * 175) / 1000));
-  wr16(&out[14], sat16(((int32_t)s->imu.gz * 175) / 1000));
+  /* gyro: DECI-dps (÷10 for dps on the host). v0.0.28: gyro FS is now
+     ±2000 dps (70 mdps/LSB), so deci-dps = raw * 70/100 = raw * 700/1000
+     (max ≈ 22937 for 2293 dps, fits int16). Was ±500 dps (raw*175/1000):
+     fast hand rotations / backflips saturated the ±500 sensor and
+     undercounted the host's gyro-integrated live 3D heading. Host scale is
+     unchanged (still deci-dps, ÷10). Keep this factor in lock-step with the
+     CTRL6_G FS in sensors_imu.c AND emit_sensor_row's mdps factor. */
+  wr16(&out[10], sat16(((int32_t)s->imu.gx * 700) / 1000));
+  wr16(&out[12], sat16(((int32_t)s->imu.gy * 700) / 1000));
+  wr16(&out[14], sat16(((int32_t)s->imu.gz * 700) / 1000));
 
   wr16(&out[16], (int16_t)(((int32_t)s->mag.mx * 15) / 10));
   wr16(&out[18], (int16_t)(((int32_t)s->mag.my * 15) / 10));
