@@ -33,7 +33,8 @@ uint8_t GPS_FixUpdated(void);
 /* Diagnostic counters for Build #8 GPS bring-up. Pass NULL for fields you
    don't need. Values are running totals since boot. */
 void GPS_GetStats(uint32_t *bytes, uint32_t *lines_good, uint32_t *lines_bad,
-                  uint32_t *rmc, uint32_t *gga, uint32_t *errors);
+                  uint32_t *rmc, uint32_t *gga, uint32_t *errors,
+                  uint32_t *rx_dropped, uint32_t *ubx_dropped);
 
 /* GPS fix-quality summary, used to drive the green-LED pattern (single /
    double / triple flash). Returns NONE if the latest valid-status RMC

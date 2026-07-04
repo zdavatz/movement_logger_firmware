@@ -116,6 +116,20 @@ static void gps_cfg_port_uart1(uint32_t baud)
 #define CFG_UART1INPROT_UBX   0x10730001UL
 #define CFG_UART1OUTPROT_UBX  0x10740001UL
 
+/* CFG-MSGOUT-NMEA_ID_*_UART1 rate keys (U1: emit every Nth nav epoch; 0 =
+   off). At 9600 baud the UART is oversubscribed by 5 Hz NMEA, so the survey's
+   UBX poll replies (NAV-PVT / MON-RF) were delayed or dropped — the "ant=?/?"
+   / "used=0" survey gaps. While the bridge is active we silence the heavy /
+   non-essential sentences (GSV is the big one — multi-sentence per satellite)
+   to free bandwidth for the UBX answers; GGA + RMC stay on for the SD logger's
+   fix. Restored (rate 1) on bridge off. RAM-only, ACK-verified via
+   gps_cfg_valset_bool (its 1-byte value matches these U1 keys). */
+#define CFG_MSGOUT_NMEA_GSV_UART1  0x209100c5UL
+#define CFG_MSGOUT_NMEA_GSA_UART1  0x209100c0UL
+#define CFG_MSGOUT_NMEA_VTG_UART1  0x209100b1UL
+#define CFG_MSGOUT_NMEA_GLL_UART1  0x209100caUL
+#define CFG_MSGOUT_NMEA_ZDA_UART1  0x209100d9UL
+
 static int ubx_send_retry(uint8_t cls, uint8_t id, const uint8_t *payload,
                           uint16_t len, int retries);
 
@@ -382,6 +396,20 @@ static void bridge_capture(uint8_t b)
   }
 }
 
+/* Silence (on=0) or restore (on=1, default rate) the heavy NMEA sentences on
+   UART1 so the survey's UBX poll replies aren't starved by 5 Hz NMEA at
+   9600 baud. GGA + RMC are left untouched for the SD logger's fix. */
+static void gps_survey_nmea(uint8_t on)
+{
+  static const uint32_t keys[] = {
+    CFG_MSGOUT_NMEA_GSV_UART1, CFG_MSGOUT_NMEA_GSA_UART1,
+    CFG_MSGOUT_NMEA_VTG_UART1, CFG_MSGOUT_NMEA_GLL_UART1,
+    CFG_MSGOUT_NMEA_ZDA_UART1,
+  };
+  for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+    (void)gps_cfg_valset_bool(keys[i], on);
+}
+
 void GPS_BridgeSet(uint8_t on)
 {
   extern void ErrLog_Writef(const char *fmt, ...);
@@ -400,7 +428,10 @@ void GPS_BridgeSet(uint8_t on)
        ACK/FAIL below in the errlog tells us definitively whether it took. */
     int in_rc  = gps_cfg_valset_bool(CFG_UART1INPROT_UBX, 1);
     int out_rc = gps_cfg_valset_bool(CFG_UART1OUTPROT_UBX, 1);
-    ErrLog_Writef("gps: bridge ON @%lu baud (valset in=%s out=%s)",
+    /* Free UART bandwidth for the UBX poll replies by silencing the heavy
+       NMEA sentences (GSV/GSA/VTG/GLL/ZDA) while the survey runs. */
+    gps_survey_nmea(0);
+    ErrLog_Writef("gps: bridge ON @%lu baud (valset in=%s out=%s, nmea trimmed)",
                   (unsigned long)g_locked_baud,
                   (in_rc == 0) ? "ACK" : "FAIL",
                   (out_rc == 0) ? "ACK" : "FAIL");
@@ -410,7 +441,8 @@ void GPS_BridgeSet(uint8_t on)
        power cycle would clear it anyway; the ACK doesn't matter here. */
     (void)gps_cfg_valset_bool(CFG_UART1OUTPROT_UBX, 0);
     gps_set_ubx_output(0);
-    ErrLog_Writef("gps: bridge off @%lu baud", (unsigned long)g_locked_baud);
+    gps_survey_nmea(1);   /* restore the NMEA sentences we silenced */
+    ErrLog_Writef("gps: bridge off @%lu baud (nmea restored)", (unsigned long)g_locked_baud);
   }
 }
 
@@ -744,14 +776,21 @@ void GPS_Tick(void)
 }
 
 void GPS_GetStats(uint32_t *bytes, uint32_t *lines_good, uint32_t *lines_bad,
-                  uint32_t *rmc, uint32_t *gga, uint32_t *errors)
+                  uint32_t *rmc, uint32_t *gga, uint32_t *errors,
+                  uint32_t *rx_dropped, uint32_t *ubx_dropped)
 {
-  if (bytes)      *bytes      = g_diag_bytes;
-  if (lines_good) *lines_good = g_diag_lines_good;
-  if (lines_bad)  *lines_bad  = g_diag_lines_bad;
-  if (rmc)        *rmc        = g_diag_rmc;
-  if (gga)        *gga        = g_diag_gga;
-  if (errors)     *errors     = g_diag_errors;
+  if (bytes)       *bytes       = g_diag_bytes;
+  if (lines_good)  *lines_good  = g_diag_lines_good;
+  if (lines_bad)   *lines_bad   = g_diag_lines_bad;
+  if (rmc)         *rmc         = g_diag_rmc;
+  if (gga)         *gga         = g_diag_gga;
+  if (errors)      *errors      = g_diag_errors;
+  /* rx_dropped: STM32 512 B RX ring overflowed (main loop fell behind).
+     ubx_dropped: 2048 B UBX relay ring overflowed (BLE drain fell behind).
+     Both near 0 while the survey still drops replies ⇒ the MODULE never sent
+     them ⇒ UART bandwidth saturation (baud/NMEA), not an STM32-side loss. */
+  if (rx_dropped)  *rx_dropped  = g_rx_dropped;
+  if (ubx_dropped) *ubx_dropped = g_ubx_dropped;
 }
 
 pl_gps_quality_t GPS_LastFixQuality(void)

@@ -340,11 +340,12 @@ void Logger_Tick(void)
   if (now_diag - s_last_gps_diag >= 5000) {
     s_last_gps_diag = now_diag;
     extern void ErrLog_Writef(const char *fmt, ...);
-    uint32_t b, lg, lb, rmc, gga, err;
-    GPS_GetStats(&b, &lg, &lb, &rmc, &gga, &err);
-    ErrLog_Writef("gps_diag: bytes=%lu lines_good=%lu lines_bad=%lu rmc=%lu gga=%lu errors=%lu",
+    uint32_t b, lg, lb, rmc, gga, err, rxd, ubxd;
+    GPS_GetStats(&b, &lg, &lb, &rmc, &gga, &err, &rxd, &ubxd);
+    ErrLog_Writef("gps_diag: bytes=%lu lines_good=%lu lines_bad=%lu rmc=%lu gga=%lu errors=%lu rx_drop=%lu ubx_drop=%lu",
                   (unsigned long)b, (unsigned long)lg, (unsigned long)lb,
-                  (unsigned long)rmc, (unsigned long)gga, (unsigned long)err);
+                  (unsigned long)rmc, (unsigned long)gga, (unsigned long)err,
+                  (unsigned long)rxd, (unsigned long)ubxd);
 
     /* One-shot loud marker if GPS communication is fundamentally broken.
        Fires once per boot at 30 s if lines_good is still 0 — the
