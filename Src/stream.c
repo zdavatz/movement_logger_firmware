@@ -15,12 +15,9 @@ static inline void wr16(uint8_t *p, int16_t v)
 }
 
 /* Saturate a 32-bit value into int16 range instead of letting the cast
-   WRAP. Gyro at ±500 dps packed as centi-dps overflows int16 above
-   327.67 dps — a fast hand rotation is easily > that, and the silent wrap
-   turned a fast spin into a garbage value that made the desktop/iOS live
-   3D preview "explode" and lose orientation. Clamping degrades that to a
-   graceful cap (the preview lags on a very fast flick, then the mag
-   re-anchor recovers) instead of flipping to nonsense. */
+   WRAP. Belt-and-suspenders for the stream fields; with the deci-dps gyro
+   scale below it no longer trips in practice (the full ±500 dps FS fits),
+   but it still guards against a stray out-of-range sample. */
 static inline int16_t sat16(int32_t v)
 {
   if (v > 32767) return 32767;
@@ -52,9 +49,16 @@ void Stream_Pack(const PL_Snapshot *s, uint8_t logging_active,
   wr16(&out[6],  (int16_t)(((int32_t)s->imu.ay * 122) / 1000));
   wr16(&out[8],  (int16_t)(((int32_t)s->imu.az * 122) / 1000));
 
-  wr16(&out[10], sat16(((int32_t)s->imu.gx * 175) / 100));
-  wr16(&out[12], sat16(((int32_t)s->imu.gy * 175) / 100));
-  wr16(&out[14], sat16(((int32_t)s->imu.gz * 175) / 100));
+  /* gyro: DECI-dps (raw * 17.5 mdps/LSB, ÷10) — v0.0.27. Was centi-dps
+     (÷100), which overflowed int16 above 327.67 dps and clamped/wrapped, so
+     a normal hand rotation (peaks well past 327 dps) undercounted and the
+     host's gyro-integrated live heading lost ~12%/turn. Deci-dps covers the
+     full ±500 dps gyro FS in int16 (max ≈ 5000). Host divides by 10 for dps
+     (was /100). CSV path (emit_sensor_row) is unchanged — it packs mdps and
+     is unaffected. */
+  wr16(&out[10], sat16(((int32_t)s->imu.gx * 175) / 1000));
+  wr16(&out[12], sat16(((int32_t)s->imu.gy * 175) / 1000));
+  wr16(&out[14], sat16(((int32_t)s->imu.gz * 175) / 1000));
 
   wr16(&out[16], (int16_t)(((int32_t)s->mag.mx * 15) / 10));
   wr16(&out[18], (int16_t)(((int32_t)s->mag.my * 15) / 10));
