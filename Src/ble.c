@@ -120,6 +120,11 @@
    side (real LL_TERMINATE) and re-advertises — same proven path the watchdogs
    use. Fire-and-forget, no reply (legacy hosts never send it). */
 #define FSYNC_OP_DISCONNECT 0x0F   /* (none); box HCI-disconnects + re-advertises */
+#define FSYNC_OP_GET_VERSION 0x10  /* (none) → ASCII firmware version string (e.g.
+                                      "0.0.29"), no null term. Lets the desktop
+                                      "Check FW" button compare against the latest
+                                      GitHub release. Legacy fw (≤0.0.28) ignores
+                                      it → no reply → host treats the box as old. */
 
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
@@ -1073,6 +1078,15 @@ static void ble_process_command(void)
     ble_notify_try(g_filedata_handle + 1, &m, 1, 500);
     snprintf(buf, sizeof(buf), "ble: GET_MODE → %s",
              m ? "manual" : "auto");
+    ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_GET_VERSION) {
+    /* GET_VERSION → ASCII firmware version string (no null term), so the
+       desktop "Check FW" button can compare against the latest GitHub
+       release and offer/perform an OTA update. */
+    const char *ver = PL_FW_VERSION;
+    ble_notify_try(g_filedata_handle + 1, (const uint8_t *)ver,
+                   (uint16_t)strlen(ver), 500);
+    snprintf(buf, sizeof(buf), "ble: GET_VERSION → %s", ver);
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_SET_TIME) {
     /* SET_TIME <epoch_ms:u64-LE>: the host (iPhone/Android/desktop) pushes
