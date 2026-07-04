@@ -231,7 +231,19 @@ static volatile uint16_t g_att_mtu         = 23;
    No mode switch — SD logging runs regardless (DESIGN.md Section 2/3). */
 static uint8_t           g_stream_subscribed = 0;
 static uint32_t          g_stream_last_ms    = 0;
-#define STREAM_PERIOD_MS 2000
+/* SensorStream emit period. 100 ms = 10 Hz: fast enough that the desktop /
+   iOS / Android live 3D box preview moves in real time (the old 2000 ms /
+   0.5 Hz made every update a big discrete jump — the box "losing
+   orientation") and, just as importantly, feeds the hosts' passive 3D
+   hard-iron auto-calibration ~20× more samples per second so it converges
+   in seconds of ordinary handling instead of minutes. The snapshot behind
+   it (g_last_imu/g_last_mag) is already refreshed at 100 Hz in Logger_Tick,
+   so this only changes how often we re-send it — no extra sensor I/O. Well
+   within the link budget: the negotiated connection interval is 15–30 ms,
+   and one 46-byte notify per 100 ms is ~460 B/s. Non-blocking single
+   attempt (below), so a momentarily full TX buffer just drops one 100 ms
+   slot rather than stalling the main loop. */
+#define STREAM_PERIOD_MS 100
 
 /* BatteryStatus: stored value updated + (if subscribed) notified once per
    minute, plus immediately on a low-battery flag transition. */
@@ -1635,9 +1647,9 @@ int BLE_Init(void)
   return 0;
 }
 
-/* Emit one SensorStream snapshot if a client is subscribed and the 2 s
-   period has elapsed. Reuses the logger's cached samples — no sensor I/O,
-   no mode switch, never touches SD logging. */
+/* Emit one SensorStream snapshot if a client is subscribed and the
+   STREAM_PERIOD_MS (100 ms / 10 Hz) period has elapsed. Reuses the logger's
+   cached samples — no sensor I/O, no mode switch, never touches SD logging. */
 static void ble_stream_tick(void)
 {
   if (!g_stream_subscribed || g_conn_handle == 0) return;
@@ -1650,7 +1662,7 @@ static void ble_stream_tick(void)
   uint8_t pkt[STREAM_PACKET_SIZE];
   Stream_Pack(&snap, (uint8_t)Logger_IsActive(), pkt);
   /* Non-blocking single attempt — if the TX buffer is full we just skip
-     this 2 s slot rather than stall the main loop. */
+     this 100 ms slot rather than stall the main loop. */
   ble_notify(g_stream_handle + 1, pkt, STREAM_PACKET_SIZE);
 }
 
