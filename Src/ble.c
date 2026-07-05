@@ -627,10 +627,18 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
    of wedging the box forever. Self-stops once advertising is confirmed up. */
 #define ADV_REARM_INTERVAL_MS   3000
 /* Consecutive re-adv failures before the re-arm escalates to a full chip
-   re-init (~30 s off-air at the 3 s interval). Low enough that the box comes
-   back before the user reaches for the power switch; high enough that a
-   transient ACL-TX-saturation failure (1-2 rounds) never triggers it. */
-#define ADV_REARM_MAX_FAILS     10
+   re-init. Lowered 10 → 3 (v0.0.31): rc=211 (0xD3) is DETERMINISTIC — the
+   adv-set config is invalid / the ACL slot is stuck, so re-issuing
+   SET_ADV_ENABLE a 4th…10th time cannot succeed; it is pure dead air. The
+   full BLE_Init (which re-runs SET_ADVERTISING_CONFIGURATION + SET_ADV_DATA)
+   is the ONLY thing that clears it in the field (ERRLOG 05.07.2026 wedged
+   ~33 s on 10 identical fails, then recovered only via chip re-init). 3
+   fails ≈ 9 s off-air instead of ~30 s. A genuine 1-2 round transient still
+   self-clears (a successful enable resets g_adv_fail_streak at ble.c:1797),
+   and escalation runs only while disconnected + off-air, so it cannot cause
+   a reconnect storm (the box is already unreachable — a 4 s re-init beats
+   more silence). If 3 proves twitchy on the hardware, bump to 4 (~12 s). */
+#define ADV_REARM_MAX_FAILS     3
 
 /* Per-chunk notify budget INSIDE fsm_advance. Short on purpose: each
    BLE_Tick may eat at most this much wall-clock so Logger_Tick stays
