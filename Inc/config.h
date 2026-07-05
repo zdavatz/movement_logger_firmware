@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.31"
+#define PL_FW_VERSION          "0.0.32"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -39,6 +39,14 @@
 #define PL_LPS22DF_I2C_ADDR    (0x5D << 1)   /* SA0=1 → 0xBA 8-bit (LPS22DF on this board) */
 #define PL_STTS22H_I2C_ADDR    (0x38 << 1)   /* 0x70 8-bit */
 #define PL_STC3115_I2C_ADDR    (0x70 << 1)   /* 0xE0 8-bit */
+
+/* Battery model for the STC3115 gauge (sensors_fuel.c). Values are ST's own
+   STC3115_Battery_Conf.h for STEVAL-MKBOXPRO: HiMax 752535 pack behind the
+   board's R83 shunt. Changing the pack means re-deriving CC_CNF/VM_CNF —
+   see the formulas in sensors_fuel.c. */
+#define PL_BATT_CAPACITY_MAH   480    /* nominal capacity */
+#define PL_BATT_RINT_MOHM      160    /* pack internal impedance */
+#define PL_BATT_RSENSE_MOHM    50     /* R83 current-sense shunt */
 
 /* GPS / UART4 --------------------------------------------------------------*/
 #ifndef GPS_RATE_HZ

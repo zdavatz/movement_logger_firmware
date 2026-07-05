@@ -328,6 +328,21 @@ Notify cadence: once per minute while connected. Also notified
 opportunistically whenever the low-battery flag transitions, so the GUI
 sees the warning immediately on first crossing 10 %.
 
+**Gauge configuration (v0.0.32+).** The STC3115 is programmed at boot with
+the real battery model — 480 mAh HiMax 752535, Ri 160 mΩ, behind the
+board's R83 = 50 mΩ shunt (`CC_CNF=484`, `VM_CNF=79`, ST's board-tuned
+OCVTAB offsets, relax threshold 24 mA; constants in `Inc/config.h`
+`PL_BATT_*`, values from ST's `STC3115_Battery_Conf.h` for
+STEVAL-MKBOXPRO). Startup discriminates warm (gauge kept running through
+the Hall cut — state untouched, SOC continuous), restore (gauge reset but
+its 16-byte RAM survived — SOC reloaded from the 1 Hz backup that
+`FUEL_Read` writes), and cold (true first power-up — SOC preset from OCV
+through the corrected curve). Before v0.0.32 the gauge ran on POR defaults
+(1957 mAh @ 10 mΩ model) with no state handling, so SOC re-preset from the
+generic OCV curve at every boot — a plateau-resting Li-Po read "~55 %"
+forever — and `current_x100` was scaled ~200× too low (µA/mA slip plus the
+wrong shunt value).
+
 Host can also `read` the characteristic anytime for an instantaneous
 value (e.g. right after connecting, before the first periodic notify).
 
@@ -523,7 +538,7 @@ sensors_acc_gyro       1                ~80 µs (one SPI burst)
 sensors_mag            1                ~100 µs (I²C)
 sensors_baro_temp      4                ~150 µs (I²C, only on this tick)
 gps_parse_dma          1                ~50 µs (scan ring buffer)
-battery_poll           1000             ~200 µs (I²C, once/sec)
+battery_poll           1000             ~2 ms (I²C, once/sec — 10 B status+data read + 16 B gauge-RAM SOC backup write @ ~145 kHz, v0.0.32+)
 logger_flush           100              ~10 ms (FatFs flush — worst case)
 ble_poll               1                ~200 µs (chip-event drain)
 ble_task               1                ~500 µs (filesync/stream emit)
