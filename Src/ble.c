@@ -1143,6 +1143,16 @@ static void ble_process_command(void)
       snprintf(buf, sizeof(buf), "ble: SET_TIME epoch_ms=%s tick=%lu wrote=%d",
                &edec[ep], (unsigned long)HAL_GetTick(), wrote);
       ErrLog_Write(buf);
+      /* Flush NOW so the epoch anchor is physically on the SD card before
+         the auto-LIST (~500 ms behind SET_TIME) snapshots the file size.
+         ErrLog_Write only appends to the RAM buffer; without this flush the
+         line stays buffered, the LIST reports the pre-anchor size, and the
+         sync that immediately follows the connect READs up to that size and
+         never captures the anchor (it would only reach SD at the next
+         once-per-minute heartbeat, and is lost outright if the box resets
+         first). This is what makes the desktop's per-boot wall-clock appear
+         on the very first sync after connecting, not a sync-or-two later. */
+      ErrLog_Flush();
     }
   } else if (op == FSYNC_OP_FW_BEGIN) {
     /* FW_BEGIN <image_len:u32-LE><sha256:32>: start a firmware-over-BLE update
