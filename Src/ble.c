@@ -1117,8 +1117,31 @@ static void ble_process_command(void)
       int wrote = Logger_WriteSyncMarker(epoch_ms);
       uint8_t st = FSYNC_ST_OK;
       ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
-      snprintf(buf, sizeof(buf), "ble: SET_TIME tick=%lu wrote=%d",
-               (unsigned long)HAL_GetTick(), wrote);
+      /* Stamp the host wall-clock into the errlog too. The box has no RTC,
+         so this is the ONLY absolute-time anchor a boot ever gets, and only
+         once a host (phone/desktop) has connected and pushed SET_TIME. The
+         desktop's per-boot health view back-computes the boot's start time
+         as  epoch_ms - [leading tick]  (both this line's `tick=` and the
+         ErrLog `[N ms]` prefix are HAL_GetTick() = the same free-running
+         ms-since-boot clock), then renders HH:MM DD.MM.YYYY per boot.
+         Format the u64 epoch by hand — newlib-nano's printf has no %llu,
+         same trick as Logger_WriteSyncMarker(). */
+      char edec[24];
+      int  ep = (int)sizeof(edec);
+      edec[--ep] = '\0';
+      {
+        uint64_t e = epoch_ms;
+        if (e == 0u) {
+          edec[--ep] = '0';
+        } else {
+          while (e > 0u && ep > 0) {
+            edec[--ep] = (char)('0' + (int)(e % 10u));
+            e /= 10u;
+          }
+        }
+      }
+      snprintf(buf, sizeof(buf), "ble: SET_TIME epoch_ms=%s tick=%lu wrote=%d",
+               &edec[ep], (unsigned long)HAL_GetTick(), wrote);
       ErrLog_Write(buf);
     }
   } else if (op == FSYNC_OP_FW_BEGIN) {
