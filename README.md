@@ -64,6 +64,14 @@ The box is BLE peripheral-only with a polled BlueNRG-LP (no link-layer ISR). If 
 
 A **peer-gone watchdog** (`Src/ble.c`) closes this gap: `g_last_peer_seen_ms` is refreshed on connect, on any inbound write, and on every **successful** notify (a notify only drains once the peer ACKs at the link layer, so it also covers a passive live-stream viewer that never writes back). If the box stays connected with no liveness evidence for **90 s** (`PEER_GONE_DEADLINE_MS`, safely above the 60 s battery-only notify period to avoid false drops), it force-disconnects and re-advertises on its own — no power-cycle, no app restart. SD logging is never affected. Host clients (iOS, Android, desktop) auto-reconnect on re-advertise. See CLAUDE.md "BLE peer-gone watchdog" and [issue #4](https://github.com/zdavatz/movement_logger_firmware/issues/4).
 
+## GPS power on/off (battery-save, v0.0.35+)
+
+The box can turn its u-blox MAX-M10S GPS receiver **off** to save battery when GPS is unused or faulty — acquiring, the module draws ~25 mA; parked it draws only tens of µA. Two host opcodes toggle it, mirroring the `SET_MODE`/`GET_MODE` design: `GPS_POWER 0x11 <u8 on>` (1 = on, 0 = off) applies + persists and replies one status byte (`0x00` = OK); `GPS_GET_POWER 0x12` (no payload) replies one byte (1 = on, 0 = off).
+
+**Off** parks the receiver in **UBX-RXM-PMREQ backup mode** (fire-and-forget, not ACK'd). **On** wakes it with a short `0xFF` UART burst — the module hot-starts from the config already held in its battery-backed RAM (from the existing CFG-CFG-SAVE) and resumes NMEA. The choice is persisted to the SD root as **`GPSPWR.CFG`** (first byte `f`/`F` = off, anything else = on — same pattern as `LOGMODE.CFG`) and **re-applied on boot**: `GPS_Init` runs its normal baud-lock + config, then immediately re-enters backup if the persisted state is off.
+
+Logging never stops while GPS is off — IMU + baro keep recording, GPS rows simply stop appearing (the logger only writes a GPS row on a fresh fix), and the phone-clock `# SYNC` anchor (`SET_TIME`) keeps the replay time-aligned with no GPS fix needed. See CLAUDE.md "GPS power on/off" and DESIGN.md opcode table (0x11/0x12).
+
 ## Flash via DFU
 
 Hold the user button while plugging USB-C to enter STM32 DFU mode:

@@ -65,4 +65,15 @@ uint8_t  GPS_BridgeActive(void);
 void     GPS_BridgeTx(const uint8_t *data, uint16_t len);  /* host → module UART */
 uint16_t GPS_BridgeRead(uint8_t *out, uint16_t max);       /* captured UBX → out */
 
+/* ---------- GPS power (battery-save on/off over BLE) --------------------
+   Turn the u-blox receiver off to save battery when GPS is faulty/unused.
+   OFF puts the MAX-M10S into UBX-RXM-PMREQ *backup* mode (~tens of µA vs
+   ~25 mA acquiring); the module wakes on the next UART activity. The choice
+   is persisted to the SD root (GPSPWR.CFG) and re-applied at boot, so a box
+   with a bad antenna stops burning battery on every session until the user
+   turns GPS back on from the app. Logging continues (IMU + baro), and the
+   phone-clock `# SYNC` anchor keeps the replay time-aligned with no GPS fix. */
+int  GPS_GetPower(void);           /* 1 = on (default), 0 = off. Reads SD once, then cached. */
+int  GPS_SetPower(int on);         /* apply to the module + persist. 0 on success. */
+
 #endif

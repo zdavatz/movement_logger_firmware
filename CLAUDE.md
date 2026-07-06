@@ -349,6 +349,36 @@ watchdogs use. Purely additive: only the Mac sends `0x0F` (iOS/Android never do,
 so their behaviour is unchanged), and it only affects the current connection.
 Look for `ble: cmd DISCONNECT (host requested)` in `ERRLOG.LOG`.
 
+## GPS power on/off (battery-save, v0.0.35+) — `0x11`/`0x12`, `gps.c`
+
+The box can power its u-blox MAX-M10S **off** to save battery when GPS is faulty or
+unused. Two FileSync opcodes mirror the `SET_MODE`/`GET_MODE` design:
+**`0x11 FSYNC_OP_GPS_POWER <u8 on>`** (1 = on, 0 = off) applies + persists and
+replies one status byte (`0x00` = OK), exactly like `SET_MODE`;
+**`0x12 FSYNC_OP_GPS_GET_POWER`** (no payload) replies one byte (1 = on / 0 = off),
+like `GET_MODE`. Public API: `int GPS_GetPower(void)` / `int GPS_SetPower(int on)`
+(`Inc/gps.h`).
+
+**Off = UBX-RXM-PMREQ backup mode** (~tens of µA vs ~25 mA acquiring). Uses the
+16-byte v0 PMREQ (flags bit1 = backup, wakeupSources bit3 = uartrx); PMREQ is
+**fire-and-forget** (not ACK'd). **On** wakes the module with a short `0xFF` UART
+burst (`gps_wake_pulse`) — it hot-starts from the config still held in BBR (from
+the existing CFG-CFG-SAVE) and re-listens for NMEA.
+
+**Persisted to `GPSPWR.CFG`** on the SD root (first byte `f`/`F` = off, anything
+else = on — same pattern as `LOGMODE.CFG`; cached in `g_power`, `-1` = unread).
+**Re-applied on boot:** `GPS_Init` runs its normal baud-lock/config, saves config
+to BBR, then immediately enters backup if the persisted state is off. A
+**wake-pulse was added at the very start of `GPS_Init`** (before baud detection)
+so a module left asleep across an MCU-only reset still gets detected. `GPS_Tick`
+early-exits while off, discarding any trickled bytes so the RX ring can't wrap.
+
+Logging is unaffected — IMU + baro keep recording; GPS rows naturally stop (the
+logger only writes a GPS row on a fresh fix), and the phone-clock `# SYNC` anchor
+(`SET_TIME`) keeps replay time-aligned with no GPS fix. Purely additive: legacy
+hosts that never send `0x11`/`0x12` leave GPS on. Bumped `PL_FW_VERSION` →
+**0.0.35** (`Inc/config.h`).
+
 ## Known WIP edges (per the PR description)
 
 These are scheduled for cleanup in Phase 8; don't be surprised by them

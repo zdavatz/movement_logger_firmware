@@ -126,6 +126,14 @@
                                       GitHub release. Legacy fw (≤0.0.28) ignores
                                       it → no reply → host treats the box as old. */
 
+/* GPS power (battery-save). Mirrors SET_MODE/GET_MODE: a persisted setting the
+   host toggles to stop the u-blox burning battery when GPS is faulty/unused.
+   OFF → the receiver enters UBX-RXM-PMREQ backup (~tens of µA); logging keeps
+   running (IMU + baro), and the phone-clock # SYNC anchor keeps replay aligned
+   without a GPS fix. Choice persists to SD and is re-applied on boot. */
+#define FSYNC_OP_GPS_POWER     0x11  /* <u8> 1=on/0=off → 1-byte status reply    */
+#define FSYNC_OP_GPS_GET_POWER 0x12  /* (none) → 1-byte reply 1=on / 0=off       */
+
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
 #define FSYNC_ST_BUSY       0xB0
@@ -1095,6 +1103,28 @@ static void ble_process_command(void)
     ble_notify_try(g_filedata_handle + 1, (const uint8_t *)ver,
                    (uint16_t)strlen(ver), 500);
     snprintf(buf, sizeof(buf), "ble: GET_VERSION → %s", ver);
+    ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_GPS_POWER) {
+    /* GPS_POWER <u8>: 1 = on, 0 = off (backup mode). Persisted to SD and
+       applied to the module immediately. 1-byte status reply. */
+    if (g_cmd_len < 2) {
+      uint8_t st = FSYNC_ST_BAD_REQ;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: GPS_POWER bad request (no on/off byte)");
+    } else {
+      int on = (g_cmd_buf[1] != 0) ? 1 : 0;
+      int rc = GPS_SetPower(on);
+      uint8_t st = (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      snprintf(buf, sizeof(buf), "ble: GPS_POWER %s rc=%d st=0x%02x",
+               on ? "on" : "off", rc, st);
+      ErrLog_Write(buf);
+    }
+  } else if (op == FSYNC_OP_GPS_GET_POWER) {
+    /* GPS_GET_POWER → single byte: 1 = on, 0 = off. */
+    uint8_t p = GPS_GetPower() ? 1 : 0;
+    ble_notify_try(g_filedata_handle + 1, &p, 1, 500);
+    snprintf(buf, sizeof(buf), "ble: GPS_GET_POWER → %s", p ? "on" : "off");
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_SET_TIME) {
     /* SET_TIME <epoch_ms:u64-LE>: the host (iPhone/Android/desktop) pushes

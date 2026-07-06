@@ -19,6 +19,8 @@
   */
 #include "main.h"
 #include "gps.h"
+#include "sd_fatfs.h"
+#include "errlog.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -52,6 +54,13 @@ static volatile uint32_t g_diag_errors;        /* UART RX error callbacks invoke
 /* Baud the module locked to in GPS_Init — needed by the bridge's $PUBX,41
    reconfigure (it must keep the same baud, only flip the output protocol). */
 static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
+
+/* Persisted GPS power state (battery-save). GPSPWR.CFG on the SD root: first
+   byte 'f'/'F' ("off") = backup mode, anything else = on. g_power is the
+   cache: -1 = not read yet, 0 = off (in backup), 1 = on. GPS_Tick early-exits
+   while off so no stale NMEA is parsed. */
+#define GPSPWR_CFG_NAME "GPSPWR.CFG"
+static int g_power = -1;
 
 /* ---------- BLE GPS bridge state ---------------------------------------- */
 static volatile uint8_t g_bridge;                 /* survey bridge active */
@@ -576,6 +585,34 @@ static int ubx_send_retry(uint8_t cls, uint8_t id, const uint8_t *payload,
   return -1;
 }
 
+/* ---------- GPS power (backup / wake) ----------------------------------- */
+
+/* Drop the receiver into UBX-RXM-PMREQ *backup* mode (~tens of µA). Wakes on
+   the next UART-RX activity (wakeupSources = uartrx). PMREQ is NOT ACK'd, so
+   this is fire-and-forget. The module's config is retained in BBR (saved by
+   the CFG-CFG-SAVE in GPS_Init), so a later wake resumes NMEA at the locked
+   baud without a full reconfigure. */
+static void gps_pmreq_backup(void)
+{
+  uint8_t p[16] = {0};
+  p[0]  = 0x00;                 /* version 0 (16-byte form)          */
+  /* duration @4 = 0 → sleep until woken                            */
+  p[8]  = 0x02;                 /* flags[bit1] = backup              */
+  p[12] = 0x08;                 /* wakeupSources[bit3] = uartrx      */
+  ubx_send(0x02, 0x41, p, sizeof(p));
+}
+
+/* Wake a sleeping module: any edge on its RX pin (our TX) wakes it. A short
+   0xFF burst (junk the module discards) provides the edges; then it hot-starts.
+   Harmless when the module is already awake. */
+static void gps_wake_pulse(void)
+{
+  uint8_t junk[16];
+  memset(junk, 0xFF, sizeof(junk));
+  HAL_UART_Transmit(&g_huart4, junk, sizeof(junk), 200);
+  HAL_Delay(120);
+}
+
 int GPS_Init(void)
 {
   memset(&g_latest, 0, sizeof(g_latest));
@@ -622,6 +659,11 @@ int GPS_Init(void)
   g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
   __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
                                  | UART_CLEAR_FEF  | UART_CLEAR_PEF);
+  /* Wake pulse before the first listen: if the module was left in backup by a
+     previous persisted-OFF session and its VCC survived an MCU-only reset, it
+     would be asleep and emit no NMEA — baud detection would then fail. A short
+     junk burst wakes it (harmless when already awake); it hot-starts NMEA. */
+  gps_wake_pulse();
   int nl = listen_newlines(1500);
 
   if (nl >= 3) {
@@ -726,6 +768,79 @@ int GPS_Init(void)
   ErrLog_Writef("gps: ready @%lu baud, rate=%luHz",
                 (unsigned long)locked_baud,
                 (unsigned long)(1000U / meas_ms));
+
+  /* Apply the persisted GPS-power choice. If the user turned GPS off to save
+     battery, drop the just-configured module straight into backup mode (its
+     config is now saved in BBR, so a later wake resumes cleanly). */
+  if (GPS_GetPower() == 0) {
+    gps_pmreq_backup();
+    g_latest.valid = 0;
+    g_latest.fix_q = 0;
+    ErrLog_Write("gps: persisted OFF → backup mode");
+  }
+
+  return 0;
+}
+
+/* ---------- GPS power on/off (persisted, applied to the module) --------- */
+
+int GPS_GetPower(void)
+{
+  if (g_power >= 0) return g_power;          /* cached */
+
+  g_power = 1;                               /* default ON */
+  if (SDFat_IsMounted()) {
+    PL_File f;
+    if (SDFat_OpenRead(&f, GPSPWR_CFG_NAME) == PL_FX_OK) {
+      char c = 0;
+      uint32_t got = 0;
+      if (SDFat_Read(&f, &c, 1, &got) == PL_FX_OK && got == 1 &&
+          (c == 'f' || c == 'F')) {
+        g_power = 0;
+      }
+      SDFat_Close(&f);
+    }
+  }
+  ErrLog_Writef("gps: power = %s", g_power ? "on" : "off");
+  return g_power;
+}
+
+int GPS_SetPower(int on)
+{
+  on = on ? 1 : 0;
+
+  /* Persist by delete + recreate (the SD layer is append-only, no truncate).
+     NOT_FOUND on delete is fine the first time. */
+  SDFat_Delete(GPSPWR_CFG_NAME);
+  PL_File f;
+  if (SDFat_OpenAppend(&f, GPSPWR_CFG_NAME) == PL_FX_OK) {
+    const char *txt = on ? "on\n" : "off\n";
+    SDFat_Append(&f, txt, (uint32_t)strlen(txt));
+    SDFat_Flush(&f);
+    SDFat_Close(&f);
+  } else {
+    ErrLog_Write("gps: SetPower persist open fail (applying anyway)");
+  }
+
+  int was = g_power;
+  g_power = on;
+
+  if (on) {
+    /* Wake only if it was actually asleep. Config is retained in BBR, so a
+       wake resumes NMEA at the locked baud with no reconfigure. */
+    if (was == 0) {
+      gps_wake_pulse();
+      int nl = listen_newlines(1000);
+      ErrLog_Writef("gps: power ON (wake, %d newlines)", nl);
+    } else {
+      ErrLog_Write("gps: power ON (already on)");
+    }
+  } else {
+    gps_pmreq_backup();
+    g_latest.valid = 0;
+    g_latest.fix_q = 0;
+    ErrLog_Write("gps: power OFF → backup mode");
+  }
   return 0;
 }
 
@@ -763,6 +878,13 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
 void GPS_Tick(void)
 {
+  /* GPS powered off (backup mode): no NMEA is arriving. Discard anything that
+     trickled in (e.g. wake-up junk) so the ring can't wrap, and skip parsing. */
+  if (g_power == 0) {
+    g_rx_tail = g_rx_head;
+    return;
+  }
+
   /* Drain the IRQ-filled ring buffer through the NMEA parser. While the BLE
      survey bridge is active, the same bytes also feed the UBX frame
      extractor so poll replies get relayed — NMEA logging is unaffected. */
