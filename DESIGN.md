@@ -79,6 +79,11 @@ payload.
 | `0x0C` | `FW_ABORT` | none | Discard the current FOTA session. The partially-written inactive bank is left stale (never activated) and re-erased by the next `FW_BEGIN`. Returns `0x00`. |
 | `0x0D` | `GPS_BRIDGE` | `<on:u8>` | `1` = start, `0` = stop relaying raw u-blox UBX over BLE for the desktop GPS antenna survey. While ON, the box adds UBX to the GPS port's output protocol (`$PUBX,41`, NMEA logging unaffected) and captures complete UBX reply frames out of the RX stream, notifying them back on **FileData** in ≤160-byte chunks while the FileSync FSM is idle. **Fire-and-forget — no reply.** Auto-disabled on disconnect; never persisted (a power-cycle restores NMEA-only). Legacy hosts/firmware ignore it. The host must not run a LIST/READ while the bridge is on (both ride FileData). |
 | `0x0E` | `GPS_TX` | `<raw bytes…>` | Forward the bytes straight to the u-blox UART. The desktop survey sends UBX poll frames (`NAV-PVT`/`NAV-DOP`/`NAV-SAT`/`NAV-SIG`/`MON-RF`) this way; replies come back as `GPS_BRIDGE` notifies. **Fire-and-forget — no reply.** No-op unless a bridge is active. |
+| `0x0F` | `DISCONNECT` | none | Fire-and-forget host-requested link teardown. Routes to `ble_recover_lost_peer("host disconnect")` → real HCI_Disconnect from the box side + re-advertise. Sent by the macOS desktop before `cancelPeripheralConnection` (which only detaches the *app's* view; `bluetoothd` keeps the ACL alive with LL keepalives otherwise, leaving the box connected-in-limbo). iOS/Android tear the link down natively, so they never send this. |
+| `0x11` | `GPS_POWER` | `<on:u8>` | Turn the u-blox MAX-M10S receiver on (1) or off (0 = UBX-RXM-PMREQ backup mode, ~tens of µA). Persisted to `GPSPWR.CFG` on the SD root and re-applied on every boot (with a wake-pulse at the start of `GPS_Init` so a module left asleep across an MCU-only reset gets detected). IMU + baro logging is unaffected; GPS rows naturally stop while off (the `# SYNC` anchor keeps replay time-aligned with no fix). Returns single-byte status. |
+| `0x12` | `GPS_GET_POWER` | none | Box replies one byte on FileData: `0` = off, `1` = on. Legacy firmware (< v0.0.35) never replies — the host treats a timeout as "unknown, assume on". |
+| `0x13` | `CAL_GET` | none | Box replies the 32-byte **calibration blob** (layout below). All hosts that connect to the same box see the same calibration — a per-box source of truth so a calibration set on the iPhone survives on the Desktop / Android without a re-tap. Legacy firmware (< v0.0.37) never replies — the host treats a timeout as "unknown, use local UserDefaults / config.toml as before". |
+| `0x14` | `CAL_SET` | 32-byte calibration blob | Merge the incoming blob into the box's persisted `CAL.CFG`. **Merge is per-field, not blob-replace**: only fields whose valid-mask bit is set in the incoming blob overwrite the stored ones; unset bits leave the corresponding field untouched. Lets a host push a single new field (e.g. just `nosePlusY`) without knowing the box's current `magOffsetMg`. Returns single-byte status. |
 | any other | reserved | — | Box replies `0xE3 BAD_REQUEST` on FileData. |
 
 **LOG mode: AUTO (default) vs MANUAL.** There is still no STREAM_START /
@@ -104,6 +109,51 @@ The mode is persisted on the SD card (`LOGMODE.CFG`, a one-line text
 file — first byte `m`/`M` ⇒ manual, anything else ⇒ auto) so it survives
 the hard power-cycle (F-PWR-5). Changing it needs no power-cycle:
 `SET_MODE` applies at once.
+
+### Box-persisted calibration (`CAL_GET` / `CAL_SET`, v0.0.37+)
+
+Historically each host app (iPhone, Android, Desktop) kept its own copy
+of the calibration in its own local store (UserDefaults /
+SharedPreferences / `config.toml`). A `nosePlusY` toggle set on the
+iPhone didn't reach the Desktop — three of the four calibration fields
+are physical facts of the specific box (which end is the nose, hard-iron
+of *its* magnetometer, the pose the user picked as "level" for *this*
+board), so the box is the natural place to store them.
+
+The `CAL_GET` (`0x13`) / `CAL_SET` (`0x14`) opcodes move that state onto
+the box, persisted as a fixed-size blob in `CAL.CFG` on the SD root
+(parallel to `LOGMODE.CFG` + `GPSPWR.CFG`). On connect the host issues
+`CAL_GET`, seeds its local mirror from the reply, and thereafter reuses
+its cache offline. On any local user-driven update (nosePlusY toggle,
+"USB-C south" tap, "Zero here" tap) the host issues `CAL_SET` with just
+that field's bit set, and the merge on the box updates only that field
+in `CAL.CFG` — a second host can't clobber untouched fields.
+
+**Blob layout — 32 bytes, little-endian.** Fits in one BLE notify.
+
+| Offset | Size | Field | Encoding |
+|---|---|---|---|
+| 0 | 1 | `version` | Layout version, starts at `0x01`. Reserved values ≥ `0x02` let a future revision extend the blob without breaking older readers. |
+| 1 | 1 | `valid_mask` | Bit `0` = nosePlusY, `1` = magOffsetMg, `2` = angleZeroRef, `3` = headingBiasDeg. In a `CAL_GET` reply, unset bits mean "not calibrated yet — host falls back to its own local value or default". In a `CAL_SET` write, unset bits mean "leave that field alone" so a host can update one field without knowing the others. |
+| 2 | 1 | `nosePlusY` | `0` = nose is `-Y`, `1` = `+Y`. |
+| 3 | 1 | reserved | Zero-fill. |
+| 4 | 6 | `magOffsetMg[3]` | Hard-iron offset from the continuous compass auto-cal: 3 × `i16` (X, Y, Z in milli-gauss). Written back on a "wipe compass cal" tap; hosts should push updates conservatively (rate-limit or on-disconnect) to avoid SD-write churn. |
+| 10 | 6 | `angleZeroRef[3]` | "Zero here" board-angle reference: 3 × `i16` in **tenths of a degree** ([pitch, roll, yaw]; range ±3276.7°). |
+| 16 | 8 | `angleZeroAtEpoch` | Wall-clock epoch (ms) when "Zero here" was captured. `u64` LE. `0` = never zeroed. |
+| 24 | 2 | `headingBiasDeg` | "USB-C points SOUTH" yaw bias: `i16` in tenths of a degree. |
+| 26 | 6 | reserved | Zero-fill; extension room for future single-`i16`/`u32` fields under new mask bits. |
+
+The `CAL_GET` reply is exactly this 32-byte blob (one notify), regardless
+of how many mask bits are set — legacy hosts can tell "box has no cal
+yet" from `valid_mask == 0`. The `CAL_SET` reply is one status byte
+(`0x00` OK / `0xE2` IO_ERROR if SD write failed / `0xE3` BAD_REQUEST for
+a wrong-size or bad-version payload).
+
+`CAL.CFG` is loaded once on boot into a static RAM copy; `CAL_GET` reads
+from RAM, `CAL_SET` mutates RAM and re-writes the whole 32-byte file
+(cheap — one SD block, no cluster rewrite unless the file didn't exist
+yet). Missing / corrupt / wrong-version `CAL.CFG` → RAM copy is zeroed
+(`valid_mask = 0`), same as "unset".
 
 ### Box → host (FileData notifies)
 

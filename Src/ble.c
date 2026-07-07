@@ -38,6 +38,7 @@
 #include "battery.h"
 #include "fwupdate.h"
 #include "gps.h"
+#include "calibration.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -133,6 +134,18 @@
    without a GPS fix. Choice persists to SD and is re-applied on boot. */
 #define FSYNC_OP_GPS_POWER     0x11  /* <u8> 1=on/0=off → 1-byte status reply    */
 #define FSYNC_OP_GPS_GET_POWER 0x12  /* (none) → 1-byte reply 1=on / 0=off       */
+
+/* Box-persisted board-orientation calibration (v0.0.37+). See DESIGN.md
+   "Box-persisted calibration (CAL_GET / CAL_SET)". The blob (32 bytes,
+   layout in calibration.h) lives in CAL.CFG on the SD root; the box acts
+   as a single source of truth so a "Zero here" / nosePlusY / heading-
+   bias set on ANY host is visible to every other host on the next
+   connect — instead of each app maintaining its own copy in local
+   UserDefaults / config.toml. */
+#define FSYNC_OP_CAL_GET       0x13  /* (none) → 32-byte blob (single notify)   */
+#define FSYNC_OP_CAL_SET       0x14  /* 32-byte blob → 1-byte status reply.
+                                        Per-field merge: only fields whose
+                                        valid_mask bit is set are updated. */
 
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
@@ -1210,6 +1223,36 @@ static void ble_process_command(void)
     ble_notify_try(g_filedata_handle + 1, &p, 1, 500);
     snprintf(buf, sizeof(buf), "ble: GPS_GET_POWER → %s", p ? "on" : "off");
     ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_CAL_GET) {
+    /* CAL_GET → 32-byte calibration blob (single notify). Legacy hosts
+       (< v0.0.37) never send this; new hosts fall back to their local
+       UserDefaults / config.toml on a timeout. Uses the deferred path
+       because 32 bytes is larger than a status byte and the ACL may be
+       briefly congested after a burst of stream/battery notifies. */
+    uint8_t blob[CAL_BLOB_SIZE];
+    Calibration_GetBlob(blob);
+    ble_notify_or_defer(g_filedata_handle + 1, blob, (uint8_t)CAL_BLOB_SIZE, 500);
+    snprintf(buf, sizeof(buf), "ble: CAL_GET → mask=0x%02x", blob[1]);
+    ErrLog_Write(buf);
+  } else if (op == FSYNC_OP_CAL_SET) {
+    /* CAL_SET <32-byte blob>: per-field merge into CAL.CFG. Only the
+       fields whose valid_mask bit is set in the incoming blob overwrite
+       the stored ones — a host can push just nosePlusY without knowing
+       the box's current magOffsetMg. 1-byte status reply. */
+    if (g_cmd_len != 1 + CAL_BLOB_SIZE) {
+      uint8_t st = FSYNC_ST_BAD_REQ;
+      ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Writef("ble: CAL_SET bad length %u (expected %u)",
+                    (unsigned)g_cmd_len, (unsigned)(1u + CAL_BLOB_SIZE));
+    } else {
+      int rc = Calibration_SetFromBlob(&g_cmd_buf[1], CAL_BLOB_SIZE);
+      uint8_t st = (rc == 0)  ? FSYNC_ST_OK
+                 : (rc == -1) ? FSYNC_ST_IO_ERROR
+                              : FSYNC_ST_BAD_REQ;
+      ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
+      snprintf(buf, sizeof(buf), "ble: CAL_SET rc=%d st=0x%02x", rc, st);
+      ErrLog_Write(buf);
+    }
   } else if (op == FSYNC_OP_SET_TIME) {
     /* SET_TIME <epoch_ms:u64-LE>: the host (iPhone/Android/desktop) pushes
        its current wall-clock millis on every connect. The box has no RTC,

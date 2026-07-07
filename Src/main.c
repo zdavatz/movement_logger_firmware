@@ -25,6 +25,7 @@
 #include "ble.h"
 #include "usb_msc.h"
 #include "fwupdate.h"
+#include "calibration.h"
 
 /* Captured *before* HAL clears anything so the error log can decode the
    reset reason in ErrLog_Init(). */
@@ -99,6 +100,14 @@ int main(void)
        back to the previous image and resets — never returns in that case. SD is
        mounted (we're in the SD-OK branch) so the pending marker is readable. */
     FwUpdate_BootCheck();
+    /* Load the box-persisted board-orientation calibration from CAL.CFG
+       (v0.0.37+). Missing file / wrong version → zeroed blob (valid_mask
+       == 0, i.e. "not calibrated"), which is what CAL_GET returns until
+       a host writes back via CAL_SET. Runs before sensors so a client
+       that connects super-fast after boot still gets a coherent reply.
+       No matching beep_pattern for a load failure — CAL is best-effort
+       state; the box logs perfectly with valid_mask == 0. */
+    Calibration_Init();
     if (FUEL_Init() != 0) {
       ErrLog_Write("fuel: init FAIL");
       beep_pattern(2000, 4, 60, 80);

@@ -77,6 +77,7 @@ C_SOURCES = \
   $(APP)/Src/sha256.c \
   $(APP)/Src/stream.c \
   $(APP)/Src/battery.c \
+  $(APP)/Src/calibration.c \
   $(APP)/Src/usb_msc.c \
   $(APP)/Src/usb_descriptors.c \
   $(APP)/Src/stm32u5xx_it.c \
