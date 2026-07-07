@@ -542,6 +542,83 @@ static int ble_notify_try(uint16_t val_handle, const uint8_t *data,
   }
 }
 
+/* -------- Deferred single-shot status-byte reply ------------------------
+   Backstop for the "DELETE times out — no notify for 20 s" symptom:
+   `SDFat_Delete` on the box succeeded, but its 1-byte status notify
+   occasionally can't squeeze into `ble_notify_try`'s 500 ms window when
+   the ACL is briefly congested (macOS BT power-nap, competing
+   SensorStream/BatteryStatus notifies, GATT congestion after a burst of
+   deletes). The design rule "no Watchdog_Kick inside a retry loop" (see
+   `ble_notify_try` header + DESIGN.md §11) forbids sitting in a longer
+   blocking loop; instead we hand the reply off to a one-shot pending slot
+   and `ble_flush_pending_reply()` in BLE_Tick keeps trying every tick
+   until it drains OR the whole reply expires. Single slot is enough:
+   status-byte replies are for one-in-flight ops (DELETE, SET_MODE,
+   SET_TIME, GPS_POWER) and the client's own state machine won't queue a
+   new one until the current op resolves. LIST/READ streams are NOT
+   deferred — they abort on notify failure by design (peer-gone signal).
+   */
+#define PENDING_REPLY_EXPIRY_MS  10000U    /* 10 s — well under the host's
+                                              20 s DELETE watchdog, so the
+                                              host's auto-retry still has
+                                              time to fire if we truly
+                                              can't get the byte through. */
+static struct {
+  uint8_t  valid;
+  uint16_t val_handle;
+  uint8_t  data[8];        /* status bytes are 1 B; 8 B budget is generous */
+  uint8_t  len;
+  uint32_t queued_at;
+} g_pending_reply;
+
+static void ble_flush_pending_reply(void)
+{
+  if (!g_pending_reply.valid) return;
+  int rc = ble_notify(g_pending_reply.val_handle,
+                      g_pending_reply.data,
+                      g_pending_reply.len);
+  if (rc == 0) {
+    g_pending_reply.valid = 0;
+    ErrLog_Writef("ble: deferred reply flushed (val=%u len=%u after=%lu ms)",
+                  g_pending_reply.val_handle, g_pending_reply.len,
+                  (unsigned long)(HAL_GetTick() - g_pending_reply.queued_at));
+  } else if (HAL_GetTick() - g_pending_reply.queued_at > PENDING_REPLY_EXPIRY_MS) {
+    g_pending_reply.valid = 0;
+    ErrLog_Writef("*** ble: deferred reply expired (val=%u len=%u after=%lu ms)",
+                  g_pending_reply.val_handle, g_pending_reply.len,
+                  (unsigned long)(HAL_GetTick() - g_pending_reply.queued_at));
+  }
+  /* Else: keep trying on subsequent ticks. */
+}
+
+/* Send now with a short initial window, or hand off to the pending-reply
+   slot if that fails — the caller doesn't care which path drains it. If a
+   pending reply is already parked, we let the flush finish it before
+   queuing a new one, to avoid clobbering (in practice: no-op path because
+   status replies are for one-in-flight ops). */
+static void ble_notify_or_defer(uint16_t val_handle, const uint8_t *data,
+                                uint8_t len, uint32_t initial_ms)
+{
+  if (ble_notify_try(val_handle, data, len, initial_ms) == 0) return;
+  if (g_pending_reply.valid) {
+    /* Rare: previous deferred reply hasn't drained yet. Log and drop the
+       new one — a second stalled reply is a bigger signal than losing this
+       byte, and the host's per-op watchdog will resync. */
+    ErrLog_Write("*** ble: notify defer skipped — slot already pending");
+    return;
+  }
+  if (len > sizeof(g_pending_reply.data)) {
+    ErrLog_Writef("*** ble: notify defer skipped — payload too big (%u)", len);
+    return;
+  }
+  g_pending_reply.val_handle = val_handle;
+  memcpy(g_pending_reply.data, data, len);
+  g_pending_reply.len        = len;
+  g_pending_reply.queued_at  = HAL_GetTick();
+  g_pending_reply.valid      = 1;
+  ErrLog_Writef("ble: notify deferred (val=%u len=%u)", val_handle, len);
+}
+
 /* ----- FileSync command handling ----------------------------------------- */
 
 /* Captured FileCmd write payload, set by the attribute-modified handler and
@@ -1046,7 +1123,14 @@ static void ble_process_command(void)
     uint8_t st = (s == PL_FX_OK)              ? FSYNC_ST_OK
                : (s == PL_FX_ERR_NOT_FOUND)   ? FSYNC_ST_NOT_FOUND
                                               : FSYNC_ST_IO_ERROR;
-    ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+    /* Use the deferred path: if the 1-byte status can't drain in the 500 ms
+       initial window (transient ACL congestion — most often after a burst
+       of DELETEs racing SensorStream/BatteryStatus notifies), it's parked
+       in the pending-reply slot and BLE_Tick's flush retries every tick
+       until it goes through. Fixes the "DELETE times out — no notify for
+       20 s" symptom where SDFat_Delete succeeded but the reply was silently
+       dropped, leaving the host to spin its 20 s watchdog on a completed op. */
+    ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
     snprintf(buf, sizeof(buf), "ble: DELETE '%s' s=%d st=0x%02x", name, s, st);
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_STOP_LOG) {
@@ -1781,6 +1865,14 @@ static void ble_battery_tick(void)
 void BLE_Tick(void)
 {
   if (!g_advertising) return;
+
+  /* Drain any status-byte reply that ble_notify_or_defer couldn't push out
+     inside its 500 ms initial window (typically a DELETE reply that raced
+     a stream/battery notify or a briefly-stalled peer). Runs FIRST so a
+     pending byte gets its own drain attempt before the tick queues fresh
+     stream / battery notifies that could re-fill the ACL. Cheap no-op
+     when the slot is empty. */
+  ble_flush_pending_reply();
 
   /* Stream + battery emit run every tick regardless of pending events —
      they're timers, not event responses. */
