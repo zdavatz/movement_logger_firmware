@@ -72,6 +72,19 @@ The box can turn its u-blox MAX-M10S GPS receiver **off** to save battery when G
 
 Logging never stops while GPS is off — IMU + baro keep recording, GPS rows simply stop appearing (the logger only writes a GPS row on a fresh fix), and the phone-clock `# SYNC` anchor (`SET_TIME`) keeps the replay time-aligned with no GPS fix needed. See CLAUDE.md "GPS power on/off" and DESIGN.md opcode table (0x11/0x12).
 
+## Rapid-DELETE reliability (v0.0.36+)
+
+`SDFat_Delete` on the box finishes fast, but its 1-byte status notify occasionally couldn't drain inside `ble_notify_try`'s 500 ms window when the ACL was briefly congested — the host then spun its 20 s watchdog on a completed op and looked hung. Fix: a one-slot **deferred-reply** mechanism (`ble_notify_or_defer` + `ble_flush_pending_reply` in `BLE_Tick`) parks the status byte if the initial window fails and re-tries every tick until it drains or 10 s expires (safely under the host's 20 s watchdog). Respects the "no `Watchdog_Kick` inside a retry loop" rule (DESIGN.md §11). Single slot is enough — status-byte replies are for one-in-flight ops. See CLAUDE.md "Deferred DELETE-reply notify".
+
+## Box-persisted calibration (v0.0.37+)
+
+The board-orientation calibration (which end is the nose, hard-iron of *this* magnetometer, the pose the user picked as level, the "USB-C south" render bias) now lives on the box in **`CAL.CFG`** on the SD root, exposed via two new host opcodes:
+
+- `CAL_GET 0x13` — reply is a 32-byte blob (single FileData notify).
+- `CAL_SET 0x14` — 32-byte payload, **per-field merge**: only fields whose valid-mask bit is set overwrite the stored ones; unset bits leave the corresponding stored field untouched. Reply is one status byte.
+
+The three host apps (Desktop v0.0.61+, iOS v1.0.17+, Android v0.0.46+) `CAL_GET` on every connect and `CAL_SET` on every user-facing calibration tap, so a "Zero here" done on the iPhone is visible to the Desktop / Android on their next connect without a re-tap. Blob layout, encoding, and semantics: **[DESIGN.md](DESIGN.md)** → *Box-persisted calibration*. Legacy hosts that never send `0x13`/`0x14` are unaffected (they keep their own local copy as before).
+
 ## Flash via DFU
 
 Hold the user button while plugging USB-C to enter STM32 DFU mode:

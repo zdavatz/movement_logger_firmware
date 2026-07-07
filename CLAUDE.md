@@ -379,6 +379,80 @@ logger only writes a GPS row on a fresh fix), and the phone-clock `# SYNC` ancho
 hosts that never send `0x11`/`0x12` leave GPS on. Bumped `PL_FW_VERSION` →
 **0.0.35** (`Inc/config.h`).
 
+## Deferred DELETE-reply notify (v0.0.36+) — `ble.c`
+
+**The "rapid multi-file DELETE times out at 20 s" fix (host complaint: "I still
+manage to hang it").** `SDFat_Delete` on the box completes fast; the symptom was
+that its 1-byte status notify sometimes couldn't drain inside
+`ble_notify_try`'s 500 ms window when the ACL was briefly congested (competing
+SensorStream / BatteryStatus notifies, macOS BT power-nap, GATT credits starved
+after a burst of DELETEs). The firmware then logged the failure internally and
+moved on, but the host saw nothing and spun its own 20 s watchdog on a completed
+op → forcing a disconnect + full reconnect.
+
+DESIGN.md §11 forbids sitting in a longer `HAL_Delay(1)` loop
+(**no `Watchdog_Kick` inside a retry loop** — the IWDG must be free to catch a
+genuinely stuck bus). The fix respects that: a **one-slot deferred-reply
+mechanism**. If `ble_notify_try` fails in the initial 500 ms window,
+`ble_notify_or_defer` parks the payload in `g_pending_reply`; every subsequent
+`BLE_Tick` calls `ble_flush_pending_reply` at its top, which re-tries the notify
+until it drains **or 10 s expires** (safely under the host's 20 s watchdog).
+
+Single slot is enough: status-byte replies (`DELETE`, `SET_MODE`, `SET_TIME`,
+`GPS_POWER`, `CAL_SET`) are for one-in-flight ops and the client's state
+machine won't queue a new one until the current resolves. `LIST` / `READ`
+streams still abort on notify failure by design (that IS the peer-gone
+signal). Currently only DELETE calls `ble_notify_or_defer`; the same treatment
+can be added to any other status-byte reply that also occasionally gets eaten.
+
+Look for these lines in `ERRLOG.LOG` after a rapid delete run:
+```
+ble: DELETE 'SENS040.CSV' s=0 st=0x00
+ble: notify deferred (val=42 len=1)
+ble: deferred reply flushed (val=42 len=1 after=137 ms)
+```
+The `*** ble: deferred reply expired (>10 s)` line would be the smoking gun
+that the 10 s wasn't enough — hasn't fired yet in the field.
+
+Bumped `PL_FW_VERSION` → **0.0.36** (`Inc/config.h`).
+
+## Box-persisted board-orientation calibration (v0.0.37+) — `0x13`/`0x14`, `calibration.c`
+
+Historically each host app (iPhone / Android / Desktop) kept its own copy of
+`nosePlusY`, `magOffsetMg`, `angleZeroRef` (+`angleZeroAtEpoch`), and
+`headingBiasDeg` in local `UserDefaults` / `SharedPreferences` / `config.toml`.
+Three of the four are physical facts of the *specific box* (which end is the
+nose, hard-iron of *this* magnetometer, the pose the user chose as level for
+*this* board), so "kalibrierst du auf iPhone, sieht Desktop's nächste Connect
+es sofort auch" didn't work — every host had to re-tap.
+
+**Fix**: the box holds the calibration in a 32-byte blob (`CAL.CFG` on the SD
+root, parallel to `LOGMODE.CFG` + `GPSPWR.CFG`) and exposes it over two new
+FileSync opcodes:
+
+- **`0x13 FSYNC_OP_CAL_GET`** — no payload. Reply is the whole 32-byte blob
+  in one FileData notify (via the deferred-reply path — the blob is bigger
+  than a status byte and the same ACL-congestion risk applies).
+- **`0x14 FSYNC_OP_CAL_SET`** — 32-byte payload. **Per-field merge, not
+  blob-replace**: only fields whose `valid_mask` bit is set in the incoming
+  blob overwrite the stored ones; unset bits leave the corresponding field
+  untouched. Reply is one status byte. Semantics let two hosts update
+  disjoint fields without clobbering each other, and let a host push just
+  `nosePlusY` (say) without needing to know the box's current `magOffsetMg`.
+
+Blob layout, field encoding, semantics, and failure modes: **DESIGN.md**
+→ *Box-persisted calibration (`CAL_GET` / `CAL_SET`)*. Do not re-derive.
+
+Public API in `Src/calibration.c` / `Inc/calibration.h` is deliberately
+opaque — no per-field getters/setters, just `Calibration_Init` (called from
+`main()` after `SDFat_Mount`), `Calibration_GetBlob(out[32])`, and
+`Calibration_SetFromBlob(in, len)`. The 32-byte layout is the ONLY spec so
+the reserved bytes can grow into future mask bits without churning `ble.c`.
+
+Purely additive: legacy hosts (< v0.0.37) that never send `0x13`/`0x14`
+keep their local UserDefaults / config.toml as before. Bumped
+`PL_FW_VERSION` → **0.0.37** (`Inc/config.h`).
+
 ## Known WIP edges (per the PR description)
 
 These are scheduled for cleanup in Phase 8; don't be surprised by them
