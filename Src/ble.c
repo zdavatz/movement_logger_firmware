@@ -692,20 +692,30 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
 #define FSM_READ_DEADLINE_MS   600000
 #define FSM_STALL_DEADLINE_MS   15000
 
-/* READ-stream stall tolerance (v0.0.15). Separate from the 15 s stall used
-   for FW_RECV: during a long file READ the host legitimately pauses draining
-   for many seconds at a time — writing the growing mirror to disk / SQLite,
-   the app briefly backgrounded, a macOS BT power-nap. The old shared 15 s
-   stall force-disconnected the link on those pauses, and on a 700 KB+ file
-   (minutes on-air) it hit one often — the "connection often gets lost when
-   syncing very large files" report. 45 s rides those pauses out. It stays
-   safely below the 90 s peer-gone watchdog (which, gated on real liveness
-   evidence, still catches a genuinely vanished peer) and the 600 s read
-   deadline, and a truly-dead link is caught far sooner by the chip's own LL
-   supervision timeout (≈4 s once the conn-param request above lands) raising
-   Disconnection_Complete. FW_RECV keeps the tighter 15 s — a firmware upload
-   is host-driven and should push steadily. */
-#define FSM_READ_STALL_DEADLINE_MS  45000
+/* READ-stream stall tolerance. Separate from the 15 s stall used for FW_RECV:
+   during a long file READ the host legitimately pauses draining for tens of
+   seconds at a time. On macOS especially, CoreBluetooth *keeps the LL link
+   alive* (LL keepalives flow, supervision doesn't fire) while it PARKS the
+   GATT notify drain for long stretches — it time-shares the 2.4 GHz radio
+   across Wi-Fi + every other BLE peripheral and deprioritises a "background"
+   box. The held chunk resumes the instant macOS drains again, so tearing the
+   link down on such a pause is pure self-harm: it also triggers re-adv=211
+   (a still-full TX queue can't SET_ADV_ENABLE) → the box goes radio-silent
+   until the NRST-escalation recovers it. iOS/Android don't park like this, so
+   they never trip it — this stall is a macOS-only artefact.
+
+   v0.0.39: 45 s → 180 s. 45 s was still shorter than the real macOS parks
+   (Peter's ERRLOG: 18 READ stalls, all → re-adv=211 → minute-long gaps).
+   180 s rides essentially every observed park out on the LIVE link — no
+   teardown, no 211, no reconnect. To make the full 180 s usable the peer-gone
+   watchdog is now SUPPRESSED during FSM_READ_STREAM (see BLE_Tick) — it is the
+   IDLE-connected guard, and its 90 s would otherwise cut the READ ride-out
+   short. A genuinely dead link is still caught fast by the chip's LL
+   supervision (≈4 s → Disconnection_Complete → g_conn_handle==0 below), and
+   the 600 s read deadline is the ultimate backstop for the rare silent-drop
+   where the chip never reports. FW_RECV keeps the tighter 15 s — a firmware
+   upload is host-driven and should push steadily. */
+#define FSM_READ_STALL_DEADLINE_MS  180000
 
 /* Peer-gone watchdog (issue #4): max time we tolerate being connected with
    NO evidence the peer is alive before forcing disconnect + re-advertise.
@@ -907,9 +917,12 @@ static void fsm_advance(void)
     return;
   }
   uint32_t stall_deadline = (g_fsm.state == FSM_READ_STREAM)
-                            ? FSM_READ_STALL_DEADLINE_MS   /* 45 s — ride out host disk/app pauses */
+                            ? FSM_READ_STALL_DEADLINE_MS   /* 180 s — ride out macOS notify parks on the LIVE link */
                             : FSM_STALL_DEADLINE_MS;       /* 15 s — FW upload should push steadily */
   if (now - g_fsm.last_progress_tick >= stall_deadline) {
+    /* A READ that reaches here has been notify-parked for 180 s with the LL
+       link still up — treat as a genuinely wedged transfer (last resort) and
+       recover cleanly; anything shorter is ridden out above. */
     fsm_emergency_exit(SM_PEER_GONE, "stall");
     return;
   }
@@ -1961,11 +1974,18 @@ void BLE_Tick(void)
      re-advertises, but only if the chip raises that event — on a SILENT drop
      (iOS lock-screen suspend, BT power-nap) it often doesn't, leaving the box
      stuck connected-in-limbo and invisible to scans until a power-cycle. The
-     FSM stall guard (45 s read / 15 s FW) already covers an ACTIVE transfer;
+     FSM stall guard (180 s read / 15 s FW) already covers an ACTIVE transfer;
      this covers the IDLE-connected case it can't see. Runs every tick (before the irq_high
      early-return) so it fires on a dead-quiet link. fsm_advance() above may
-     have already cleared g_conn_handle, so this won't double-fire. */
-  if (g_conn_handle != 0 &&
+     have already cleared g_conn_handle, so this won't double-fire.
+
+     SUPPRESSED during FSM_READ_STREAM (v0.0.39): peer-gone is refreshed only
+     on a DRAINED notify, so a macOS notify-park (link alive, drain parked)
+     lets it go stale and fire at 90 s — which would cut the 180 s READ
+     ride-out short and re-introduce the re-adv=211 teardown we're avoiding.
+     During a READ the FSM's own 180 s stall + the g_conn_handle==0 LL-
+     supervision check are the guards; peer-gone stays the IDLE-only guard. */
+  if (g_conn_handle != 0 && g_fsm.state != FSM_READ_STREAM &&
       (HAL_GetTick() - g_last_peer_seen_ms) >= PEER_GONE_DEADLINE_MS) {
     ble_recover_lost_peer("peer-gone watchdog");
   }
