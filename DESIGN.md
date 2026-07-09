@@ -529,11 +529,18 @@ handles variable widths. ~70-80 bytes per row average.
 ### `GpsNNN.csv` (one row per fix, 10 Hz when fixed)
 
 ```
-ms,utc,lat,lon,alt_m,speed_kmh,course_deg,fix_q,nsat,hdop
+ms,utc,lat,lon,alt_m,speed_kmh,course_deg,fix_q,nsat,hdop,cn0_max,sats_in_view
 ```
 
 Empty (header only) until first valid fix. Rows match the structure used
-by stbox-viz so the existing GPS-overlay code keeps working.
+by stbox-viz so the existing GPS-overlay code keeps working. `cn0_max`
+(strongest satellite C/N0, dB-Hz) and `sats_in_view` (satellites with a
+C/N0) come from GSV (v0.0.19). Since v0.0.38 `GPS_Init` keeps GSV
+*enabled* but throttled to every 10th nav epoch (= 1 burst/s at 10 Hz;
+off at the 9600/5 Hz fallback — no UART headroom for GSV bursts) — the
+previous init disabled GSV outright, which starved both columns to a
+permanent 0. Between bursts the parser holds the last committed value
+and decays to 0 ("no data") after 3 s of GSV silence.
 
 ### `BatNNN.csv` (one row per second)
 

@@ -453,6 +453,43 @@ Purely additive: legacy hosts (< v0.0.37) that never send `0x13`/`0x14`
 keep their local UserDefaults / config.toml as before. Bumped
 `PL_FW_VERSION` → **0.0.37** (`Inc/config.h`).
 
+## GSV un-starved: C/N0 telemetry actually flows (v0.0.38+) — `gps.c`
+
+**The "cn0_max/sats_in_view are always 0" fix.** v0.0.19 added `parse_gsv`
+for per-satellite signal strength, but `GPS_Init`'s noisy-NMEA disable list
+(GLL/GSA/**GSV**/VTG, ACK'd every boot) turned GSV off before a single
+sentence could arrive — the two CSV columns and SensorStream byte 45 were
+dead on every configured module. Diagnosed while refuting the field theory
+"die Software hat die u-blox Chips nachhaltig umkonfiguriert": the ERRLOG
+shows `gps: cfg-cfg-save FAIL` on **every** boot (the M10 never ACKs the
+legacy `UBX-CFG-CFG` persist), so nothing our firmware writes survives a
+module power cycle — 12 of 15 field boots found the module back at factory
+9600. All module config is effectively RAM-layer/per-session; the modules
+are fine, they just never see sky signal (survey: C/N0 ≤ 27 dB-Hz, 0 sats
+used → antenna/RF problem, not config).
+
+Three coupled changes (`Src/gps.c`):
+
+1. **`GPS_Init`**: disable list is now GLL/GSA/VTG only; GSV is set to
+   **rate 10** ("emit every 10th nav epoch" = 1 burst/s at 10 Hz) via the
+   same legacy CFG-MSG write. Full-rate GSV at 10 Hz would oversubscribe
+   38400 baud — don't set it to 1. At the 9600/5 Hz fallback GSV stays 0
+   (no headroom; also covers factory-fresh modules that boot with GSV at
+   every epoch). New errlog line: `gps: cfg-msg gsv rate=10 ACK`.
+2. **`parse_gga` hold-and-decay**: GSV bursts arrive 1/s but GGA commits
+   10/s, so the commit only overwrites when a fresh burst was parsed
+   (`g_gsv_burst`), holds the last value between bursts, and decays to 0
+   ("no data") after `GSV_STALE_MS` (3 s) of GSV silence. Without this the
+   CSV flickers 0 on 9 of 10 rows.
+3. **`gps_survey_nmea(1)` restores the post-init state** (GSV at
+   `g_gsv_rate`, GSA/VTG/GLL/ZDA off) instead of the old uniform rate-1,
+   which re-enabled everything at every epoch after a GPS-Debug survey and
+   oversubscribed the UART until the next module power cycle.
+   `gps_cfg_valset_bool` now writes its 1-byte value raw (still 0/1 for the
+   protocol bools; rate values for the U1 MSGOUT keys).
+
+Bumped `PL_FW_VERSION` → **0.0.38** (`Inc/config.h`).
+
 ## Known WIP edges (per the PR description)
 
 These are scheduled for cleanup in Phase 8; don't be surprised by them
@@ -481,12 +518,16 @@ that SHA as the stable base.
 
 ## Backlog (separate task, not in this branch)
 
-- GPS per-satellite signal strength (C/N0) + satellite count — **done in
-  v0.0.19** (`parse_gsv` in `gps.c`). The module already emits GSV at its
-  NMEA default, so no config write is needed (module→box RX direction);
-  `parse_gga` commits the per-epoch strongest C/N0 (`cn0_max`) and
-  tracked-sat count (`sats_in_view`) into `PL_GpsFix`, the Gps CSV
-  (`cn0_max,sats_in_view` columns), and SensorStream byte 45. RX-only, so
-  it works even when the box→module command line is dead (unlike the UBX
-  GPS Debug survey, which needs the box→module TX path). A full
-  per-satellite C/N0 table is still future work.
+- GPS per-satellite signal strength (C/N0) + satellite count — parsing
+  **done in v0.0.19** (`parse_gsv` in `gps.c`), but **starved until
+  v0.0.38**: the v0.0.19 note claimed "the module already emits GSV at
+  its NMEA default, so no config write is needed" — wrong, because
+  `GPS_Init`'s own noisy-NMEA disable list included GSV (ACK'd every
+  boot), so `cn0_max`/`sats_in_view` read a permanent 0 in the field.
+  Fixed in v0.0.38 (see below). `parse_gga` commits the strongest C/N0
+  (`cn0_max`) and tracked-sat count (`sats_in_view`) into `PL_GpsFix`,
+  the Gps CSV (`cn0_max,sats_in_view` columns), and SensorStream
+  byte 45. Parsing is RX-only, so it works even when the box→module
+  command line is dead (unlike the UBX GPS Debug survey, which needs the
+  box→module TX path). A full per-satellite C/N0 table is still future
+  work.

@@ -55,6 +55,13 @@ static volatile uint32_t g_diag_errors;        /* UART RX error callbacks invoke
    reconfigure (it must keep the same baud, only flip the output protocol). */
 static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
 
+/* GSV emit rate chosen by GPS_Init ("every Nth nav epoch"; 0 = off). 10 at
+   38400/10 Hz = one burst/s for the C/N0 telemetry; 0 at the 9600/5 Hz
+   fallback (no UART headroom for GSV bursts there). The survey's NMEA
+   trim/restore (gps_survey_nmea) restores GSV to this rate, not to the
+   module default of every-epoch. */
+static uint8_t g_gsv_rate;
+
 /* Persisted GPS power state (battery-save). GPSPWR.CFG on the SD root: first
    byte 'f'/'F' ("off") = backup mode, anything else = on. g_power is the
    cache: -1 = not read yet, 0 = off (in backup), 1 = on. GPS_Tick early-exits
@@ -131,8 +138,9 @@ static void gps_cfg_port_uart1(uint32_t baud)
    / "used=0" survey gaps. While the bridge is active we silence the heavy /
    non-essential sentences (GSV is the big one — multi-sentence per satellite)
    to free bandwidth for the UBX answers; GGA + RMC stay on for the SD logger's
-   fix. Restored (rate 1) on bridge off. RAM-only, ACK-verified via
-   gps_cfg_valset_bool (its 1-byte value matches these U1 keys). */
+   fix. Bridge off restores the post-GPS_Init state (GSV at g_gsv_rate, rest
+   off) — see gps_survey_nmea. RAM-only, ACK-verified via gps_cfg_valset_bool
+   (its 1-byte value matches these U1 keys). */
 #define CFG_MSGOUT_NMEA_GSV_UART1  0x209100c5UL
 #define CFG_MSGOUT_NMEA_GSA_UART1  0x209100c0UL
 #define CFG_MSGOUT_NMEA_VTG_UART1  0x209100b1UL
@@ -142,8 +150,10 @@ static void gps_cfg_port_uart1(uint32_t baud)
 static int ubx_send_retry(uint8_t cls, uint8_t id, const uint8_t *payload,
                           uint16_t len, int retries);
 
-/* Set one boolean (L-type, 1-byte) config key in the RAM layer, ACK-verified.
-   Returns 0 on ACK, -1 on timeout/NAK after retries. */
+/* Set one 1-byte config key (L-type bool or U1 rate) in the RAM layer,
+   ACK-verified. The value is written raw: 0/1 for the protocol-enable bools,
+   an epoch-divider for the CFG-MSGOUT rate keys. Returns 0 on ACK, -1 on
+   timeout/NAK after retries. */
 static int gps_cfg_valset_bool(uint32_t key, uint8_t val)
 {
   uint8_t p[9];
@@ -154,7 +164,7 @@ static int gps_cfg_valset_bool(uint32_t key, uint8_t val)
   p[5] = (uint8_t)(key >> 8);
   p[6] = (uint8_t)(key >> 16);
   p[7] = (uint8_t)(key >> 24);
-  p[8] = val ? 0x01 : 0x00;
+  p[8] = val;
   return ubx_send_retry(0x06, 0x8A, p, sizeof(p), 2);
 }
 
@@ -226,14 +236,19 @@ static int nmea_split(char *line, char *fields[], int max_fields)
 }
 
 /* GSV per-satellite C/N0 roll-up. GSV arrives as a multi-sentence burst (one
-   group per constellation) between GGAs; we accumulate the strongest C/N0 and
-   the count of tracked (C/N0-bearing) satellites, then parse_gga commits them
-   to g_latest at the once-per-epoch GGA boundary and resets. Stays 0 when the
-   module emits no GSV, so cn0_max reads a clean "no data" on legacy setups.
-   RX-only — nothing is sent to the module — so it works even when the
-   box->module command line is dead (the exact case that blocks the UBX survey). */
-static uint8_t g_gsv_cn0_max;    /* strongest C/N0 seen this epoch (dB-Hz) */
-static uint8_t g_gsv_nsat_sig;   /* satellites with a C/N0 this epoch */
+   group per constellation); we accumulate the strongest C/N0 and the count of
+   tracked (C/N0-bearing) satellites, then parse_gga commits them to g_latest
+   at the GGA boundary. Since v0.0.38 GSV is throttled to ~1 burst/s while GGA
+   runs at 10 Hz, so most GGA epochs see no fresh burst — parse_gga holds the
+   last committed value between bursts and only decays to 0 ("no data") after
+   GSV_STALE_MS of GSV silence (legacy module with GSV off, module gone quiet).
+   Parsing is RX-only — works even when the box->module command line is dead
+   (the exact case that blocks the UBX survey). */
+static uint8_t  g_gsv_cn0_max;    /* strongest C/N0 since the last commit (dB-Hz) */
+static uint8_t  g_gsv_nsat_sig;   /* satellites with a C/N0 since the last commit */
+static uint8_t  g_gsv_burst;      /* ≥1 GSV sentence parsed since the last commit */
+static uint32_t g_gsv_seen_tick;  /* HAL_GetTick() of the last GSV sentence */
+#define GSV_STALE_MS 3000U
 
 /* $xxGSV,numMsg,msgNum,numSV,{svid,elev,azim,cno}...  (up to 4 sats/sentence;
    an optional trailing signalId in NMEA 4.11 is naturally ignored — a lone
@@ -243,6 +258,8 @@ static uint8_t g_gsv_nsat_sig;   /* satellites with a C/N0 this epoch */
 static void parse_gsv(char *fields[], int n)
 {
   if (n < 4) return;
+  g_gsv_burst     = 1;
+  g_gsv_seen_tick = HAL_GetTick();
   for (int i = 4; i + 3 < n; i += 4) {
     const char *cno_s = fields[i + 3];
     if (!cno_s || !*cno_s) continue;         /* satellite not tracked */
@@ -288,13 +305,21 @@ static void parse_gga(char *fields[], int n)
 {
   if (n < 10) return;
   g_diag_gga++;
-  /* Commit the C/N0 rolled up from this epoch's GSV burst and reset for the
-     next. GGA is the once-per-epoch boundary; cn0_max stays 0 when the module
-     emits no GSV, so the field reads a clean "no data" rather than stale. */
-  g_latest.cn0_max      = g_gsv_cn0_max;
-  g_latest.sats_in_view = g_gsv_nsat_sig;
-  g_gsv_cn0_max  = 0;
-  g_gsv_nsat_sig = 0;
+  /* Commit the C/N0 rolled up from the GSV bursts. GSV is throttled to
+     ~1 burst/s (v0.0.38) while GGA arrives at 10 Hz, so most epochs carry no
+     fresh burst — hold the last committed value instead of flapping to 0, and
+     decay to 0 ("no data") only after GSV_STALE_MS of GSV silence. A burst
+     whose satellites all lack a C/N0 commits a genuine 0/0. */
+  if (g_gsv_burst) {
+    g_latest.cn0_max      = g_gsv_cn0_max;
+    g_latest.sats_in_view = g_gsv_nsat_sig;
+    g_gsv_cn0_max  = 0;
+    g_gsv_nsat_sig = 0;
+    g_gsv_burst    = 0;
+  } else if ((uint32_t)(HAL_GetTick() - g_gsv_seen_tick) > GSV_STALE_MS) {
+    g_latest.cn0_max      = 0;
+    g_latest.sats_in_view = 0;
+  }
   g_latest.fix_q   = (uint8_t)atoi(fields[6]);
   g_latest.num_sat = (uint8_t)atoi(fields[7]);
   g_latest.hdop    = (float)strtod(fields[8], NULL);
@@ -405,18 +430,19 @@ static void bridge_capture(uint8_t b)
   }
 }
 
-/* Silence (on=0) or restore (on=1, default rate) the heavy NMEA sentences on
-   UART1 so the survey's UBX poll replies aren't starved by 5 Hz NMEA at
-   9600 baud. GGA + RMC are left untouched for the SD logger's fix. */
+/* Silence (on=0) or restore (on=1) the heavy NMEA sentences on UART1 so the
+   survey's UBX poll replies aren't starved by the NMEA stream. GGA + RMC are
+   left untouched for the SD logger's fix. Restore means the post-GPS_Init
+   state — GSV at its throttled g_gsv_rate, GSA/VTG/GLL/ZDA off — NOT the old
+   uniform rate-1, which re-enabled sentences the logger never wants and
+   oversubscribed the UART at 10 Hz nav until the next module power cycle. */
 static void gps_survey_nmea(uint8_t on)
 {
-  static const uint32_t keys[] = {
-    CFG_MSGOUT_NMEA_GSV_UART1, CFG_MSGOUT_NMEA_GSA_UART1,
-    CFG_MSGOUT_NMEA_VTG_UART1, CFG_MSGOUT_NMEA_GLL_UART1,
-    CFG_MSGOUT_NMEA_ZDA_UART1,
-  };
-  for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
-    (void)gps_cfg_valset_bool(keys[i], on);
+  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_GSV_UART1, on ? g_gsv_rate : 0);
+  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_GSA_UART1, 0);
+  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_VTG_UART1, 0);
+  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_GLL_UART1, 0);
+  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_ZDA_UART1, 0);
 }
 
 void GPS_BridgeSet(uint8_t on)
@@ -743,14 +769,28 @@ int GPS_Init(void)
                 (unsigned long)(1000U / meas_ms),
                 (rate_rc == 0) ? "ACK" : "FAIL");
 
-  /* Disable noisy NMEA sentences (GLL/GSA/GSV/VTG). */
-  const uint8_t off[4][2] = { {0xF0,0x01}, {0xF0,0x02}, {0xF0,0x03}, {0xF0,0x05} };
+  /* Disable noisy NMEA sentences (GLL/GSA/VTG). GSV is NOT disabled anymore —
+     it feeds the v0.0.19 C/N0 telemetry (parse_gsv → cn0_max/sats_in_view),
+     which the old GLL/GSA/GSV/VTG disable list starved to a permanent 0. */
+  const uint8_t off[3][2] = { {0xF0,0x01}, {0xF0,0x02}, {0xF0,0x05} };
   int msg_acks = 0;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 3; i++) {
     uint8_t p[3] = { off[i][0], off[i][1], 0 };
     if (ubx_send_retry(0x06, 0x01, p, sizeof(p), 3) == 0) msg_acks++;
   }
-  ErrLog_Writef("gps: cfg-msg disable %d/4 ACK'd", msg_acks);
+  ErrLog_Writef("gps: cfg-msg disable %d/3 ACK'd", msg_acks);
+
+  /* GSV on, throttled (v0.0.38). Rate byte = "emit every Nth nav epoch":
+     10 @ 10 Hz nav = one burst/s — plenty for antenna/signal telemetry, and
+     it keeps the 38400 UART comfortably undersubscribed (a full-rate GSV
+     burst per 100 ms epoch would exceed the line rate). At the 9600/5 Hz
+     fallback there is no headroom at all → explicit 0, which also covers a
+     factory-fresh module that boots with GSV at every epoch. */
+  g_gsv_rate = (locked_baud == GPS_UART_BAUDRATE) ? 10 : 0;
+  uint8_t gsv_p[3] = { 0xF0, 0x03, g_gsv_rate };
+  int gsv_rc = ubx_send_retry(0x06, 0x01, gsv_p, sizeof(gsv_p), 3);
+  ErrLog_Writef("gps: cfg-msg gsv rate=%u %s",
+                (unsigned)g_gsv_rate, (gsv_rc == 0) ? "ACK" : "FAIL");
 
   /* CFG-CFG-SAVE — persist baud + rate + msg config to BBR + Flash +
      EEPROM so the next boot starts at the configured baud and Build #44's
