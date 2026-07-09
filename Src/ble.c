@@ -2085,6 +2085,25 @@ void BLE_Tick(void)
         g_conn_handle = ch;
         g_adv_active  = 0;                      /* chip stops advertising on connect */
         g_last_peer_seen_ms = HAL_GetTick();   /* arm the peer-gone watchdog */
+        /* A NEW connection proves any in-flight transfer from the previous
+           link is dead — discard it NOW (v0.0.40). Context: a silent macOS
+           drop never raises Disconnection_Complete (whose handler does this
+           cleanup), and v0.0.39 extended the READ stall hold to 180 s for
+           notify parks — so a silent-drop + fast host reconnect left the
+           single-op FSM wedged on the stale READ for up to 3 minutes,
+           stonewalling the fresh link's LIST (host: "LIST timed out", box:
+           eventually stall-exits and HCI-drops the NEW link too — the
+           2026-07-09 connect-then-dead loop). Inline cleanup, deliberately
+           NOT fsm_emergency_exit: that ends in ble_recover_lost_peer, which
+           would HCI-disconnect the connection we just accepted. */
+        if (g_fsm.state != FSM_IDLE) {
+          snprintf(buf, sizeof(buf), "fsm: %s discarded on new connect sent=%lu",
+                   g_fsm.name, (unsigned long)g_fsm.sent);
+          ErrLog_Write(buf);
+          if (g_fsm.state == FSM_READ_STREAM)   SDFat_Close(&g_fsm.f);
+          else if (g_fsm.state == FSM_FW_RECV)  FwUpdate_Abort();
+          memset(&g_fsm, 0, sizeof(g_fsm));     /* state = FSM_IDLE */
+        }
         /* v0.0.16: do NOT arm the fast-conn-param request here. In v0.0.15 it
            fired ~1 s after connect — exactly when the central subscribes to the
            live-stream CCCD and sends LIST — and ble_aci_cmd's receive loop
