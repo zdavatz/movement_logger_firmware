@@ -561,22 +561,29 @@ cold-starts at factory 9600 baud NMEA). Recipe from Peter's u-center
 verification (2026-07-13; 15 sats used / 3D fix at ~40 % sky view where
 the 4-constellation default never fixed):
 
-1. **CFG-UART1-BAUDRATE = 115200 — FIRST, and sent blind at 9600.**
+1. **CFG-UART1-BAUDRATE = 230400 — FIRST, and sent blind at 9600.**
    No baud scan (Peter: *"Es braucht keinen Baudratentest am Anfang.
    Nach dem Booten ist es immer 9600 Baud."*). The only reconfiguration
    done on the slow line. The ACK arrives at the **new** baud, so the
-   local UART is re-opened at 115200 immediately after the command
-   drains. **115200 = exactly Peter's u-center value** (screenshot
-   2026-07-13, layer RAM) — the config that measured 15 sats / 3D fix /
-   C/N0 41 dB-Hz. An earlier note here claimed "115200 loses data, use
-   230400"; that was a mis-transcription and is retracted (v0.0.44).
+   local UART is re-opened at 230400 immediately after the command
+   drains.
+
+   **230400 is Peter's explicit decision** (2026-07-14: *"Peter will
+   Baudrate von exakt 230400"*) and settles a real conflict in the
+   record — do not "correct" it back. His u-center **screenshot**
+   (2026-07-13, layer RAM) shows `CFG-UART1-BAUDRATE = 115200` in the
+   config that measured 15 sats / 3D fix / C/N0 41 dB-Hz, while his
+   **written instruction** the same day said 230400. v0.0.44 briefly
+   shipped 115200 to match the screenshot; v0.0.45 reverts to 230400.
+   Both rates work (~6 % vs ~12 % line utilisation) — never a
+   correctness question, and unrelated to the missing fix (issue #10).
 
    **Confirm, don't scan.** The confirm step covers both boot worlds:
-   - module @9600 (cold boot) → accepts the command; ACK lands at 115200.
-   - module @115200 (**MCU-only reset**: FOTA `SWAP_BANK` reboot, IWDG,
+   - module @9600 (cold boot) → accepts the command; ACK lands at 230400.
+   - module @230400 (**MCU-only reset**: FOTA `SWAP_BANK` reboot, IWDG,
      software reset) → drops our 9600 bytes as framing garbage (UBX
      checksums make a false positive impossible), but answers the
-     **MON-VER poll** we then send at 115200 → *already there*.
+     **MON-VER poll** we then send at 230400 → *already there*.
 
    This case is not optional: **no MCU pin switches the GPS supply**
    (GPS-off is software only — UBX-RXM-PMREQ backup), so an MCU-only
@@ -584,13 +591,14 @@ the 4-constellation default never fixed):
    config. Assuming 9600 unconditionally would kill the GPS after every
    FOTA update until a magnet power-cycle.
 
-   Only if *neither* confirms does a real probe run, over **230400 →
+   Only if *neither* confirms does a real probe run, over **115200 →
    38400 → 9600**, and the raise is retried from wherever the module
    actually is. Logged as `*** gps: baud fallback — module @<baud> ***`.
-   **230400 must stay a candidate**: v0.0.41–v0.0.43 used it as the
-   session baud, so a box updated by FOTA *from* one of those reboots
-   MCU-only with its module still at 230400. Drop the candidate and the
-   GPS dies on exactly the update that installs the 115200 firmware.
+   **115200 must stay a candidate** until no v0.0.44 box is left in the
+   field: v0.0.44 is the one release that used 115200 as the session
+   baud, so a box updated by FOTA *from* v0.0.44 reboots MCU-only with
+   its module still at 115200. Drop the candidate and the GPS dies on
+   exactly the update that installs the current firmware.
    (38400 = left by pre-v0.0.41 firmware; 9600 = alive but ignoring us.)
 2. **CFG-SIGNAL**: GPS + Galileo *on*, BeiDou + GLONASS *off* (one
    VALSET, 9 keys), then 500 ms settle (GNSS subsystem restarts).
@@ -604,7 +612,7 @@ the 4-constellation default never fixed):
    **1 Hz** if step 1 failed and the box is stuck on a slow line.
 
 **Why baud first (changed in v0.0.42).** Peter, 2026-07-13: *"Die
-Baudrate als ersten Schritt auf 115200 erhöhen. Mit 9600 kollabiert die
+Baudrate als ersten Schritt auf 230400 erhöhen. Mit 9600 kollabiert die
 gesamte Kommunikation wenn mit den Folgebefehlen die Datenrate erhöht
 wird."* v0.0.41 put the baud switch at step 6, so steps 2-5 ran at 9600
 **while the module was still streaming its factory NMEA** — and step 4
@@ -771,7 +779,7 @@ PumpLogger/
 | .data | Initialized globals | ≤ 4 KB | |
 | .bss | Zero-initialized globals | ≤ 28 KB | Includes the buffers below. |
 | Main stack | | 4 KB | Only one stack in bare-metal — no per-thread stacks. |
-| GPS RX ring | static array | 2 KB | Byte-IRQ ring; covers a full-line-rate 50 ms burst at 115200 baud. |
+| GPS RX ring | static array | 2 KB | Byte-IRQ ring; covers a full-line-rate 50 ms burst at 230400 baud. |
 | SD scratch | FatFs work area | 4 KB | One cluster cache. |
 | BLE TX/RX | HCI frame buffers | 2 × 256 B | Largest event packet ~250 B. |
 | Sensor frame | latest sample of each | < 1 KB | Doubles as the SensorStream source. |
