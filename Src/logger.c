@@ -348,16 +348,16 @@ void Logger_Tick(void)
                   (unsigned long)rxd, (unsigned long)ubxd);
 
     /* One-shot loud marker if GPS communication is fundamentally broken.
-       Fires once per boot at 30 s if lines_good is still 0 — the
-       deliberate hand-signal that "the GPS file will be empty, go look
-       at the module / wiring / baud rate, the firmware can't see NMEA".
-       No retry logic on purpose: a retry path is hard to test reliably
-       and a loud error marker is enough to drive the human to fix the
-       root cause (factory-reset the module, check wires, etc.). */
+       Fires once per boot at 30 s if lines_good is still 0 — since v0.0.41
+       that counter covers both decoded units (NMEA lines AND checksum-valid
+       UBX frames), so 0 really means "no decodable GPS data at all". The
+       "GPS NO NMEA" token is load-bearing: the desktop's errlog_check
+       matches it. No retry logic on purpose: a loud error marker is enough
+       to drive the human to fix the root cause (wiring, supply, module). */
     static uint8_t s_gps_broken_announced = 0;
     if (!s_gps_broken_announced && now_diag >= 30000 && lg == 0) {
       s_gps_broken_announced = 1;
-      ErrLog_Writef("*** GPS NO NMEA: %lus, 0 lines parsed (bytes=%lu errors=%lu) ***",
+      ErrLog_Writef("*** GPS NO NMEA/UBX: %lus, 0 units parsed (bytes=%lu errors=%lu) ***",
                     (unsigned long)(now_diag / 1000),
                     (unsigned long)b, (unsigned long)err);
       ErrLog_Writef("*** module is sending, we can't decode — check UART baud/wiring ***");

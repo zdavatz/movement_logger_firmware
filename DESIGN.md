@@ -77,7 +77,7 @@ payload.
 | `0x0A` | `FW_DATA` | `<offset:u32-LE><bytes…>` | Program a contiguous segment into the inactive bank at `offset`. `offset` must equal the box's current write cursor (a strictly smaller offset is treated as an idempotent retransmit after a lost ACK). On success the box replies a **4-byte** little-endian next-expected-offset (the host's flow-control + resume signal); on error a single byte `0xE7` bad-sequence or `0xE5` flash-program-failed. |
 | `0x0B` | `FW_COMMIT` | none | Flush the final quadword, verify SHA-256 over the staged image, and — on match — activate it (toggle `SWAP_BANK` + reset). Replies `0xA0 FW_READY` then disconnects (the host sees the reset as success and reconnects to the new firmware). On mismatch replies `0xE4`; the running image is untouched. |
 | `0x0C` | `FW_ABORT` | none | Discard the current FOTA session. The partially-written inactive bank is left stale (never activated) and re-erased by the next `FW_BEGIN`. Returns `0x00`. |
-| `0x0D` | `GPS_BRIDGE` | `<on:u8>` | `1` = start, `0` = stop relaying raw u-blox UBX over BLE for the desktop GPS antenna survey. While ON, the box adds UBX to the GPS port's output protocol (`$PUBX,41`, NMEA logging unaffected) and captures complete UBX reply frames out of the RX stream, notifying them back on **FileData** in ≤160-byte chunks while the FileSync FSM is idle. **Fire-and-forget — no reply.** Auto-disabled on disconnect; never persisted (a power-cycle restores NMEA-only). Legacy hosts/firmware ignore it. The host must not run a LIST/READ while the bridge is on (both ride FileData). |
+| `0x0D` | `GPS_BRIDGE` | `<on:u8>` | `1` = start, `0` = stop relaying raw u-blox UBX over BLE for the desktop GPS antenna survey. Since v0.0.41 the port is UBX-native anyway; while ON the box only throttles its own periodic NAV-PVT (10 Hz → 1 Hz, logging continues) so the survey's poll replies don't compete on the relay, and captures complete UBX reply frames out of the RX stream, notifying them back on **FileData** in ≤160-byte chunks while the FileSync FSM is idle. **Fire-and-forget — no reply.** Auto-disabled on disconnect; never persisted. Legacy hosts/firmware ignore it. The host must not run a LIST/READ while the bridge is on (both ride FileData). |
 | `0x0E` | `GPS_TX` | `<raw bytes…>` | Forward the bytes straight to the u-blox UART. The desktop survey sends UBX poll frames (`NAV-PVT`/`NAV-DOP`/`NAV-SAT`/`NAV-SIG`/`MON-RF`) this way; replies come back as `GPS_BRIDGE` notifies. **Fire-and-forget — no reply.** No-op unless a bridge is active. |
 | `0x0F` | `DISCONNECT` | none | Fire-and-forget host-requested link teardown. Routes to `ble_recover_lost_peer("host disconnect")` → real HCI_Disconnect from the box side + re-advertise. Sent by the macOS desktop before `cancelPeripheralConnection` (which only detaches the *app's* view; `bluetoothd` keeps the ACL alive with LL keepalives otherwise, leaving the box connected-in-limbo). iOS/Android tear the link down natively, so they never send this. |
 | `0x11` | `GPS_POWER` | `<on:u8>` | Turn the u-blox MAX-M10S receiver on (1) or off (0 = UBX-RXM-PMREQ backup mode, ~tens of µA). Persisted to `GPSPWR.CFG` on the SD root and re-applied on every boot (with a wake-pulse at the start of `GPS_Init` so a module left asleep across an MCU-only reset gets detected). IMU + baro logging is unaffected; GPS rows naturally stop while off (the `# SYNC` anchor keeps replay time-aligned with no fix). Returns single-byte status. |
@@ -312,10 +312,10 @@ offset  size  field                   units             source
  36       2   gps_alt_m               metres (signed)
  38       2   gps_speed_cmh           cm/h × 10         u-blox (≈ km/h × 100)
  40       2   gps_course_cdeg         centi-degrees     0..35999
- 42       1   gps_fix_q               0=none 1=GPS …    u-blox NMEA GGA
- 43       1   gps_nsat                # satellites
+ 42       1   gps_fix_q               0=none 1=fix      GGA scale; since v0.0.41 from UBX NAV-PVT (gnssFixOK → 1)
+ 43       1   gps_nsat                # satellites      used in the solution
  44       1   flags                   bit field         see below
- 45       1   gps_cn0_max             dB-Hz (u8)        strongest satellite C/N0 from GSV; 0 = no data
+ 45       1   gps_cn0_max             dB-Hz (u8)        strongest satellite C/N0 (NAV-SAT; GSV in NMEA fallback); 0 = no data
 ```
 
 **flags** (bit 0 = LSB):
@@ -533,14 +533,62 @@ ms,utc,lat,lon,alt_m,speed_kmh,course_deg,fix_q,nsat,hdop,cn0_max,sats_in_view
 ```
 
 Empty (header only) until first valid fix. Rows match the structure used
-by stbox-viz so the existing GPS-overlay code keeps working. `cn0_max`
-(strongest satellite C/N0, dB-Hz) and `sats_in_view` (satellites with a
-C/N0) come from GSV (v0.0.19). Since v0.0.38 `GPS_Init` keeps GSV
-*enabled* but throttled to every 10th nav epoch (= 1 burst/s at 10 Hz;
-off at the 9600/5 Hz fallback — no UART headroom for GSV bursts) — the
-previous init disabled GSV outright, which starved both columns to a
-permanent 0. Between bursts the parser holds the last committed value
-and decays to 0 ("no data") after 3 s of GSV silence.
+by stbox-viz so the existing GPS-overlay code keeps working. Since
+v0.0.41 the row is filled from **UBX NAV-PVT** (one frame per nav epoch)
+instead of the NMEA RMC+GGA pair; column meanings on the wire are kept
+NMEA-compatible:
+
+- `fix_q` — `1` on a valid fix (PVT `gnssFixOK` + fixType 2D/3D), `0`
+  otherwise. Deliberately mapped to the NMEA-GGA "1 = GPS fix" scale all
+  consumers were built for; the raw fixType is not exposed.
+- `hdop` — carries **pDOP × 0.01** (NAV-PVT has no hDOP; same scale,
+  same "smaller = better" gating the tools do). True hDOP only in the
+  NMEA fallback mode.
+- `nsat` — satellites used in the solution (PVT `numSV`).
+- `utc` — `hhmmss.ss` from the PVT UTC fields, written only when the
+  module flags date+time valid.
+- `cn0_max` / `sats_in_view` — from **UBX NAV-SAT** (every 10th nav
+  epoch = 1 burst/s at 10 Hz; GSV feeds the same roll-up in the NMEA
+  fallback). Between bursts the parser holds the last committed value
+  and decays to 0 ("no data") after 3 s of silence.
+
+### GPS module configuration (v0.0.41+)
+
+The u-blox MAX-M10S is configured **on every boot, RAM layer only**
+(UBX-CFG-VALSET; the M10 never ACKs the legacy CFG-CFG save — verified
+across 15 field boots — so nothing persists and the module always
+cold-starts at factory 9600 baud NMEA). Recipe from Peter's u-center
+verification (2026-07-13; 15 sats used / 3D fix at ~40 % sky view where
+the 4-constellation default never fixed):
+
+1. **Baud detect** (listen-first, NMEA newlines *or* UBX syncs count):
+   9600 (cold boot) → 230400 (MCU-only reset, module still on this
+   session's config) → 38400 (module left by pre-v0.0.41 firmware).
+2. **CFG-SIGNAL**: GPS + Galileo *on*, BeiDou + GLONASS *off* (one
+   VALSET, 9 keys), then 500 ms settle (GNSS subsystem restarts).
+3. **CFG-PM-OPERATEMODE = 0** (full power).
+4. **UBX output on**: `UART1INPROT/OUTPROT-UBX = 1` (UBX *out* is off in
+   the M10 factory default), `MSGOUT-UBX_NAV_PVT_UART1 = 1`,
+   `MSGOUT-UBX_NAV_SAT_UART1 = 10`.
+5. **NMEA silenced** (GGA/RMC/GSV/GSA/VTG/GLL/ZDA rates → 0) — only
+   after step 4 ACK'd, so a partial failure never leaves the module mute.
+6. **CFG-UART1-BAUDRATE = 230400** — deliberately the *last* command on
+   the old baud (Peter measured data loss at 115200; the ACK arrives at
+   the **new** baud, so the local UART is re-inited immediately after
+   the command drains, with a MON-VER poll as fallback confirmation).
+7. **CFG-RATE**: measRate 100 ms / navRate 1 (10 Hz). Set *after* the
+   baud switch — 10 Hz output at 9600 would oversubscribe the module TX
+   and drown the ACKs (the one deliberate reorder vs. Peter's list).
+   Falls back to 5 Hz if the box is stuck on a slow line.
+
+Every command is ACK-verified (3 retries); **every un-ACK'd command
+writes a `***` errlog entry** (Peter's rule — it also latches the red
+LED). If step 4 fails (dead box→module TX), NMEA keeps flowing at the
+module's factory defaults and the NMEA parser acts as the RX-only
+fallback data path. The `gps_diag` errlog line keeps its exact 8-key
+format (the desktop errlog_check parses it strictly): `lines_good/bad`
+count decoded/corrupt *units* — NMEA lines or UBX frames; `gga` counts
+epochs (PVT or GGA), `rmc` counts valid fixes.
 
 ### `BatNNN.csv` (one row per second)
 
@@ -688,7 +736,7 @@ PumpLogger/
 | .data | Initialized globals | ≤ 4 KB | |
 | .bss | Zero-initialized globals | ≤ 28 KB | Includes the buffers below. |
 | Main stack | | 4 KB | Only one stack in bare-metal — no per-thread stacks. |
-| GPS DMA ring | static array | 512 B | ~3 s of GPS bytes at 38400 baud. |
+| GPS RX ring | static array | 2 KB | Byte-IRQ ring; covers a full-line-rate 50 ms burst at 230400 baud. |
 | SD scratch | FatFs work area | 4 KB | One cluster cache. |
 | BLE TX/RX | HCI frame buffers | 2 × 256 B | Largest event packet ~250 B. |
 | Sensor frame | latest sample of each | < 1 KB | Doubles as the SensorStream source. |
@@ -866,7 +914,10 @@ From cold-boot to "advertising + logging" — target ≤ 1 s.
 24 ms    IWDG enable
 30 ms    SDMMC1 init + FatFs mount
 70 ms    Sensors init (acc/gyro, mag, baro, fuel gauge)
-220 ms   GPS UART4 + DMA-circular start, send UBX-CFG-RATE config
+220 ms   GPS UART4 start, baud detect + per-boot CFG-VALSET config
+         (see "GPS module configuration"; adds ~2-5 s on a cold boot —
+         dominated by the 1.5 s listen windows and the 0.5 s
+         constellation-switch settle; runs before the IWDG is armed)
 260 ms   BLE chip reset pulse (10 ms low + 150 ms wait)
 430 ms   HCI command sequence (Section 5) — ~50 commands at ~5 ms each
 700 ms   Advertising enabled — STBoxFs visible

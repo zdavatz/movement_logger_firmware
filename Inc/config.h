@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.40"
+#define PL_FW_VERSION          "0.0.41"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -52,8 +52,12 @@
 #ifndef GPS_RATE_HZ
 #define GPS_RATE_HZ            10
 #endif
-#define GPS_UART_BAUDRATE      38400U
-#define GPS_DMA_RING_SIZE      512U          /* DMA-circular buffer */
+/* Session baud, set per boot via UBX-CFG-VALSET (RAM only — the module always
+   cold-starts at factory 9600; nothing we write persists across a module power
+   cut). 230400, not 115200: Peter measured data loss at 115200 with the full
+   10 Hz output (2026-07-13). */
+#define GPS_UART_BAUDRATE      230400U
+#define GPS_RX_RING_SIZE       2048U         /* byte-IRQ RX ring (gps.c) */
 
 /* Cooperative scheduler ----------------------------------------------------*/
 #define PL_TICK_HZ             1000U         /* SysTick @ 1 ms */

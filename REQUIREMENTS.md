@@ -89,7 +89,7 @@ the run silently.
 |         | • LPS22DF barometer @ 25 Hz (pressure hPa, temperature °C) |
 |         | • GPS (u-blox MAX-M10S) @ 10 Hz (lat, lon, alt, speed, course, time) |
 |         | • STC3115 fuel gauge @ 1 Hz (voltage, SOC, current) |
-| F-LOG-3 | Timestamps use a free-running ms counter starting at 0 on cold boot. Wall-clock time is folded in when GPS produces a valid `$GNRMC` sentence — the FAT timestamp on each open file is updated then. |
+| F-LOG-3 | Timestamps use a free-running ms counter starting at 0 on cold boot. Wall-clock time is folded in when GPS produces a valid fix with time (UBX NAV-PVT since v0.0.41; `$GNRMC` before) — the FAT timestamp on each open file is updated then. |
 | F-LOG-4 | File naming: `SensNNN.csv`, `GpsNNN.csv`, `BatNNN.csv`. Counter increments per session; first available number is used. One session = one of each file (no rollover). |
 | F-LOG-5 | Periodic flush so an ungraceful power-off still leaves readable files. Target ≤ 1 s of data loss on hard cut. |
 | F-LOG-6 | When an SD write returns an error, log to the error log and continue with the next sample. Never wedge the main loop on SD trouble. |
@@ -185,7 +185,7 @@ While in STREAM mode this is paused; it resumes on STREAM_STOP / reconnect.
 |          | • **IWDG** as the hardware loop-alive watchdog — produces no ISR, just resets the chip on miss. Belt-and-suspenders backup if WWDG ISR itself hangs. |
 |          | • **WWDG early-warning ISR**: fires ~50 ms before WWDG would reset. ISR writes a last-gasp error-log line ("watchdog: about to reset, last_task=…"), plays the watchdog-beep pattern, then either returns (letting reset happen naturally) or calls `NVIC_SystemReset()` directly. Lets us preserve the diagnostic on the SD card across the reset. |
 |          | • **OTG_FS_IRQ** (Phase 9): forwarded to TinyUSB's `tud_int_handler(0)` so USB enumeration and bulk transfers meet the host's <100 µs response requirement. Cannot be polled cooperatively — the bus reset → set-address handshake misses its deadline at our 1 ms tick cadence. NVIC priority 13 (between SDMMC1 and UART4-GPS). The TinyUSB device task itself still runs cooperatively from the main loop. |
-|          | • **UART4 RX** for the GPS NMEA byte stream — same rationale as Build #8/#9: DMA-only was unreliable, the per-byte IRQ is bounded (<0.5% CPU at 38400 baud). |
+|          | • **UART4 RX** for the GPS byte stream (UBX; NMEA in fallback) — same rationale as Build #8/#9: DMA-only was unreliable, the per-byte IRQ is bounded (~1.4 KB/s of configured UBX traffic ≈ 1.5 % CPU; the 230400 line is mostly idle). |
 | F-ARCH-8 | No dynamic memory allocation after init. Heap is off-limits at runtime (see NF-SIZE-3). |
 
 ### 3.11 Firmware update over BLE (FOTA) — F-FWU
@@ -253,7 +253,7 @@ design + wire protocol in DESIGN.md §"Firmware update over BLE (FOTA)".
 | HW-2 | MCU: STM32U585AIIxQ, single-core Cortex-M33 @ 160 MHz, dual-bank 2 MB flash, 786 KB SRAM. |
 | HW-3 | BLE chip: BlueNRG-LP / STM32WB07_06 over SPI1. EXTI11 IRQ pin present on the board but firmware uses pure polling (F-ARCH-6) — the EXTI line is left unarmed. |
 | HW-4 | Sensors: LSM6DSV16X (SPI), LIS2MDL (I²C2), LPS22DF (I²C2), STTS22H (I²C2). |
-| HW-5 | GPS: u-blox MAX-M10S on UART4 @ 38400 baud. Bytes captured by **DMA in circular mode** into a 512 B ring buffer; main loop reads at leisure. Auto-configured at boot (UBX-CFG-RATE, CFG-MSG, CFG-CFG). |
+| HW-5 | GPS: u-blox MAX-M10S on UART4 @ 230400 baud (raised per boot from the factory 9600; RAM layer only — the M10 never persists our config). Bytes captured by per-byte RX IRQ into a 2 KB ring buffer; main loop parses at leisure. Auto-configured on every boot via UBX-CFG-VALSET: GPS+Galileo only (BeiDou/GLONASS off), full power, UBX NAV-PVT @ 10 Hz + NAV-SAT every 10th epoch, NMEA silenced, every command ACK-verified with a `***` errlog entry on failure (see DESIGN.md "GPS module configuration"). |
 | HW-6 | Fuel gauge: STC3115 on I²C4. |
 | HW-7 | SD card: SDMMC1 peripheral, FAT32. |
 | HW-8 | Power: Li-Po battery, **wireless / inductive charging** via the transport case. On-board USB-C is sealed inside the case and used only for factory flashing / DFU repair. |

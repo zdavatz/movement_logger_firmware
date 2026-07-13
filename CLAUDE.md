@@ -70,8 +70,9 @@ row; it's a best-effort no-op when no session is open.
   the architectural fix that took 43 firmware revisions to find in the
   predecessor stack; do not "re-enable" it.
 - Sensors: LSM6DSV16X (SPI2), LIS2MDL + LPS22DF + STTS22H on I²C2,
-  STC3115 fuel gauge on I²C4. GPS u-blox MAX-M10S on UART4 @ 38400 baud,
-  captured by DMA-circular into a 512 B ring.
+  STC3115 fuel gauge on I²C4. GPS u-blox MAX-M10S on UART4 @ 230400 baud
+  (raised per boot from factory 9600 — see the v0.0.41 section), captured
+  by per-byte RX IRQ into a 2 KB ring.
 - **GPS wiring (authoritative — verified against ST schematic Rev 3
   Fig. 3 + UM3133 Rev 7).** The box has **no STMod+ connector**; UART4
   (PA0/PA1) is exposed only on **JP2, the STLINK programming connector**
@@ -362,8 +363,9 @@ like `GET_MODE`. Public API: `int GPS_GetPower(void)` / `int GPS_SetPower(int on
 **Off = UBX-RXM-PMREQ backup mode** (~tens of µA vs ~25 mA acquiring). Uses the
 16-byte v0 PMREQ (flags bit1 = backup, wakeupSources bit3 = uartrx); PMREQ is
 **fire-and-forget** (not ACK'd). **On** wakes the module with a short `0xFF` UART
-burst (`gps_wake_pulse`) — it hot-starts from the config still held in BBR (from
-the existing CFG-CFG-SAVE) and re-listens for NMEA.
+burst (`gps_wake_pulse`) — software backup keeps the module's RAM powered, so it
+resumes this session's config (the original "held in BBR via CFG-CFG-SAVE" story
+was wrong — the M10 never ACKs that save; see the v0.0.38/v0.0.41 sections).
 
 **Persisted to `GPSPWR.CFG`** on the SD root (first byte `f`/`F` = off, anything
 else = on — same pattern as `LOGMODE.CFG`; cached in `g_power`, `-1` = unread).
@@ -455,6 +457,12 @@ keep their local UserDefaults / config.toml as before. Bumped
 
 ## GSV un-starved: C/N0 telemetry actually flows (v0.0.38+) — `gps.c`
 
+> **Superseded by v0.0.41** (next section): the port is UBX-native now, GSV is
+> silenced along with the rest of NMEA, and `cn0_max`/`sats_in_view` come from
+> UBX NAV-SAT. The GSV path survives only as the RX-only fallback parser. The
+> cfg-cfg-save discovery below (nothing persists on the M10) still stands and
+> is the reason v0.0.41 reconfigures on every boot.
+
 **The "cn0_max/sats_in_view are always 0" fix.** v0.0.19 added `parse_gsv`
 for per-satellite signal strength, but `GPS_Init`'s noisy-NMEA disable list
 (GLL/GSA/**GSV**/VTG, ACK'd every boot) turned GSV off before a single
@@ -489,6 +497,51 @@ Three coupled changes (`Src/gps.c`):
    protocol bools; rate values for the U1 MSGOUT keys).
 
 Bumped `PL_FW_VERSION` → **0.0.38** (`Inc/config.h`).
+
+## GPS UBX-native at 230400, GPS+Galileo only (v0.0.41+) — `gps.c`
+
+**Peter's per-boot config recipe (2026-07-13), verified in u-center 2 over a
+USB-UART adapter**: GPS + Galileo only (BeiDou/GLONASS off), full power, UBX
+NAV-PVT every nav epoch + NAV-SAT every 10th, baud **230400** (115200 loses
+data) set as the **last** command, everything **RAM layer only** (re-sent every
+boot — the M10 never persists, see v0.0.38), every command ACK-verified, and
+**every un-ACK'd command writes a `***` errlog entry** (which also latches the
+red LED). Result at his window with ~40 % sky view: 15 sats used, 3D fix,
+C/N0 up to 41 dB-Hz — where the 4-constellation NMEA default never fixed.
+
+Authoritative sequence + rationale: **DESIGN.md → "GPS module configuration
+(v0.0.41+)"**. Key implementation facts:
+
+- **Boot flow (`GPS_Init`)**: listen-first baud detect (9600 cold-boot →
+  230400 MCU-only reset → 38400 pre-v0.0.41 leftover; UBX syncs count as
+  traffic, not just NMEA newlines) → CFG-SIGNAL (9 keys, one VALSET, then
+  500 ms settle) → CFG-PM-OPERATEMODE=0 → INPROT/OUTPROT-UBX=1 + MSGOUT
+  PVT=1/SAT=10 (UBX *out* is OFF in the M10 factory default — without this
+  key PVT never flows) → NMEA MSGOUT all 0 (only if the UBX step ACK'd, so a
+  partial failure can't mute the module) → CFG-UART1-BAUDRATE=230400 with the
+  local UART re-inited immediately (the ACK arrives at the NEW baud; MON-VER
+  poll as fallback confirmation) → CFG-RATE 100 ms/1. The nav rate comes
+  AFTER the baud switch (deliberate reorder vs Peter's list: 10 Hz output at
+  9600 would oversubscribe the module TX and drown the ACKs).
+- **Parser** (`gps_rx_byte`): protocol router — UBX frames (Fletcher-checked,
+  `parse_nav_pvt`/`parse_nav_sat`) + the old NMEA line assembler as fallback.
+  `fix_q` is mapped to the NMEA-GGA scale (1 = valid fix) for host compat;
+  `hdop` carries pDOP×0.01 in UBX mode; `utc` from PVT (validDate+Time gated).
+- **Diag counters keep their exact 8-key `gps_diag:` format** (the desktop
+  errlog_check parses it strictly): checksum-valid UBX frames count into
+  `lines_good`, corrupt into `lines_bad`, PVT epochs into `gga`, valid fixes
+  into `rmc`. The 30 s one-shot marker still contains the literal token
+  `GPS NO NMEA` (errlog_check matches it).
+- **Bridge (`0x0D`)** no longer flips protocols — the port is UBX-native; it
+  only throttles our periodic PVT 10 Hz → 1 Hz while a survey runs.
+- **RX ring 512 B → 2 KB** (`GPS_RX_RING_SIZE`, config.h); configured UBX
+  traffic is ~1.4 KB/s, the 230400 line is mostly idle (headroom for Peter's
+  future 18 Hz idea — 25 Hz "chip tuning" is out: irreversible per Peter).
+- **NMEA-fallback mode** (box→module TX dead, nothing ACKs): module stays at
+  factory 9600/1 Hz NMEA defaults, GGA/RMC/GSV parsing still logs — RX-only
+  operation keeps working as before.
+
+Bumped `PL_FW_VERSION` → **0.0.41** (`Inc/config.h`).
 
 ## Known WIP edges (per the PR description)
 

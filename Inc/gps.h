@@ -1,7 +1,8 @@
 /**
   ******************************************************************************
   * @file    gps.h
-  * @brief   u-blox MAX-M10S on UART4 — DMA-circular RX, polling parse.
+  * @brief   u-blox MAX-M10S on UART4 — byte-IRQ RX, polling parse.
+  *          UBX-native (NAV-PVT/NAV-SAT) since v0.0.41; NMEA fallback.
   ******************************************************************************
   */
 #ifndef PL_GPS_H
@@ -16,13 +17,15 @@ typedef struct {
   float    speed_kmh;
   float    course;
   char     utc[16];          /* "hhmmss.ss" */
-  uint8_t  fix_q;            /* 0=none, 1=GPS, 2=DGPS */
-  uint8_t  num_sat;
-  float    hdop;
+  uint8_t  fix_q;            /* 0 = none, 1 = valid fix (UBX PVT gnssFixOK /
+                                NMEA GGA quality — kept on the GGA scale) */
+  uint8_t  num_sat;          /* satellites used in the solution */
+  float    hdop;             /* pDOP in UBX mode, hDOP in NMEA fallback */
   uint32_t tick_ms;
   uint8_t  valid;
-  uint8_t  cn0_max;          /* strongest satellite C/N0 (dB-Hz) from GSV; 0 = no data */
-  uint8_t  sats_in_view;     /* satellites reporting a C/N0 in the last GSV burst */
+  uint8_t  cn0_max;          /* strongest satellite C/N0 (dB-Hz), NAV-SAT (or
+                                GSV in fallback); 0 = no data */
+  uint8_t  sats_in_view;     /* satellites reporting a C/N0 in the last burst */
 } PL_GpsFix;
 
 int  GPS_Init(void);
@@ -54,12 +57,13 @@ pl_gps_quality_t GPS_LastFixQuality(void);
    The host polls the receiver directly: UBX poll frames arrive over BLE and
    are written straight to the module UART by GPS_BridgeTx; complete UBX reply
    frames are captured out of the RX stream into a relay buffer that the BLE
-   layer drains with GPS_BridgeRead and notifies back. NMEA keeps flowing to
-   the SD logger the whole time — enabling the bridge only *adds* UBX output
-   on the port (CFG via $PUBX,41), it never disables NMEA.
+   layer drains with GPS_BridgeRead and notifies back. Since v0.0.41 the port
+   is UBX-native anyway — enabling the bridge only throttles the firmware's
+   own periodic NAV-PVT (10 Hz → 1 Hz) so poll replies don't compete on the
+   relay; logging continues at the reduced fix rate meanwhile.
 
-   The bridge is volatile (never persisted): a power-cycle leaves the module
-   back at NMEA-only, and the BLE layer also disables it on disconnect. */
+   The bridge is volatile (never persisted), and the BLE layer disables it on
+   disconnect. */
 void     GPS_BridgeSet(uint8_t on);                        /* enable/disable */
 uint8_t  GPS_BridgeActive(void);
 void     GPS_BridgeTx(const uint8_t *data, uint16_t len);  /* host → module UART */

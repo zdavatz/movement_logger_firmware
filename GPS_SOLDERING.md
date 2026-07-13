@@ -7,8 +7,9 @@ date: "2026-05-18"
 # What you are doing
 
 The MovementLogger firmware reads GPS over **UART4** on MCU pins
-**PA0 (TX)** and **PA1 (RX)**, at **38400 baud, 8 data bits, no parity,
-1 stop bit (8N1)**, 3.3 V logic. The receiver is a separate
+**PA0 (TX)** and **PA1 (RX)**, at **230400 baud** (v0.0.41+; raised per
+boot from the module's factory 9600 — earlier firmware used 38400),
+**8 data bits, no parity, 1 stop bit (8N1)**, 3.3 V logic. The receiver is a separate
 **u-blox MAX-M10S** module — it is *not* on the STEVAL-MKBOXPRO. This
 sheet covers wiring that module to the box by hand.
 

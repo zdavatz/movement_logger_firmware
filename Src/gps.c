@@ -1,20 +1,28 @@
 /**
   ******************************************************************************
   * @file    gps.c
-  * @brief   u-blox MAX-M10S NMEA parser on UART4 — byte-by-byte IRQ RX.
+  * @brief   u-blox MAX-M10S on UART4 — byte-by-byte IRQ RX, UBX-native.
+  *
+  *          Since v0.0.41 the module is configured per boot (RAM layer only —
+  *          nothing persists on the M10; it always cold-starts at factory
+  *          9600 baud NMEA) with Peter's 2026-07-13 recipe: GPS+Galileo only
+  *          (BeiDou/GLONASS off), full power, UBX NAV-PVT every nav epoch +
+  *          NAV-SAT every 10th, NMEA silenced, then the baud raised to 230400
+  *          as the LAST command (the ACK arrives at the new baud — the local
+  *          UART is switched immediately after the command drains). Every
+  *          un-ACK'd config command leaves a *** errlog entry. The parser
+  *          handles both UBX frames (normal mode) and NMEA lines (fallback
+  *          when the box→module TX path is dead and no config could land —
+  *          the module then keeps its factory 9600/1 Hz NMEA output).
   *
   *          The DMA approach (Builds #1-#9) proved unreliable: after a single
-  *          framing error UART4 latched and DMA stayed stuck (ERRLOG showed
-  *          bytes=1 over 6 minutes). The IRQ approach is lifted from the
-  *          original SDDataLogFileX::gps_nmea.c — one byte per IRQ, push to
-  *          ring buffer, re-arm; error callback clears flags and re-arms.
-  *          GPS_Tick drains the ring at main-loop priority and runs the
-  *          NMEA line-assembly + parser (atof/strtod heavy work) outside
-  *          IRQ context.
-  *
-  *          IRQ load at 38400 baud ≈ 4800 bytes/s = one IRQ every ~210 µs,
-  *          each <10 µs → ~5% CPU. Bounded; F-ARCH-6 exception explicitly
-  *          documented in stm32u5xx_it.c.
+  *          framing error UART4 latched and DMA stayed stuck. One byte per
+  *          IRQ, push to ring buffer, re-arm; error callback clears flags and
+  *          re-arms. GPS_Tick drains the ring at main-loop priority and runs
+  *          the UBX/NMEA parsing outside IRQ context. Configured UBX traffic
+  *          is ~1.4 KB/s (PVT@10Hz + SAT@1Hz) → ~1.4k IRQs/s, each <10 µs
+  *          → ~1.5% CPU. Bounded; F-ARCH-6 exception documented in
+  *          stm32u5xx_it.c.
   ******************************************************************************
   */
 #include "main.h"
@@ -28,7 +36,8 @@
 static UART_HandleTypeDef g_huart4;
 static uint8_t            g_rx_byte;           /* single-byte landing zone for HAL */
 
-#define GPS_RX_RING_SIZE  512
+/* GPS_RX_RING_SIZE (config.h, 2048 B) covers a worst-case full-line-rate
+   burst at 230400 baud (~1.15 KB) between two 50 ms GPS_Tick drains. */
 static volatile uint8_t  g_rx_ring[GPS_RX_RING_SIZE];
 static volatile uint16_t g_rx_head;            /* written by IRQ, read by thread */
 static volatile uint16_t g_rx_tail;            /* written by thread, read by IRQ */
@@ -47,20 +56,13 @@ static volatile uint32_t g_diag_bytes;
 static volatile uint32_t g_diag_lines_good;
 static volatile uint32_t g_diag_lines_bad;
 static volatile uint32_t g_diag_rmc;
-static volatile uint32_t g_latest_valid_tick;   /* HAL_GetTick() of last status='A' RMC; 0 = never */
+static volatile uint32_t g_latest_valid_tick;   /* HAL_GetTick() of last valid fix (PVT gnssFixOK / RMC 'A'); 0 = never */
 static volatile uint32_t g_diag_gga;
 static volatile uint32_t g_diag_errors;        /* UART RX error callbacks invoked */
 
-/* Baud the module locked to in GPS_Init — needed by the bridge's $PUBX,41
-   reconfigure (it must keep the same baud, only flip the output protocol). */
+/* Baud the module ended up on in GPS_Init (230400 normally; the detected
+   baud if the switch couldn't be confirmed). Logged by the bridge. */
 static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
-
-/* GSV emit rate chosen by GPS_Init ("every Nth nav epoch"; 0 = off). 10 at
-   38400/10 Hz = one burst/s for the C/N0 telemetry; 0 at the 9600/5 Hz
-   fallback (no UART headroom for GSV bursts there). The survey's NMEA
-   trim/restore (gps_survey_nmea) restores GSV to this rate, not to the
-   module default of every-epoch. */
-static uint8_t g_gsv_rate;
 
 /* Persisted GPS power state (battery-save). GPSPWR.CFG on the SD root: first
    byte 'f'/'F' ("off") = backup mode, anything else = on. g_power is the
@@ -105,21 +107,7 @@ static void ubx_send(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t l
   HAL_UART_Transmit(&g_huart4, ck, 2, 200);
 }
 
-static void gps_cfg_port_uart1(uint32_t baud)
-{
-  uint8_t p[20] = {0};
-  p[0]  = 0x01;
-  p[4]  = 0xC0; p[5] = 0x08;
-  p[8]  = (uint8_t)(baud);
-  p[9]  = (uint8_t)(baud >> 8);
-  p[10] = (uint8_t)(baud >> 16);
-  p[11] = (uint8_t)(baud >> 24);
-  p[12] = 0x03;
-  p[14] = 0x02;
-  ubx_send(0x06, 0x00, p, sizeof(p));
-}
-
-/* ---------- UBX-CFG-VALSET: M10-native protocol enable ------------------ */
+/* ---------- UBX-CFG-VALSET: M10-native config (RAM layer only) ----------- */
 
 /* On the MAX-M10S (M10 generation) the legacy $PUBX,41 / UBX-CFG-PRT output
    protocol mask is unreliable — the port keeps emitting NMEA-only even after
@@ -133,19 +121,42 @@ static void gps_cfg_port_uart1(uint32_t baud)
 #define CFG_UART1OUTPROT_UBX  0x10740001UL
 
 /* CFG-MSGOUT-NMEA_ID_*_UART1 rate keys (U1: emit every Nth nav epoch; 0 =
-   off). At 9600 baud the UART is oversubscribed by 5 Hz NMEA, so the survey's
-   UBX poll replies (NAV-PVT / MON-RF) were delayed or dropped — the "ant=?/?"
-   / "used=0" survey gaps. While the bridge is active we silence the heavy /
-   non-essential sentences (GSV is the big one — multi-sentence per satellite)
-   to free bandwidth for the UBX answers; GGA + RMC stay on for the SD logger's
-   fix. Bridge off restores the post-GPS_Init state (GSV at g_gsv_rate, rest
-   off) — see gps_survey_nmea. RAM-only, ACK-verified via gps_cfg_valset_bool
-   (its 1-byte value matches these U1 keys). */
+   off). In normal (UBX-native) operation GPS_Init silences ALL of these —
+   the logger's fix comes from UBX NAV-PVT. They only stay at the module's
+   factory defaults when the config phase couldn't land (dead box→module TX),
+   in which case the NMEA parser below is the fallback data path. */
+#define CFG_MSGOUT_NMEA_GGA_UART1  0x209100bbUL
+#define CFG_MSGOUT_NMEA_RMC_UART1  0x209100acUL
 #define CFG_MSGOUT_NMEA_GSV_UART1  0x209100c5UL
 #define CFG_MSGOUT_NMEA_GSA_UART1  0x209100c0UL
 #define CFG_MSGOUT_NMEA_VTG_UART1  0x209100b1UL
 #define CFG_MSGOUT_NMEA_GLL_UART1  0x209100caUL
 #define CFG_MSGOUT_NMEA_ZDA_UART1  0x209100d9UL
+
+/* CFG-MSGOUT-UBX_NAV_*_UART1 — the v0.0.41 primary data path. PVT every nav
+   epoch (position/speed/course/time/fix/pDOP in one 92-byte frame), NAV-SAT
+   every 10th epoch (per-satellite C/N0 → cn0_max / sats_in_view). */
+#define CFG_MSGOUT_UBX_NAV_PVT_UART1  0x20910007UL
+#define CFG_MSGOUT_UBX_NAV_SAT_UART1  0x20910016UL
+
+/* CFG-SIGNAL constellation enables. Peter's recipe (2026-07-13): GPS + Galileo
+   only; BeiDou + GLONASS off. Measured result: 15 sats used / 3D fix at a
+   window with ~40 % sky view — where the 4-constellation default never fixed. */
+#define CFG_SIGNAL_GPS_ENA        0x1031001fUL
+#define CFG_SIGNAL_GPS_L1CA_ENA   0x10310001UL
+#define CFG_SIGNAL_GAL_ENA        0x10310021UL
+#define CFG_SIGNAL_GAL_E1_ENA     0x10310007UL
+#define CFG_SIGNAL_BDS_ENA        0x10310022UL
+#define CFG_SIGNAL_BDS_B1_ENA     0x1031000dUL
+#define CFG_SIGNAL_BDS_B1C_ENA    0x1031000fUL
+#define CFG_SIGNAL_GLO_ENA        0x10310025UL
+#define CFG_SIGNAL_GLO_L1_ENA     0x10310018UL
+
+/* Nav rate, power mode, port baud. */
+#define CFG_RATE_MEAS             0x30210001UL   /* U2, ms per nav epoch */
+#define CFG_RATE_NAV              0x30210002UL   /* U2, epochs per solution */
+#define CFG_PM_OPERATEMODE        0x20d00001UL   /* E1, 0 = full power */
+#define CFG_UART1_BAUDRATE        0x40520001UL   /* U4 */
 
 static int ubx_send_retry(uint8_t cls, uint8_t id, const uint8_t *payload,
                           uint16_t len, int retries);
@@ -168,32 +179,68 @@ static int gps_cfg_valset_bool(uint32_t key, uint8_t val)
   return ubx_send_retry(0x06, 0x8A, p, sizeof(p), 2);
 }
 
-/* $PUBX,41 — u-blox proprietary NMEA sentence that configures a UART
-   port (baudrate + inProtoMask + outProtoMask). Critically, this
-   travels as NMEA, so it's accepted by the module even when its
-   persisted inProtoMask is set to NMEA-only (= our previous Build #45
-   trap, where every UBX command silently dropped). After this lands,
-   the module is at the new baud with UBX input re-enabled, and all
-   subsequent UBX commands ACK normally.
+/* Multi-key CFG-VALSET builder. vs_begin resets the staging buffer (version 0,
+   RAM layer), vs_u1/u2/u4 append key+value pairs, vs_send transmits with
+   3 ACK-verified retries and logs the outcome — a *** entry for every un-ACK'd
+   command (Peter's rule, 2026-07-13: "Jeder Befehl an das GPS Modul, der nicht
+   bestätigt wird, muss im Errorlog einen Eintrag machen"). Returns 0 on ACK,
+   1 on failure so callers can sum a failure count. */
+#define VS_BUF_MAX (4 + 9 * 8)              /* header + 9 keys à (4+4) worst case */
+static uint8_t  g_vs_buf[VS_BUF_MAX];
+static uint16_t g_vs_len;
 
-   Wire format: $PUBX,41,1,0003,0002,<baud>,0*<XOR>\r\n
-     port 1     = UART
-     inMask 0x0003 = UBX + NMEA
-     outMask 0x0002 = NMEA only
-     autobaud 0  = off
-   The XOR checksum runs over everything between '$' and '*'. */
-static void send_pubx_port_cfg(uint32_t baud_out)
+static void vs_begin(void)
 {
-  char body[64];
-  int n = snprintf(body, sizeof(body), "PUBX,41,1,0003,0002,%lu,0",
-                   (unsigned long)baud_out);
-  if (n <= 0) return;
-  uint8_t cs = 0;
-  for (int i = 0; i < n; i++) cs ^= (uint8_t)body[i];
-  char full[80];
-  int m = snprintf(full, sizeof(full), "$%s*%02X\r\n", body, cs);
-  if (m > 0) HAL_UART_Transmit(&g_huart4, (uint8_t *)full,
-                               (uint16_t)m, 200);
+  g_vs_buf[0] = 0x00;                       /* version 0 */
+  g_vs_buf[1] = 0x01;                       /* layers: RAM only */
+  g_vs_buf[2] = 0x00;
+  g_vs_buf[3] = 0x00;
+  g_vs_len    = 4;
+}
+
+static void vs_key(uint32_t key)
+{
+  g_vs_buf[g_vs_len++] = (uint8_t)(key);
+  g_vs_buf[g_vs_len++] = (uint8_t)(key >> 8);
+  g_vs_buf[g_vs_len++] = (uint8_t)(key >> 16);
+  g_vs_buf[g_vs_len++] = (uint8_t)(key >> 24);
+}
+
+static void vs_u1(uint32_t key, uint8_t v)
+{
+  if (g_vs_len + 5 > VS_BUF_MAX) return;
+  vs_key(key);
+  g_vs_buf[g_vs_len++] = v;
+}
+
+static void vs_u2(uint32_t key, uint16_t v)
+{
+  if (g_vs_len + 6 > VS_BUF_MAX) return;
+  vs_key(key);
+  g_vs_buf[g_vs_len++] = (uint8_t)(v);
+  g_vs_buf[g_vs_len++] = (uint8_t)(v >> 8);
+}
+
+static void vs_u4(uint32_t key, uint32_t v)
+{
+  if (g_vs_len + 8 > VS_BUF_MAX) return;
+  vs_key(key);
+  g_vs_buf[g_vs_len++] = (uint8_t)(v);
+  g_vs_buf[g_vs_len++] = (uint8_t)(v >> 8);
+  g_vs_buf[g_vs_len++] = (uint8_t)(v >> 16);
+  g_vs_buf[g_vs_len++] = (uint8_t)(v >> 24);
+}
+
+static int vs_send(const char *what)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  int rc = ubx_send_retry(0x06, 0x8A, g_vs_buf, g_vs_len, 3);
+  if (rc == 0) {
+    ErrLog_Writef("gps: cfg %s ACK", what);
+    return 0;
+  }
+  ErrLog_Writef("*** gps: cfg %s NOT ACK'd ***", what);
+  return 1;
 }
 
 /* ---------- NMEA parser ------------------------------------------------- */
@@ -235,20 +282,35 @@ static int nmea_split(char *line, char *fields[], int max_fields)
   return n;
 }
 
-/* GSV per-satellite C/N0 roll-up. GSV arrives as a multi-sentence burst (one
-   group per constellation); we accumulate the strongest C/N0 and the count of
-   tracked (C/N0-bearing) satellites, then parse_gga commits them to g_latest
-   at the GGA boundary. Since v0.0.38 GSV is throttled to ~1 burst/s while GGA
-   runs at 10 Hz, so most GGA epochs see no fresh burst — parse_gga holds the
-   last committed value between bursts and only decays to 0 ("no data") after
-   GSV_STALE_MS of GSV silence (legacy module with GSV off, module gone quiet).
-   Parsing is RX-only — works even when the box->module command line is dead
-   (the exact case that blocks the UBX survey). */
+/* Per-satellite C/N0 roll-up, fed by UBX NAV-SAT (normal mode, 1 frame per
+   burst) or NMEA GSV (fallback mode, multi-sentence burst). Either source
+   fills the accumulators + burst flag; the epoch parser (parse_nav_pvt /
+   parse_gga) then commits them to g_latest. Bursts arrive ~1/s while epochs
+   run at 10 Hz, so most epochs see no fresh burst — the commit holds the last
+   value between bursts and only decays to 0 ("no data") after GSV_STALE_MS of
+   silence (source disabled, module gone quiet). GSV parsing is RX-only — it
+   works even when the box→module command line is dead. */
 static uint8_t  g_gsv_cn0_max;    /* strongest C/N0 since the last commit (dB-Hz) */
 static uint8_t  g_gsv_nsat_sig;   /* satellites with a C/N0 since the last commit */
-static uint8_t  g_gsv_burst;      /* ≥1 GSV sentence parsed since the last commit */
-static uint32_t g_gsv_seen_tick;  /* HAL_GetTick() of the last GSV sentence */
+static uint8_t  g_gsv_burst;      /* ≥1 burst parsed since the last commit */
+static uint32_t g_gsv_seen_tick;  /* HAL_GetTick() of the last burst */
 #define GSV_STALE_MS 3000U
+
+/* Commit the roll-up at an epoch boundary (NAV-PVT or GGA). A burst whose
+   satellites all lack a C/N0 commits a genuine 0/0. */
+static void commit_cn0_rollup(void)
+{
+  if (g_gsv_burst) {
+    g_latest.cn0_max      = g_gsv_cn0_max;
+    g_latest.sats_in_view = g_gsv_nsat_sig;
+    g_gsv_cn0_max  = 0;
+    g_gsv_nsat_sig = 0;
+    g_gsv_burst    = 0;
+  } else if ((uint32_t)(HAL_GetTick() - g_gsv_seen_tick) > GSV_STALE_MS) {
+    g_latest.cn0_max      = 0;
+    g_latest.sats_in_view = 0;
+  }
+}
 
 /* $xxGSV,numMsg,msgNum,numSV,{svid,elev,azim,cno}...  (up to 4 sats/sentence;
    an optional trailing signalId in NMEA 4.11 is naturally ignored — a lone
@@ -305,21 +367,7 @@ static void parse_gga(char *fields[], int n)
 {
   if (n < 10) return;
   g_diag_gga++;
-  /* Commit the C/N0 rolled up from the GSV bursts. GSV is throttled to
-     ~1 burst/s (v0.0.38) while GGA arrives at 10 Hz, so most epochs carry no
-     fresh burst — hold the last committed value instead of flapping to 0, and
-     decay to 0 ("no data") only after GSV_STALE_MS of GSV silence. A burst
-     whose satellites all lack a C/N0 commits a genuine 0/0. */
-  if (g_gsv_burst) {
-    g_latest.cn0_max      = g_gsv_cn0_max;
-    g_latest.sats_in_view = g_gsv_nsat_sig;
-    g_gsv_cn0_max  = 0;
-    g_gsv_nsat_sig = 0;
-    g_gsv_burst    = 0;
-  } else if ((uint32_t)(HAL_GetTick() - g_gsv_seen_tick) > GSV_STALE_MS) {
-    g_latest.cn0_max      = 0;
-    g_latest.sats_in_view = 0;
-  }
+  commit_cn0_rollup();
   g_latest.fix_q   = (uint8_t)atoi(fields[6]);
   g_latest.num_sat = (uint8_t)atoi(fields[7]);
   g_latest.hdop    = (float)strtod(fields[8], NULL);
@@ -363,26 +411,155 @@ static void process_byte(uint8_t b)
   }
 }
 
-/* ---------- BLE GPS bridge ---------------------------------------------- */
+/* ---------- UBX parser (NAV-PVT / NAV-SAT — the v0.0.41 primary path) ---- */
 
-/* $PUBX,41 to flip the port's output protocol mask while keeping baud and
-   input mask. `ubx_on` → outMask 0x0003 (UBX+NMEA) so the survey's poll
-   replies are emitted alongside the NMEA the SD logger needs; off → 0x0002
-   (NMEA only), the normal logging state. Travels as NMEA so it lands even if
-   UBX input were ever disabled (same rationale as send_pubx_port_cfg). */
-static void gps_set_ubx_output(uint8_t ubx_on)
+static uint32_t g_diag_ubx_frames;   /* checksum-valid UBX frames (any class) */
+
+static int32_t rd_i32(const uint8_t *p)
 {
-  const char *outmask = ubx_on ? "0003" : "0002";
-  char body[64];
-  int n = snprintf(body, sizeof(body), "PUBX,41,1,0003,%s,%lu,0",
-                   outmask, (unsigned long)g_locked_baud);
-  if (n <= 0) return;
-  uint8_t cs = 0;
-  for (int i = 0; i < n; i++) cs ^= (uint8_t)body[i];
-  char full[80];
-  int m = snprintf(full, sizeof(full), "$%s*%02X\r\n", body, cs);
-  if (m > 0) HAL_UART_Transmit(&g_huart4, (uint8_t *)full, (uint16_t)m, 200);
+  return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                   ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
 }
+
+static uint16_t rd_u16(const uint8_t *p)
+{
+  return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+/* UBX-NAV-PVT (0x01 0x07, 92 B): the one-frame-per-epoch solution. Fills the
+   same PL_GpsFix the NMEA RMC+GGA pair used to fill:
+     fix_q   — 1 on a valid fix (flags.gnssFixOK && fixType 2/3/4), else 0.
+               Deliberately mapped to the NMEA-GGA "1 = GPS fix" scale every
+               host/CSV consumer was built for, not the raw fixType.
+     hdop    — carries pDOP×0.01 (PVT has no hDOP; scale + meaning are close
+               enough for the quality gating the tools do — see DESIGN.md).
+     utc     — hhmmss.ss from the PVT UTC fields (only when validDate+validTime).
+   Epochs count into g_diag_gga, valid fixes into g_diag_rmc, so the gps_diag
+   errlog line and the desktop's errlog_check keep their exact 8-key format. */
+static void parse_nav_pvt(const uint8_t *p, uint16_t len)
+{
+  if (len < 92) return;
+  g_diag_gga++;
+  commit_cn0_rollup();
+
+  uint8_t  fixtype = p[20];
+  uint8_t  flags   = p[21];
+  uint8_t  ok      = (flags & 0x01) && fixtype >= 2 && fixtype <= 4;
+
+  g_latest.fix_q   = ok ? 1 : 0;
+  g_latest.num_sat = p[23];
+  g_latest.hdop    = (float)rd_u16(p + 76) * 0.01f;      /* pDOP */
+  g_latest.alt_m   = (float)rd_i32(p + 36) / 1000.0f;    /* hMSL mm → m */
+
+  if (ok) {
+    g_diag_rmc++;
+    g_latest_valid_tick = HAL_GetTick();
+    g_latest.lat = (double)rd_i32(p + 28) * 1e-7;
+    g_latest.lon = (double)rd_i32(p + 24) * 1e-7;
+    g_latest.speed_kmh = (float)rd_i32(p + 60) * 0.0036f;  /* mm/s → km/h */
+    float crs = (float)rd_i32(p + 64) * 1e-5f;             /* headMot */
+    if (crs < 0.0f) crs += 360.0f;
+    g_latest.course = crs;
+    if ((p[11] & 0x03) == 0x03) {                          /* validDate+Time */
+      int32_t nano = rd_i32(p + 16);
+      int cs = (nano > 0) ? (int)(nano / 10000000) : 0;    /* clamp neg nano */
+      snprintf(g_latest.utc, sizeof(g_latest.utc), "%02u%02u%02u.%02u",
+               (unsigned)p[8], (unsigned)p[9], (unsigned)p[10], (unsigned)cs);
+    }
+    g_latest.tick_ms = HAL_GetTick();
+    g_latest.valid   = 1;
+  }
+  g_updated = 1;
+}
+
+/* UBX-NAV-SAT (0x01 0x35): per-satellite C/N0 table, one frame per burst
+   (every 10th nav epoch). Overwrites the roll-up accumulators — unlike the
+   multi-sentence GSV path there is nothing to accumulate across. */
+static void parse_nav_sat(const uint8_t *p, uint16_t len)
+{
+  if (len < 8) return;
+  uint16_t n = p[5];
+  if ((uint16_t)(8 + 12 * n) > len) n = (uint16_t)((len - 8) / 12);
+  uint8_t cn0max = 0, nsig = 0;
+  for (uint16_t i = 0; i < n; i++) {
+    uint8_t cno = p[8 + 12 * i + 2];
+    if (cno == 0) continue;                  /* in view but not tracked */
+    if (cno > 99) cno = 99;
+    if (nsig < 255) nsig++;
+    if (cno > cn0max) cn0max = cno;
+  }
+  g_gsv_cn0_max   = cn0max;
+  g_gsv_nsat_sig  = nsig;
+  g_gsv_burst     = 1;
+  g_gsv_seen_tick = HAL_GetTick();
+}
+
+/* Protocol router: assembles UBX frames (sync 0xB5 0x62, Fletcher checksum)
+   out of the RX stream and hands everything else to the NMEA line assembler.
+   Oversized frames (> UBX_PAY_MAX, e.g. a long NAV-SIG during a survey) are
+   checksum-validated but not stored. Checksum-valid frames count into
+   g_diag_lines_good, corrupt ones into g_diag_lines_bad — so the existing
+   gps_diag line and the logger's 30 s "no data" marker keep working with
+   unchanged semantics ("units decoded / units corrupt"). */
+#define UBX_PAY_MAX 600
+static uint8_t  g_ux_st;
+static uint8_t  g_ux_cls, g_ux_id, g_ux_cka, g_ux_ckb, g_ux_skip;
+static uint16_t g_ux_len, g_ux_got;
+static uint8_t  g_ux_pay[UBX_PAY_MAX];
+
+static void ux_ck(uint8_t b) { g_ux_cka += b; g_ux_ckb += g_ux_cka; }
+
+static void gps_rx_byte(uint8_t b)
+{
+  switch (g_ux_st) {
+    case 0:
+      if (b == 0xB5) { g_ux_st = 1; return; }
+      process_byte(b);
+      return;
+    case 1:
+      if (b == 0x62) { g_ux_st = 2; g_ux_cka = 0; g_ux_ckb = 0; return; }
+      g_ux_st = (b == 0xB5) ? 1 : 0;         /* repeated 0xB5 stays armed */
+      if (g_ux_st == 0) process_byte(b);
+      return;
+    case 2: g_ux_cls = b; ux_ck(b); g_ux_st = 3; return;
+    case 3: g_ux_id  = b; ux_ck(b); g_ux_st = 4; return;
+    case 4: g_ux_len = b; ux_ck(b); g_ux_st = 5; return;
+    case 5:
+      g_ux_len |= (uint16_t)b << 8; ux_ck(b);
+      g_ux_got  = 0;
+      g_ux_skip = (g_ux_len > UBX_PAY_MAX) ? 1 : 0;
+      g_ux_st   = g_ux_len ? 6 : 7;
+      return;
+    case 6:
+      if (!g_ux_skip) g_ux_pay[g_ux_got] = b;
+      ux_ck(b);
+      if (++g_ux_got >= g_ux_len) g_ux_st = 7;
+      return;
+    case 7:
+      if (b == g_ux_cka) { g_ux_st = 8; return; }
+      g_diag_lines_bad++;
+      g_ux_st = 0;
+      return;
+    case 8:
+      if (b == g_ux_ckb) {
+        g_diag_lines_good++;
+        g_diag_ubx_frames++;
+        if (!g_ux_skip) {
+          if      (g_ux_cls == 0x01 && g_ux_id == 0x07) parse_nav_pvt(g_ux_pay, g_ux_len);
+          else if (g_ux_cls == 0x01 && g_ux_id == 0x35) parse_nav_sat(g_ux_pay, g_ux_len);
+        }
+      } else {
+        g_diag_lines_bad++;
+      }
+      g_ux_st = 0;
+      return;
+    default:
+      g_ux_st = 0;
+      return;
+  }
+}
+
+/* ---------- BLE GPS bridge ---------------------------------------------- */
 
 /* Push a complete captured UBX frame into the relay ring. Whole-frame or
    nothing: if the ring can't hold it, drop it (the host re-polls next
@@ -430,21 +607,6 @@ static void bridge_capture(uint8_t b)
   }
 }
 
-/* Silence (on=0) or restore (on=1) the heavy NMEA sentences on UART1 so the
-   survey's UBX poll replies aren't starved by the NMEA stream. GGA + RMC are
-   left untouched for the SD logger's fix. Restore means the post-GPS_Init
-   state — GSV at its throttled g_gsv_rate, GSA/VTG/GLL/ZDA off — NOT the old
-   uniform rate-1, which re-enabled sentences the logger never wants and
-   oversubscribed the UART at 10 Hz nav until the next module power cycle. */
-static void gps_survey_nmea(uint8_t on)
-{
-  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_GSV_UART1, on ? g_gsv_rate : 0);
-  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_GSA_UART1, 0);
-  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_VTG_UART1, 0);
-  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_GLL_UART1, 0);
-  (void)gps_cfg_valset_bool(CFG_MSGOUT_NMEA_ZDA_UART1, 0);
-}
-
 void GPS_BridgeSet(uint8_t on)
 {
   extern void ErrLog_Writef(const char *fmt, ...);
@@ -453,31 +615,21 @@ void GPS_BridgeSet(uint8_t on)
     g_cap_st = 0; g_cap_len = 0; g_cap_got = 0;
     g_ubx_head = g_ubx_tail = 0; g_ubx_dropped = 0;
     g_bridge = 1;
-    /* Step 1: $PUBX,41 (travels as NMEA) re-enables UBX *input* even if the
-       persisted config locked the port to NMEA-only input — otherwise the
-       CFG-VALSET below would itself be dropped by the module. */
-    gps_set_ubx_output(1);
-    HAL_Delay(50);
-    /* Step 2: M10-native, ACK-verified — force UBX in+out ON on UART1 (RAM).
-       This is the lever $PUBX,41 alone doesn't reliably pull on the M10S; the
-       ACK/FAIL below in the errlog tells us definitively whether it took. */
-    int in_rc  = gps_cfg_valset_bool(CFG_UART1INPROT_UBX, 1);
-    int out_rc = gps_cfg_valset_bool(CFG_UART1OUTPROT_UBX, 1);
-    /* Free UART bandwidth for the UBX poll replies by silencing the heavy
-       NMEA sentences (GSV/GSA/VTG/GLL/ZDA) while the survey runs. */
-    gps_survey_nmea(0);
-    ErrLog_Writef("gps: bridge ON @%lu baud (valset in=%s out=%s, nmea trimmed)",
-                  (unsigned long)g_locked_baud,
-                  (in_rc == 0) ? "ACK" : "FAIL",
-                  (out_rc == 0) ? "ACK" : "FAIL");
+    /* Since v0.0.41 the port already runs UBX-native (in+out enabled, NMEA
+       silenced by GPS_Init), so there is no protocol to flip. Just throttle
+       our own periodic NAV-PVT to every 10th epoch so the survey's poll
+       replies don't compete with a 10 Hz stream on the BLE relay ring —
+       the logger still gets ~1 fix/s while the survey runs. */
+    int rc = gps_cfg_valset_bool(CFG_MSGOUT_UBX_NAV_PVT_UART1, 10);
+    ErrLog_Writef("gps: bridge ON @%lu baud (pvt throttle %s)",
+                  (unsigned long)g_locked_baud, (rc == 0) ? "ACK" : "FAIL");
   } else {
     g_bridge = 0;
-    /* Restore NMEA-only output for the SD logger. RAM-only, best-effort — a
-       power cycle would clear it anyway; the ACK doesn't matter here. */
-    (void)gps_cfg_valset_bool(CFG_UART1OUTPROT_UBX, 0);
-    gps_set_ubx_output(0);
-    gps_survey_nmea(1);   /* restore the NMEA sentences we silenced */
-    ErrLog_Writef("gps: bridge off @%lu baud (nmea restored)", (unsigned long)g_locked_baud);
+    /* Restore the 10 Hz PVT stream. RAM-only, best-effort — a power cycle
+       would clear it anyway. */
+    int rc = gps_cfg_valset_bool(CFG_MSGOUT_UBX_NAV_PVT_UART1, 1);
+    ErrLog_Writef("gps: bridge off @%lu baud (pvt restore %s)",
+                  (unsigned long)g_locked_baud, (rc == 0) ? "ACK" : "FAIL");
   }
 }
 
@@ -518,21 +670,25 @@ static int uart4_init_at(uint32_t baud)
   return (HAL_UART_Init(&g_huart4) == HAL_OK) ? 0 : -1;
 }
 
-/* Listen for `ms_window` milliseconds and return the count of '\n' bytes
-   that landed in the ring during the window. Used by GPS_Init to verify
-   that the currently-configured UART baud matches the GPS module's
-   output rate — if we see real NMEA newlines, we're decoding; if not,
-   the framing is wrong. Re-arms the RX IRQ each entry so calling this
-   right after a baud-rate change works. */
-static int listen_newlines(uint32_t ms_window)
+/* Listen for `ms_window` milliseconds and count the NMEA newlines ('\n') and
+   UBX frame syncs (0xB5 0x62 pairs) that land in the ring. Used by GPS_Init
+   to verify that the currently-configured UART baud matches the module's
+   output — a cold-booted module streams factory NMEA at 9600, a module that
+   survived an MCU-only reset streams this session's UBX at 230400; either
+   traffic pattern confirms the framing. Returns the combined count; the
+   per-protocol counts land in *nl / *ubx when non-NULL. Re-arms the RX IRQ
+   each entry so calling this right after a baud-rate change works. */
+static int listen_traffic(uint32_t ms_window, int *nl_out, int *ubx_out)
 {
   /* Robust re-arm: after multiple DeInit/Init cycles the HAL's RxState
      can land in BUSY_RX or RESET leftovers, and a fresh HAL_UART_Receive_IT
      then returns HAL_BUSY silently. Abort first, then arm, then check.
-     If arming truly fails we log it — otherwise "0 newlines" gets
+     If arming truly fails we log it — otherwise "silence" gets
      mis-attributed to "wrong baud" when the real reason was a stuck
      UART driver. */
   extern void ErrLog_Write(const char *msg);
+  if (nl_out)  *nl_out  = 0;
+  if (ubx_out) *ubx_out = 0;
   HAL_UART_AbortReceive_IT(&g_huart4);
   g_rx_head = g_rx_tail = 0;
   HAL_StatusTypeDef rs = HAL_UART_Receive_IT(&g_huart4, &g_rx_byte, 1);
@@ -541,16 +697,21 @@ static int listen_newlines(uint32_t ms_window)
     return 0;
   }
 
-  uint32_t newlines = 0;
+  uint32_t newlines = 0, syncs = 0;
+  uint8_t  prev = 0;
   uint32_t t0 = HAL_GetTick();
   while ((HAL_GetTick() - t0) < ms_window) {
     while (g_rx_head != g_rx_tail) {
       uint8_t b = g_rx_ring[g_rx_tail];
       g_rx_tail = (uint16_t)((g_rx_tail + 1u) % GPS_RX_RING_SIZE);
       if (b == '\n') newlines++;
+      if (prev == 0xB5 && b == 0x62) syncs++;
+      prev = b;
     }
   }
-  return (int)newlines;
+  if (nl_out)  *nl_out  = (int)newlines;
+  if (ubx_out) *ubx_out = (int)syncs;
+  return (int)(newlines + syncs);
 }
 
 /* Watch the ring buffer for a UBX-ACK-ACK (or ACK-NAK) frame matching the
@@ -615,9 +776,11 @@ static int ubx_send_retry(uint8_t cls, uint8_t id, const uint8_t *payload,
 
 /* Drop the receiver into UBX-RXM-PMREQ *backup* mode (~tens of µA). Wakes on
    the next UART-RX activity (wakeupSources = uartrx). PMREQ is NOT ACK'd, so
-   this is fire-and-forget. The module's config is retained in BBR (saved by
-   the CFG-CFG-SAVE in GPS_Init), so a later wake resumes NMEA at the locked
-   baud without a full reconfigure. */
+   this is fire-and-forget. Software backup keeps the module's RAM powered
+   (VCC stays on — only the MCU commands the sleep), so this session's RAM
+   config survives and a later wake resumes UBX at the locked baud without a
+   reconfigure. Only a real supply cut loses the config — and that path goes
+   back through the full GPS_Init anyway. */
 static void gps_pmreq_backup(void)
 {
   uint8_t p[16] = {0};
@@ -644,6 +807,7 @@ int GPS_Init(void)
   memset(&g_latest, 0, sizeof(g_latest));
   g_updated   = 0;
   g_linelen   = 0;
+  g_ux_st     = 0;
   g_rx_head   = 0;
   g_rx_tail   = 0;
 
@@ -669,149 +833,175 @@ int GPS_Init(void)
   HAL_NVIC_SetPriority(UART4_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(UART4_IRQn);
 
-  /* Listen-first baud detection. We don't know what state the module is
-     in (could be at factory 9600 or persisted at 38400 from a previous
-     SDDataLogFileX session). Try the most likely first, listen for
-     NMEA newlines, fall back if nothing comes through. Deliberately
-     NO blind UBX-CFG-PRT switch attempt — that path silently failed
-     for weeks and made post-mortems hard. */
+  /* Listen-first baud detection. Cold power-up (the normal case — the hall
+     switch cuts the whole rail) always finds the module at factory 9600
+     streaming default NMEA; nothing we configure persists (the M10 never
+     ACKs the legacy CFG-CFG save, verified across 15 field boots). 230400
+     covers an MCU-only reset (IWDG/FOTA) with the module still on this
+     session's RAM config (UBX traffic, no NMEA). 38400 covers a module left
+     configured by pre-v0.0.41 firmware across an MCU-only reset. Deliberately
+     NO blind config attempt when nothing is heard — a dead RX line makes the
+     module useless regardless (we could never read its data). */
+  static const uint32_t cands[3] = { 9600U, GPS_UART_BAUDRATE, 38400U };
   uint32_t locked_baud = 0;
-  uint16_t meas_ms     = (uint16_t)(1000U / GPS_RATE_HZ);   /* 100 ms = 10 Hz default */
-
-  /* Attempt 1: 38400 (our preferred rate; what the module persists to). */
-  if (uart4_init_at(GPS_UART_BAUDRATE) != 0) {
-    ErrLog_Write("gps: uart_init@38400 FAIL"); return -1;
-  }
-  g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
-  __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
-                                 | UART_CLEAR_FEF  | UART_CLEAR_PEF);
-  /* Wake pulse before the first listen: if the module was left in backup by a
-     previous persisted-OFF session and its VCC survived an MCU-only reset, it
-     would be asleep and emit no NMEA — baud detection would then fail. A short
-     junk burst wakes it (harmless when already awake); it hot-starts NMEA. */
-  gps_wake_pulse();
-  int nl = listen_newlines(1500);
-
-  if (nl >= 3) {
-    locked_baud = GPS_UART_BAUDRATE;
-    ErrLog_Writef("gps: locked @38400 (%d newlines in 1500ms)", nl);
-  } else {
-    /* Attempt 2: 9600 (u-blox factory default). */
-    ErrLog_Writef("gps: no NMEA @38400 (newlines=%d) — trying 9600", nl);
-    HAL_UART_DeInit(&g_huart4);
-    if (uart4_init_at(9600) != 0) {
-      ErrLog_Write("gps: uart_init@9600 FAIL"); return -1;
+  for (int i = 0; i < 3; i++) {
+    if (g_huart4.Instance != NULL) HAL_UART_DeInit(&g_huart4);
+    if (uart4_init_at(cands[i]) != 0) {
+      ErrLog_Writef("gps: uart_init@%lu FAIL", (unsigned long)cands[i]);
+      return -1;
     }
     g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
     __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
                                    | UART_CLEAR_FEF  | UART_CLEAR_PEF);
-    nl = listen_newlines(1500);
-    if (nl >= 3) {
-      ErrLog_Writef("gps: locked @9600 (%d newlines in 1500ms), upgrading via $PUBX,41…", nl);
-      /* We're at 9600 — ask the module to switch to 38400 via the
-         u-blox proprietary NMEA sentence $PUBX,41. We used to send
-         UBX-CFG-PRT here, but Build #45's errlog showed all UBX
-         commands silently dropped — symptom of a persisted config
-         with inProtoMask = NMEA only. $PUBX,41 travels as NMEA so
-         it always reaches the module regardless of UBX-input state,
-         and ALSO re-enables UBX input as part of its payload —
-         unsticking the module from the UBX-locked-out state for
-         the rest of this boot. Can't be ACK-verified because the
-         baud changes mid-stream (reply comes back on the new baud
-         while we're still on the old). Verify by listen at 38400. */
-      send_pubx_port_cfg(GPS_UART_BAUDRATE);
-      HAL_Delay(250);
+    /* Wake pulse before the first listen: if the module was left in backup by
+       a previous persisted-OFF session and its VCC survived an MCU-only reset,
+       it would be asleep and emit nothing — baud detection would then fail.
+       A short junk burst wakes it (harmless when already awake). */
+    if (i == 0) gps_wake_pulse();
+    int nl = 0, ux = 0;
+    int hits = listen_traffic(1500, &nl, &ux);
+    if (hits >= 2) {
+      locked_baud = cands[i];
+      ErrLog_Writef("gps: locked @%lu (nmea=%d ubx=%d in 1500ms)",
+                    (unsigned long)cands[i], nl, ux);
+      break;
+    }
+    ErrLog_Writef("gps: silent @%lu (nmea=%d ubx=%d)",
+                  (unsigned long)cands[i], nl, ux);
+  }
+  if (locked_baud == 0) {
+    ErrLog_Write("*** GPS: no baud lock — silent at 9600/230400/38400 ***");
+    ErrLog_Write("*** check module supply + RX wiring (JP2 pin 13/14) ***");
+    return -1;
+  }
+
+  /* From here on we have a confirmed baud + working RX. Peter's per-boot
+     config (2026-07-13), RAM layer only, every command ACK-verified with
+     3 retries; every un-ACK'd command leaves a *** errlog entry (vs_send).
+     Order: constellations → power mode → UBX output → NMEA off → baud last
+     (its ACK arrives at the new baud) → nav rate. The rate is set AFTER the
+     baud, deviating from Peter's list on purpose: 10 Hz output at 9600 would
+     oversubscribe the module TX and drown the remaining ACKs; nothing else
+     depends on the order, the config is complete before logging starts. */
+  int fails = 0;
+
+  /* 1. Constellations: GPS + Galileo on, BeiDou + GLONASS off. */
+  vs_begin();
+  vs_u1(CFG_SIGNAL_GPS_ENA,      1);
+  vs_u1(CFG_SIGNAL_GPS_L1CA_ENA, 1);
+  vs_u1(CFG_SIGNAL_GAL_ENA,      1);
+  vs_u1(CFG_SIGNAL_GAL_E1_ENA,   1);
+  vs_u1(CFG_SIGNAL_BDS_ENA,      0);
+  vs_u1(CFG_SIGNAL_BDS_B1_ENA,   0);
+  vs_u1(CFG_SIGNAL_BDS_B1C_ENA,  0);
+  vs_u1(CFG_SIGNAL_GLO_ENA,      0);
+  vs_u1(CFG_SIGNAL_GLO_L1_ENA,   0);
+  fails += vs_send("signal GPS+GAL -BDS -GLO");
+  HAL_Delay(500);   /* the receiver restarts its GNSS subsystem on a
+                       constellation change — give it a moment before the
+                       next command (u-blox M10 integration manual) */
+
+  /* 2. Full-power mode (no power-save duty cycling). */
+  vs_begin();
+  vs_u1(CFG_PM_OPERATEMODE, 0);
+  fails += vs_send("pm full-power");
+
+  /* 3. UBX protocol + periodic output: NAV-PVT every epoch, NAV-SAT every
+     10th. In/out protocol enables included — UBX *output* is off in the
+     M10 factory default, and after a power cut that default is what we get. */
+  vs_begin();
+  vs_u1(CFG_UART1INPROT_UBX,             1);
+  vs_u1(CFG_UART1OUTPROT_UBX,            1);
+  vs_u1(CFG_MSGOUT_UBX_NAV_PVT_UART1,    1);
+  vs_u1(CFG_MSGOUT_UBX_NAV_SAT_UART1,   10);
+  int pvt_rc = vs_send("ubx out pvt=1 sat=10");
+  fails += pvt_rc;
+
+  /* 4. Silence NMEA — but only once the UBX feed is confirmed, so a partial
+     failure can never leave the module emitting nothing at all. */
+  if (pvt_rc == 0) {
+    vs_begin();
+    vs_u1(CFG_MSGOUT_NMEA_GGA_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_RMC_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GSV_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GSA_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_VTG_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GLL_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_ZDA_UART1, 0);
+    fails += vs_send("nmea off");
+  } else {
+    ErrLog_Write("gps: keeping NMEA (ubx out not ACK'd) — fallback parser active");
+  }
+
+  /* 5. Baud → 230400, the LAST reconfiguration on the old baud. The module
+     applies it immediately, so the ACK arrives at the NEW baud — switch the
+     local UART right after the command drains (HAL_UART_Transmit blocks
+     until transmission complete), then wait for the ACK there. If the ACK
+     was lost in the transition, a MON-VER poll settles whether the module
+     really moved. */
+  uint32_t final_baud = locked_baud;
+  if (locked_baud != GPS_UART_BAUDRATE) {
+    vs_begin();
+    vs_u4(CFG_UART1_BAUDRATE, GPS_UART_BAUDRATE);
+    ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);
+    HAL_UART_DeInit(&g_huart4);
+    if (uart4_init_at(GPS_UART_BAUDRATE) != 0) {
+      ErrLog_Write("gps: uart_reinit@230400 FAIL");
+      return -1;
+    }
+    g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
+    __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
+                                   | UART_CLEAR_FEF  | UART_CLEAR_PEF);
+    g_rx_head = g_rx_tail = 0;
+    int confirmed = (ubx_wait_ack(0x06, 0x8A, 700) == 0);
+    if (!confirmed) {
+      ubx_send(0x0A, 0x04, NULL, 0);          /* MON-VER poll */
+      int ux = 0;
+      listen_traffic(400, NULL, &ux);
+      confirmed = (ux > 0);
+    }
+    if (confirmed) {
+      final_baud = GPS_UART_BAUDRATE;
+      ErrLog_Writef("gps: cfg baud %lu ACK", (unsigned long)GPS_UART_BAUDRATE);
+    } else {
+      fails++;
+      ErrLog_Writef("*** gps: cfg baud %lu NOT confirmed — staying @%lu ***",
+                    (unsigned long)GPS_UART_BAUDRATE,
+                    (unsigned long)locked_baud);
       HAL_UART_DeInit(&g_huart4);
-      if (uart4_init_at(GPS_UART_BAUDRATE) != 0) {
-        ErrLog_Write("gps: uart_reinit@38400 FAIL after upgrade"); return -1;
+      if (uart4_init_at(locked_baud) != 0) {
+        ErrLog_Write("gps: uart_reinit@locked FAIL");
+        return -1;
       }
       g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
       __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
                                      | UART_CLEAR_FEF  | UART_CLEAR_PEF);
-      nl = listen_newlines(1500);
-      if (nl >= 3) {
-        locked_baud = GPS_UART_BAUDRATE;
-        ErrLog_Writef("gps: upgrade @9600 → @38400 succeeded (%d newlines)", nl);
-      } else {
-        /* Upgrade didn't take — fall back to 9600 / 5 Hz. */
-        ErrLog_Writef("gps: upgrade failed (newlines=%d), staying @9600 / 5Hz", nl);
-        HAL_UART_DeInit(&g_huart4);
-        if (uart4_init_at(9600) != 0) {
-          ErrLog_Write("gps: uart_reinit@9600 FAIL"); return -1;
-        }
-        g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
-        __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
-                                       | UART_CLEAR_FEF  | UART_CLEAR_PEF);
-        listen_newlines(500);             /* re-arm IRQ + let bytes flow */
-        locked_baud = 9600;
-        meas_ms     = 200;                /* 5 Hz */
-      }
-    } else {
-      ErrLog_Write("*** GPS: no baud lock — neither 38400 nor 9600 produced NMEA ***");
-      ErrLog_Write("*** factory-reset the module via u-center if the baud isn't standard ***");
-      return -1;
+      listen_traffic(200, NULL, NULL);        /* re-arm IRQ */
     }
   }
 
-  /* From here on we have a confirmed baud + working RX. All subsequent
-     UBX commands are ACK-verified with 3 retries each — same pattern
-     SDDataLogFileX used. The status of each lands in the errlog so a
-     post-mortem can tell exactly which step worked/failed. */
+  /* 6. Nav rate — 10 Hz on the fast line; a conservative 5 Hz if we're stuck
+     on a slow one (10 Hz UBX would saturate 9600 baud). */
+  uint16_t meas_ms = (final_baud == GPS_UART_BAUDRATE)
+                       ? (uint16_t)(1000U / GPS_RATE_HZ)   /* 100 ms = 10 Hz */
+                       : 200U;                             /* 5 Hz */
+  vs_begin();
+  vs_u2(CFG_RATE_MEAS, meas_ms);
+  vs_u2(CFG_RATE_NAV,  1);
+  fails += vs_send("rate");
 
-  /* CFG-RATE — the most important one, set first. */
-  uint8_t rate_p[6];
-  rate_p[0] = (uint8_t)(meas_ms & 0xFF);
-  rate_p[1] = (uint8_t)(meas_ms >> 8);
-  rate_p[2] = 0x01; rate_p[3] = 0x00;     /* navRate = 1 */
-  rate_p[4] = 0x01; rate_p[5] = 0x00;     /* timeRef = GPS */
-  int rate_rc = ubx_send_retry(0x06, 0x08, rate_p, sizeof(rate_p), 3);
-  ErrLog_Writef("gps: cfg-rate %luHz %s",
-                (unsigned long)(1000U / meas_ms),
-                (rate_rc == 0) ? "ACK" : "FAIL");
-
-  /* Disable noisy NMEA sentences (GLL/GSA/VTG). GSV is NOT disabled anymore —
-     it feeds the v0.0.19 C/N0 telemetry (parse_gsv → cn0_max/sats_in_view),
-     which the old GLL/GSA/GSV/VTG disable list starved to a permanent 0. */
-  const uint8_t off[3][2] = { {0xF0,0x01}, {0xF0,0x02}, {0xF0,0x05} };
-  int msg_acks = 0;
-  for (int i = 0; i < 3; i++) {
-    uint8_t p[3] = { off[i][0], off[i][1], 0 };
-    if (ubx_send_retry(0x06, 0x01, p, sizeof(p), 3) == 0) msg_acks++;
-  }
-  ErrLog_Writef("gps: cfg-msg disable %d/3 ACK'd", msg_acks);
-
-  /* GSV on, throttled (v0.0.38). Rate byte = "emit every Nth nav epoch":
-     10 @ 10 Hz nav = one burst/s — plenty for antenna/signal telemetry, and
-     it keeps the 38400 UART comfortably undersubscribed (a full-rate GSV
-     burst per 100 ms epoch would exceed the line rate). At the 9600/5 Hz
-     fallback there is no headroom at all → explicit 0, which also covers a
-     factory-fresh module that boots with GSV at every epoch. */
-  g_gsv_rate = (locked_baud == GPS_UART_BAUDRATE) ? 10 : 0;
-  uint8_t gsv_p[3] = { 0xF0, 0x03, g_gsv_rate };
-  int gsv_rc = ubx_send_retry(0x06, 0x01, gsv_p, sizeof(gsv_p), 3);
-  ErrLog_Writef("gps: cfg-msg gsv rate=%u %s",
-                (unsigned)g_gsv_rate, (gsv_rc == 0) ? "ACK" : "FAIL");
-
-  /* CFG-CFG-SAVE — persist baud + rate + msg config to BBR + Flash +
-     EEPROM so the next boot starts at the configured baud and Build #44's
-     listen-first lock happens on the first try (no 1.5 s fallback). */
-  uint8_t save_p[13] = {0};
-  save_p[4] = 0xFF; save_p[5] = 0xFF;
-  save_p[12] = 0x17;
-  int save_rc = ubx_send_retry(0x06, 0x09, save_p, sizeof(save_p), 3);
-  ErrLog_Writef("gps: cfg-cfg-save %s", (save_rc == 0) ? "ACK" : "FAIL");
-
-  /* Remember the locked baud for the BLE bridge's $PUBX,41 reconfigure. */
-  g_locked_baud = locked_baud;
+  g_locked_baud = final_baud;
 
   /* RX IRQ stays armed across all the listen/ack calls. */
-  ErrLog_Writef("gps: ready @%lu baud, rate=%luHz",
-                (unsigned long)locked_baud,
-                (unsigned long)(1000U / meas_ms));
+  ErrLog_Writef("gps: ready @%lu baud, nav=%luHz, %s%s",
+                (unsigned long)final_baud,
+                (unsigned long)(1000U / meas_ms),
+                (pvt_rc == 0) ? "UBX NAV-PVT" : "NMEA fallback",
+                (fails > 0) ? " (config incomplete)" : "");
 
   /* Apply the persisted GPS-power choice. If the user turned GPS off to save
      battery, drop the just-configured module straight into backup mode (its
-     config is now saved in BBR, so a later wake resumes cleanly). */
+     RAM config survives software backup, so a later wake resumes cleanly). */
   if (GPS_GetPower() == 0) {
     gps_pmreq_backup();
     g_latest.valid = 0;
@@ -866,12 +1056,13 @@ int GPS_SetPower(int on)
   g_power = on;
 
   if (on) {
-    /* Wake only if it was actually asleep. Config is retained in BBR, so a
-       wake resumes NMEA at the locked baud with no reconfigure. */
+    /* Wake only if it was actually asleep. The RAM config survives software
+       backup, so a wake resumes UBX at the locked baud with no reconfigure. */
     if (was == 0) {
       gps_wake_pulse();
-      int nl = listen_newlines(1000);
-      ErrLog_Writef("gps: power ON (wake, %d newlines)", nl);
+      int nl = 0, ux = 0;
+      listen_traffic(1000, &nl, &ux);
+      ErrLog_Writef("gps: power ON (wake, nmea=%d ubx=%d)", nl, ux);
     } else {
       ErrLog_Write("gps: power ON (already on)");
     }
@@ -925,13 +1116,15 @@ void GPS_Tick(void)
     return;
   }
 
-  /* Drain the IRQ-filled ring buffer through the NMEA parser. While the BLE
-     survey bridge is active, the same bytes also feed the UBX frame
-     extractor so poll replies get relayed — NMEA logging is unaffected. */
+  /* Drain the IRQ-filled ring buffer through the protocol router (UBX frames
+     → NAV-PVT/NAV-SAT parsers; everything else → NMEA line assembler for the
+     fallback mode). While the BLE survey bridge is active, the same bytes
+     also feed the UBX frame extractor so poll replies get relayed — the
+     local parsing is unaffected. */
   while (g_rx_head != g_rx_tail) {
     uint8_t b = g_rx_ring[g_rx_tail];
     g_rx_tail = (uint16_t)((g_rx_tail + 1u) % GPS_RX_RING_SIZE);
-    process_byte(b);
+    gps_rx_byte(b);
     if (g_bridge) bridge_capture(b);
     g_diag_bytes++;
   }
