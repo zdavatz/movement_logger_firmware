@@ -498,7 +498,36 @@ Three coupled changes (`Src/gps.c`):
 
 Bumped `PL_FW_VERSION` → **0.0.38** (`Inc/config.h`).
 
+## GPS config order: baud FIRST (v0.0.42+) — `gps.c`
+
+**Peter, 2026-07-13:** *"Die Baudrate als ersten Schritt auf 230400 erhöhen. Mit
+9600 kollabiert die gesamte Kommunikation wenn mit den Folgebefehlen die
+Datenrate erhöht wird."* v0.0.41 (below) put the `CFG-UART1-BAUDRATE` switch at
+**step 6**, so constellations / power-mode / UBX-output all ran at **9600 while
+the module was still streaming its factory NMEA**. 9600 = 960 B/s and default
+NMEA eats most of it; step 4 then piles NAV-PVT-every-epoch + NAV-SAT on top.
+The module's TX backs up, its ACKs miss the 300 ms `ubx_send_retry` budget, and
+every later command reports FAIL — the "collapse" Peter saw.
+
+**v0.0.42 order** (`GPS_Init`, `Src/gps.c`): baud-detect → **1. baud → 230400**
+→ 2. CFG-SIGNAL → 3. CFG-PM-OPERATEMODE → 4. UBX out (INPROT/OUTPROT + MSGOUT
+PVT=1/SAT=10) → 5. NMEA off → 6. CFG-RATE 10 Hz. The baud VALSET is now the
+*only* command sent on the slow line — a single ~36 B frame, which even a
+saturated 9600 link delivers. Everything after it has 23 kB/s of headroom, so
+**no command can starve its own ACK**. The ACK-arrives-at-the-new-baud handling
+(re-init local UART right after the command drains, MON-VER poll as fallback
+confirmation, revert to `locked_baud` if unconfirmed) is unchanged — it just
+moved. Same reasoning now governs the fallback: if the baud switch fails, the
+nav rate stays at **1 Hz** (was 5 Hz — ~52 % of a 960 B/s line for NAV-PVT alone
+before NAV-SAT). New errlog line: `gps: cfg baud 230400 ACK (step 1)`.
+
+**Don't move the baud switch back down the list** — that's the whole bug.
+
 ## GPS UBX-native at 230400, GPS+Galileo only (v0.0.41+) — `gps.c`
+
+> **Command order superseded by v0.0.42** (above): the baud switch moved from
+> last to first. The recipe's *content* (GPS+Galileo only, full power, UBX
+> NAV-PVT/NAV-SAT, NMEA off, 230400, RAM-layer-only, ACK-verified) is unchanged.
 
 **Peter's per-boot config recipe (2026-07-13), verified in u-center 2 over a
 USB-UART adapter**: GPS + Galileo only (BeiDou/GLONASS off), full power, UBX
@@ -514,15 +543,14 @@ Authoritative sequence + rationale: **DESIGN.md → "GPS module configuration
 
 - **Boot flow (`GPS_Init`)**: listen-first baud detect (9600 cold-boot →
   230400 MCU-only reset → 38400 pre-v0.0.41 leftover; UBX syncs count as
-  traffic, not just NMEA newlines) → CFG-SIGNAL (9 keys, one VALSET, then
-  500 ms settle) → CFG-PM-OPERATEMODE=0 → INPROT/OUTPROT-UBX=1 + MSGOUT
-  PVT=1/SAT=10 (UBX *out* is OFF in the M10 factory default — without this
-  key PVT never flows) → NMEA MSGOUT all 0 (only if the UBX step ACK'd, so a
-  partial failure can't mute the module) → CFG-UART1-BAUDRATE=230400 with the
-  local UART re-inited immediately (the ACK arrives at the NEW baud; MON-VER
-  poll as fallback confirmation) → CFG-RATE 100 ms/1. The nav rate comes
-  AFTER the baud switch (deliberate reorder vs Peter's list: 10 Hz output at
-  9600 would oversubscribe the module TX and drown the ACKs).
+  traffic, not just NMEA newlines) → **CFG-UART1-BAUDRATE=230400 first**
+  (v0.0.42 — see the section above; local UART re-inited immediately because
+  the ACK arrives at the NEW baud, MON-VER poll as fallback confirmation) →
+  CFG-SIGNAL (9 keys, one VALSET, then 500 ms settle) → CFG-PM-OPERATEMODE=0
+  → INPROT/OUTPROT-UBX=1 + MSGOUT PVT=1/SAT=10 (UBX *out* is OFF in the M10
+  factory default — without this key PVT never flows) → NMEA MSGOUT all 0
+  (only if the UBX step ACK'd, so a partial failure can't mute the module) →
+  CFG-RATE 100 ms/1.
 - **Parser** (`gps_rx_byte`): protocol router — UBX frames (Fletcher-checked,
   `parse_nav_pvt`/`parse_nav_sat`) + the old NMEA line assembler as fallback.
   `fix_q` is mapped to the NMEA-GGA scale (1 = valid fix) for host compat;

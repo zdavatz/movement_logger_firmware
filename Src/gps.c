@@ -878,67 +878,26 @@ int GPS_Init(void)
   /* From here on we have a confirmed baud + working RX. Peter's per-boot
      config (2026-07-13), RAM layer only, every command ACK-verified with
      3 retries; every un-ACK'd command leaves a *** errlog entry (vs_send).
-     Order: constellations → power mode → UBX output → NMEA off → baud last
-     (its ACK arrives at the new baud) → nav rate. The rate is set AFTER the
-     baud, deviating from Peter's list on purpose: 10 Hz output at 9600 would
-     oversubscribe the module TX and drown the remaining ACKs; nothing else
-     depends on the order, the config is complete before logging starts. */
+
+     Order: BAUD FIRST, then everything else on the fast line.
+     Peter (2026-07-13): "Die Baudrate als ersten Schritt auf 230400 erhöhen.
+     Mit 9600 kollabiert die gesamte Kommunikation wenn mit den Folgebefehlen
+     die Datenrate erhöht wird."  A cold boot finds the module at factory 9600
+     already streaming its default NMEA — most of a 960 B/s line. The v0.0.41
+     order configured constellations / power / UBX-output on top of THAT, so
+     enabling NAV-PVT-every-epoch + NAV-SAT while NMEA was still running
+     oversubscribed the module's TX: its ACKs missed the 300 ms budget and
+     every subsequent command reported FAIL. Raising the baud first buys
+     23 kB/s of headroom, so no later command can starve its own ACK. */
   int fails = 0;
 
-  /* 1. Constellations: GPS + Galileo on, BeiDou + GLONASS off. */
-  vs_begin();
-  vs_u1(CFG_SIGNAL_GPS_ENA,      1);
-  vs_u1(CFG_SIGNAL_GPS_L1CA_ENA, 1);
-  vs_u1(CFG_SIGNAL_GAL_ENA,      1);
-  vs_u1(CFG_SIGNAL_GAL_E1_ENA,   1);
-  vs_u1(CFG_SIGNAL_BDS_ENA,      0);
-  vs_u1(CFG_SIGNAL_BDS_B1_ENA,   0);
-  vs_u1(CFG_SIGNAL_BDS_B1C_ENA,  0);
-  vs_u1(CFG_SIGNAL_GLO_ENA,      0);
-  vs_u1(CFG_SIGNAL_GLO_L1_ENA,   0);
-  fails += vs_send("signal GPS+GAL -BDS -GLO");
-  HAL_Delay(500);   /* the receiver restarts its GNSS subsystem on a
-                       constellation change — give it a moment before the
-                       next command (u-blox M10 integration manual) */
-
-  /* 2. Full-power mode (no power-save duty cycling). */
-  vs_begin();
-  vs_u1(CFG_PM_OPERATEMODE, 0);
-  fails += vs_send("pm full-power");
-
-  /* 3. UBX protocol + periodic output: NAV-PVT every epoch, NAV-SAT every
-     10th. In/out protocol enables included — UBX *output* is off in the
-     M10 factory default, and after a power cut that default is what we get. */
-  vs_begin();
-  vs_u1(CFG_UART1INPROT_UBX,             1);
-  vs_u1(CFG_UART1OUTPROT_UBX,            1);
-  vs_u1(CFG_MSGOUT_UBX_NAV_PVT_UART1,    1);
-  vs_u1(CFG_MSGOUT_UBX_NAV_SAT_UART1,   10);
-  int pvt_rc = vs_send("ubx out pvt=1 sat=10");
-  fails += pvt_rc;
-
-  /* 4. Silence NMEA — but only once the UBX feed is confirmed, so a partial
-     failure can never leave the module emitting nothing at all. */
-  if (pvt_rc == 0) {
-    vs_begin();
-    vs_u1(CFG_MSGOUT_NMEA_GGA_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_RMC_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_GSV_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_GSA_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_VTG_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_GLL_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_ZDA_UART1, 0);
-    fails += vs_send("nmea off");
-  } else {
-    ErrLog_Write("gps: keeping NMEA (ubx out not ACK'd) — fallback parser active");
-  }
-
-  /* 5. Baud → 230400, the LAST reconfiguration on the old baud. The module
-     applies it immediately, so the ACK arrives at the NEW baud — switch the
-     local UART right after the command drains (HAL_UART_Transmit blocks
-     until transmission complete), then wait for the ACK there. If the ACK
-     was lost in the transition, a MON-VER poll settles whether the module
-     really moved. */
+  /* 1. Baud → 230400. The ONLY reconfiguration done on the slow line, and
+     deliberately the first: it is a single ~36 B VALSET, which even a
+     saturated 9600 link delivers. The module applies it immediately, so the
+     ACK comes back at the NEW baud — switch the local UART right after the
+     command drains (HAL_UART_Transmit blocks until transmission complete),
+     then wait for the ACK there. If the ACK was lost in the transition, a
+     MON-VER poll settles whether the module really moved. */
   uint32_t final_baud = locked_baud;
   if (locked_baud != GPS_UART_BAUDRATE) {
     vs_begin();
@@ -962,7 +921,8 @@ int GPS_Init(void)
     }
     if (confirmed) {
       final_baud = GPS_UART_BAUDRATE;
-      ErrLog_Writef("gps: cfg baud %lu ACK", (unsigned long)GPS_UART_BAUDRATE);
+      ErrLog_Writef("gps: cfg baud %lu ACK (step 1)",
+                    (unsigned long)GPS_UART_BAUDRATE);
     } else {
       fails++;
       ErrLog_Writef("*** gps: cfg baud %lu NOT confirmed — staying @%lu ***",
@@ -978,13 +938,69 @@ int GPS_Init(void)
                                      | UART_CLEAR_FEF  | UART_CLEAR_PEF);
       listen_traffic(200, NULL, NULL);        /* re-arm IRQ */
     }
+  } else {
+    ErrLog_Writef("gps: already @%lu — no baud change needed",
+                  (unsigned long)locked_baud);
   }
 
-  /* 6. Nav rate — 10 Hz on the fast line; a conservative 5 Hz if we're stuck
-     on a slow one (10 Hz UBX would saturate 9600 baud). */
+  /* 2. Constellations: GPS + Galileo on, BeiDou + GLONASS off. */
+  vs_begin();
+  vs_u1(CFG_SIGNAL_GPS_ENA,      1);
+  vs_u1(CFG_SIGNAL_GPS_L1CA_ENA, 1);
+  vs_u1(CFG_SIGNAL_GAL_ENA,      1);
+  vs_u1(CFG_SIGNAL_GAL_E1_ENA,   1);
+  vs_u1(CFG_SIGNAL_BDS_ENA,      0);
+  vs_u1(CFG_SIGNAL_BDS_B1_ENA,   0);
+  vs_u1(CFG_SIGNAL_BDS_B1C_ENA,  0);
+  vs_u1(CFG_SIGNAL_GLO_ENA,      0);
+  vs_u1(CFG_SIGNAL_GLO_L1_ENA,   0);
+  fails += vs_send("signal GPS+GAL -BDS -GLO");
+  HAL_Delay(500);   /* the receiver restarts its GNSS subsystem on a
+                       constellation change — give it a moment before the
+                       next command (u-blox M10 integration manual) */
+
+  /* 3. Full-power mode (no power-save duty cycling). */
+  vs_begin();
+  vs_u1(CFG_PM_OPERATEMODE, 0);
+  fails += vs_send("pm full-power");
+
+  /* 4. UBX protocol + periodic output: NAV-PVT every epoch, NAV-SAT every
+     10th. In/out protocol enables included — UBX *output* is off in the
+     M10 factory default, and after a power cut that default is what we get.
+     Safe to enable now: we are on the 230400 line, so the added output
+     cannot back up the module's TX and drown the ACKs (Peter, step-1 note). */
+  vs_begin();
+  vs_u1(CFG_UART1INPROT_UBX,             1);
+  vs_u1(CFG_UART1OUTPROT_UBX,            1);
+  vs_u1(CFG_MSGOUT_UBX_NAV_PVT_UART1,    1);
+  vs_u1(CFG_MSGOUT_UBX_NAV_SAT_UART1,   10);
+  int pvt_rc = vs_send("ubx out pvt=1 sat=10");
+  fails += pvt_rc;
+
+  /* 5. Silence NMEA — but only once the UBX feed is confirmed, so a partial
+     failure can never leave the module emitting nothing at all. */
+  if (pvt_rc == 0) {
+    vs_begin();
+    vs_u1(CFG_MSGOUT_NMEA_GGA_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_RMC_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GSV_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GSA_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_VTG_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GLL_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_ZDA_UART1, 0);
+    fails += vs_send("nmea off");
+  } else {
+    ErrLog_Write("gps: keeping NMEA (ubx out not ACK'd) — fallback parser active");
+  }
+
+  /* 6. Nav rate — 10 Hz on the fast line. If step 1 failed we are still on
+     the slow one: stay at 1 Hz there. Peter's rule applies to us too — a
+     raised nav rate at 9600 is exactly what collapses the link, and 5 Hz
+     NAV-PVT alone is ~52 % of a 960 B/s line before NAV-SAT. 1 Hz keeps the
+     degraded path readable instead of trading it for garbage. */
   uint16_t meas_ms = (final_baud == GPS_UART_BAUDRATE)
                        ? (uint16_t)(1000U / GPS_RATE_HZ)   /* 100 ms = 10 Hz */
-                       : 200U;                             /* 5 Hz */
+                       : 1000U;                            /* 1 Hz, slow line */
   vs_begin();
   vs_u2(CFG_RATE_MEAS, meas_ms);
   vs_u2(CFG_RATE_NAV,  1);

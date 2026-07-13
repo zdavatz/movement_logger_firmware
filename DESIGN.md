@@ -552,7 +552,7 @@ NMEA-compatible:
   fallback). Between bursts the parser holds the last committed value
   and decays to 0 ("no data") after 3 s of silence.
 
-### GPS module configuration (v0.0.41+)
+### GPS module configuration (v0.0.42+ — baud first)
 
 The u-blox MAX-M10S is configured **on every boot, RAM layer only**
 (UBX-CFG-VALSET; the M10 never ACKs the legacy CFG-CFG save — verified
@@ -561,9 +561,14 @@ cold-starts at factory 9600 baud NMEA). Recipe from Peter's u-center
 verification (2026-07-13; 15 sats used / 3D fix at ~40 % sky view where
 the 4-constellation default never fixed):
 
-1. **Baud detect** (listen-first, NMEA newlines *or* UBX syncs count):
+0. **Baud detect** (listen-first, NMEA newlines *or* UBX syncs count):
    9600 (cold boot) → 230400 (MCU-only reset, module still on this
    session's config) → 38400 (module left by pre-v0.0.41 firmware).
+1. **CFG-UART1-BAUDRATE = 230400 — FIRST.** The only reconfiguration
+   done on the slow line. The ACK arrives at the **new** baud, so the
+   local UART is re-inited immediately after the command drains, with a
+   MON-VER poll as fallback confirmation. (115200 loses data — Peter
+   measured it; 230400 is the tested rate.)
 2. **CFG-SIGNAL**: GPS + Galileo *on*, BeiDou + GLONASS *off* (one
    VALSET, 9 keys), then 500 ms settle (GNSS subsystem restarts).
 3. **CFG-PM-OPERATEMODE = 0** (full power).
@@ -572,14 +577,21 @@ the 4-constellation default never fixed):
    `MSGOUT-UBX_NAV_SAT_UART1 = 10`.
 5. **NMEA silenced** (GGA/RMC/GSV/GSA/VTG/GLL/ZDA rates → 0) — only
    after step 4 ACK'd, so a partial failure never leaves the module mute.
-6. **CFG-UART1-BAUDRATE = 230400** — deliberately the *last* command on
-   the old baud (Peter measured data loss at 115200; the ACK arrives at
-   the **new** baud, so the local UART is re-inited immediately after
-   the command drains, with a MON-VER poll as fallback confirmation).
-7. **CFG-RATE**: measRate 100 ms / navRate 1 (10 Hz). Set *after* the
-   baud switch — 10 Hz output at 9600 would oversubscribe the module TX
-   and drown the ACKs (the one deliberate reorder vs. Peter's list).
-   Falls back to 5 Hz if the box is stuck on a slow line.
+6. **CFG-RATE**: measRate 100 ms / navRate 1 (10 Hz). Falls back to
+   **1 Hz** if step 1 failed and the box is stuck on a slow line.
+
+**Why baud first (changed in v0.0.42).** Peter, 2026-07-13: *"Die
+Baudrate als ersten Schritt auf 230400 erhöhen. Mit 9600 kollabiert die
+gesamte Kommunikation wenn mit den Folgebefehlen die Datenrate erhöht
+wird."* v0.0.41 put the baud switch at step 6, so steps 2-5 ran at 9600
+**while the module was still streaming its factory NMEA** — and step 4
+adds NAV-PVT-every-epoch + NAV-SAT on top of that. 9600 baud is 960 B/s;
+default NMEA alone eats most of it. The module's TX backs up, its ACKs
+miss the 300 ms `ubx_send_retry` budget, and every later command reports
+FAIL — the observed "collapse". Raising the baud first buys 23 kB/s of
+headroom, so **no later command can starve its own ACK**. Same reasoning
+now governs the step-6 fallback: on a slow line the nav rate stays at
+1 Hz (5 Hz NAV-PVT alone is ~52 % of a 960 B/s line before NAV-SAT).
 
 Every command is ACK-verified (3 retries); **every un-ACK'd command
 writes a `***` errlog entry** (Peter's rule — it also latches the red
