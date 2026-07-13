@@ -498,6 +498,40 @@ Three coupled changes (`Src/gps.c`):
 
 Bumped `PL_FW_VERSION` → **0.0.38** (`Inc/config.h`).
 
+## GPS: no baud scan — assume 9600, then confirm (v0.0.43+) — `gps.c`
+
+**Peter, 2026-07-13:** *"Es braucht keinen Baudratentest am Anfang. Nach dem
+Booten ist es immer 9600 Baud."* Correct for a **cold boot** — the hall switch
+cuts the whole rail, the module returns to its factory 9600 NMEA default, and
+nothing we write ever persists (the M10 never ACKs the legacy CFG-CFG save).
+
+**But there is exactly one case where it is NOT 9600, and it matters:** no MCU
+pin switches the GPS supply (grep — there is none; GPS-off is software-only,
+`UBX-RXM-PMREQ` backup). On an **MCU-only reset** — FOTA's `SWAP_BANK` reboot,
+an IWDG reset, a software reset — the module keeps its power **and this
+session's RAM config**, so it is still at **230400**. FOTA is the primary
+update path, so assuming 9600 unconditionally would leave the GPS **dead after
+every wireless firmware update** until someone power-cycles with the magnet.
+
+**Resolution — confirm, don't scan.** `GPS_Init` drops the listen-first baud
+scan entirely (saves ~1.5 s on every cold boot). It opens the UART at 9600,
+wake-pulses, sends `CFG-UART1-BAUDRATE=230400` **blind**, re-opens locally at
+230400, and then *confirms*. That single confirm covers both worlds for free:
+
+- module **@9600** → it accepted the command → the **ACK** arrives at 230400.
+- module **@230400** → it saw our 9600 bytes as framing garbage and dropped them
+  (UBX checksums make a false positive impossible), but the **MON-VER poll** we
+  then send at 230400 gets a reply → `gps: already @230400 (MCU-only reset)`.
+
+Only if **neither** confirms does a real probe run (38400 = module left by
+pre-v0.0.41 firmware; 9600 again = alive but ignoring us), and the raise is
+retried from wherever it actually is → `*** gps: baud fallback — module @… ***`.
+
+`gps_uart_reopen(baud)` is the shared helper for every baud transition
+(DeInit → init → `OVRDIS` → clear flags → empty ring).
+
+**Don't "simplify" this to a bare 9600 assumption** — that silently breaks FOTA.
+
 ## GPS config order: baud FIRST (v0.0.42+) — `gps.c`
 
 **Peter, 2026-07-13:** *"Die Baudrate als ersten Schritt auf 230400 erhöhen. Mit

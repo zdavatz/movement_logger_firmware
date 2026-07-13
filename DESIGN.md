@@ -561,14 +561,30 @@ cold-starts at factory 9600 baud NMEA). Recipe from Peter's u-center
 verification (2026-07-13; 15 sats used / 3D fix at ~40 % sky view where
 the 4-constellation default never fixed):
 
-0. **Baud detect** (listen-first, NMEA newlines *or* UBX syncs count):
-   9600 (cold boot) → 230400 (MCU-only reset, module still on this
-   session's config) → 38400 (module left by pre-v0.0.41 firmware).
-1. **CFG-UART1-BAUDRATE = 230400 — FIRST.** The only reconfiguration
+1. **CFG-UART1-BAUDRATE = 230400 — FIRST, and sent blind at 9600.**
+   No baud scan (Peter: *"Es braucht keinen Baudratentest am Anfang.
+   Nach dem Booten ist es immer 9600 Baud."*). The only reconfiguration
    done on the slow line. The ACK arrives at the **new** baud, so the
-   local UART is re-inited immediately after the command drains, with a
-   MON-VER poll as fallback confirmation. (115200 loses data — Peter
-   measured it; 230400 is the tested rate.)
+   local UART is re-opened at 230400 immediately after the command
+   drains. (115200 loses data — Peter measured it; 230400 is tested.)
+
+   **Confirm, don't scan.** The confirm step covers both boot worlds:
+   - module @9600 (cold boot) → accepts the command; ACK lands at 230400.
+   - module @230400 (**MCU-only reset**: FOTA `SWAP_BANK` reboot, IWDG,
+     software reset) → drops our 9600 bytes as framing garbage (UBX
+     checksums make a false positive impossible), but answers the
+     **MON-VER poll** we then send at 230400 → *already there*.
+
+   This case is not optional: **no MCU pin switches the GPS supply**
+   (GPS-off is software only — UBX-RXM-PMREQ backup), so an MCU-only
+   reset leaves the module powered and still on this session's RAM
+   config. Assuming 9600 unconditionally would kill the GPS after every
+   FOTA update until a magnet power-cycle.
+
+   Only if *neither* confirms does a real probe run (38400 = left by
+   pre-v0.0.41 firmware; 9600 again = alive but ignoring us), then the
+   raise is retried from wherever the module actually is. Logged as
+   `*** gps: baud fallback — module @<baud> ***`.
 2. **CFG-SIGNAL**: GPS + Galileo *on*, BeiDou + GLONASS *off* (one
    VALSET, 9 keys), then 500 ms settle (GNSS subsystem restarts).
 3. **CFG-PM-OPERATEMODE = 0** (full power).

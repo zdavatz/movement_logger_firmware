@@ -670,6 +670,21 @@ static int uart4_init_at(uint32_t baud)
   return (HAL_UART_Init(&g_huart4) == HAL_OK) ? 0 : -1;
 }
 
+/* Re-open UART4 at `baud`: tear down whatever is configured, re-init, disable
+   the overrun error (we drain a ring by polling — a dropped byte must not park
+   the peripheral in an error state), clear stale flags, and empty the ring.
+   Every baud transition in GPS_Init goes through here. */
+static int gps_uart_reopen(uint32_t baud)
+{
+  if (g_huart4.Instance != NULL) HAL_UART_DeInit(&g_huart4);
+  if (uart4_init_at(baud) != 0) return -1;
+  g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
+  __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
+                                 | UART_CLEAR_FEF  | UART_CLEAR_PEF);
+  g_rx_head = g_rx_tail = 0;
+  return 0;
+}
+
 /* Listen for `ms_window` milliseconds and count the NMEA newlines ('\n') and
    UBX frame syncs (0xB5 0x62 pairs) that land in the ring. Used by GPS_Init
    to verify that the currently-configured UART baud matches the module's
@@ -833,114 +848,119 @@ int GPS_Init(void)
   HAL_NVIC_SetPriority(UART4_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(UART4_IRQn);
 
-  /* Listen-first baud detection. Cold power-up (the normal case — the hall
-     switch cuts the whole rail) always finds the module at factory 9600
-     streaming default NMEA; nothing we configure persists (the M10 never
-     ACKs the legacy CFG-CFG save, verified across 15 field boots). 230400
-     covers an MCU-only reset (IWDG/FOTA) with the module still on this
-     session's RAM config (UBX traffic, no NMEA). 38400 covers a module left
-     configured by pre-v0.0.41 firmware across an MCU-only reset. Deliberately
-     NO blind config attempt when nothing is heard — a dead RX line makes the
-     module useless regardless (we could never read its data). */
-  static const uint32_t cands[3] = { 9600U, GPS_UART_BAUDRATE, 38400U };
-  uint32_t locked_baud = 0;
-  for (int i = 0; i < 3; i++) {
-    if (g_huart4.Instance != NULL) HAL_UART_DeInit(&g_huart4);
-    if (uart4_init_at(cands[i]) != 0) {
-      ErrLog_Writef("gps: uart_init@%lu FAIL", (unsigned long)cands[i]);
-      return -1;
-    }
-    g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
-    __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
-                                   | UART_CLEAR_FEF  | UART_CLEAR_PEF);
-    /* Wake pulse before the first listen: if the module was left in backup by
-       a previous persisted-OFF session and its VCC survived an MCU-only reset,
-       it would be asleep and emit nothing — baud detection would then fail.
-       A short junk burst wakes it (harmless when already awake). */
-    if (i == 0) gps_wake_pulse();
-    int nl = 0, ux = 0;
-    int hits = listen_traffic(1500, &nl, &ux);
-    if (hits >= 2) {
-      locked_baud = cands[i];
-      ErrLog_Writef("gps: locked @%lu (nmea=%d ubx=%d in 1500ms)",
-                    (unsigned long)cands[i], nl, ux);
-      break;
-    }
-    ErrLog_Writef("gps: silent @%lu (nmea=%d ubx=%d)",
-                  (unsigned long)cands[i], nl, ux);
+  /* Peter's per-boot config (2026-07-13), RAM layer only, every command
+     ACK-verified with 3 retries; every un-ACK'd command leaves a *** errlog
+     entry (vs_send). Order: BAUD FIRST, then everything else on the fast line
+     — v0.0.41 raised the baud last, so constellations / power / UBX-output all
+     ran at 9600 while the module was still streaming its factory NMEA (960 B/s,
+     mostly consumed). Adding NAV-PVT-every-epoch + NAV-SAT on top backed up the
+     module's TX, its ACKs missed the 300 ms budget, and every later command
+     reported FAIL. Raising the baud first buys 23 kB/s of headroom, so no
+     command can starve its own ACK. */
+  int fails = 0;
+
+  /* 1. Baud → 230400, assuming 9600. No baud scan.
+     Peter (2026-07-13): "Es braucht keinen Baudratentest am Anfang. Nach dem
+     Booten ist es immer 9600 Baud." Right for a cold boot — the hall switch
+     cuts the whole rail, the module comes back at its factory 9600 NMEA
+     default, and nothing we write ever persists (the M10 never ACKs the legacy
+     CFG-CFG save, verified across 15 field boots).
+
+     But NO MCU pin switches the GPS supply — GPS-off is software only
+     (UBX-RXM-PMREQ backup). So on an MCU-only reset (FOTA's SWAP_BANK reboot,
+     an IWDG reset, a software reset) the module keeps its power AND this
+     session's RAM config: it is still at 230400. FOTA is the primary update
+     path, so assuming 9600 *unconditionally* would leave the GPS dead after
+     every wireless update until someone power-cycles with the magnet.
+
+     Resolution: assume 9600 and send the baud command blind (no listen window
+     — that is Peter's ask, and it saves 1.5 s on every cold boot), then CONFIRM
+     at 230400. The confirm covers both worlds for free:
+       - module @9600   → it accepts the command; the ACK arrives at 230400.
+       - module @230400 → it sees our 9600 bytes as framing garbage and drops
+                          them (UBX checksums make a false positive impossible),
+                          but the MON-VER poll we then send at 230400 answers.
+     Only if NEITHER confirms do we fall back to a real probe. */
+  if (gps_uart_reopen(9600) != 0) {
+    ErrLog_Write("gps: uart_init@9600 FAIL");
+    return -1;
   }
-  if (locked_baud == 0) {
-    ErrLog_Write("*** GPS: no baud lock — silent at 9600/230400/38400 ***");
-    ErrLog_Write("*** check module supply + RX wiring (JP2 pin 13/14) ***");
+  /* A module parked in PMREQ backup by a persisted-OFF session (its VCC
+     survived an MCU-only reset) is asleep and would ignore the command. The
+     junk burst wakes it; harmless when it is already awake. */
+  gps_wake_pulse();
+
+  vs_begin();
+  vs_u4(CFG_UART1_BAUDRATE, GPS_UART_BAUDRATE);
+  ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);        /* blind, at 9600 */
+
+  if (gps_uart_reopen(GPS_UART_BAUDRATE) != 0) {
+    ErrLog_Write("gps: uart_reinit@230400 FAIL");
     return -1;
   }
 
-  /* From here on we have a confirmed baud + working RX. Peter's per-boot
-     config (2026-07-13), RAM layer only, every command ACK-verified with
-     3 retries; every un-ACK'd command leaves a *** errlog entry (vs_send).
+  uint32_t final_baud = 0;
+  if (ubx_wait_ack(0x06, 0x8A, 700) == 0) {
+    final_baud = GPS_UART_BAUDRATE;
+    ErrLog_Writef("gps: cfg baud %lu ACK (from 9600)",
+                  (unsigned long)GPS_UART_BAUDRATE);
+  } else {
+    ubx_send(0x0A, 0x04, NULL, 0);                 /* MON-VER poll */
+    int ux = 0;
+    listen_traffic(400, NULL, &ux);
+    if (ux > 0) {
+      final_baud = GPS_UART_BAUDRATE;
+      ErrLog_Write("gps: already @230400 (MCU-only reset) — baud step skipped");
+    }
+  }
 
-     Order: BAUD FIRST, then everything else on the fast line.
-     Peter (2026-07-13): "Die Baudrate als ersten Schritt auf 230400 erhöhen.
-     Mit 9600 kollabiert die gesamte Kommunikation wenn mit den Folgebefehlen
-     die Datenrate erhöht wird."  A cold boot finds the module at factory 9600
-     already streaming its default NMEA — most of a 960 B/s line. The v0.0.41
-     order configured constellations / power / UBX-output on top of THAT, so
-     enabling NAV-PVT-every-epoch + NAV-SAT while NMEA was still running
-     oversubscribed the module's TX: its ACKs missed the 300 ms budget and
-     every subsequent command reported FAIL. Raising the baud first buys
-     23 kB/s of headroom, so no later command can starve its own ACK. */
-  int fails = 0;
+  /* Last resort: the module answered at neither 9600 nor 230400. Probe the
+     remaining plausible rates (38400 = left by pre-v0.0.41 firmware; 9600
+     again = it is alive but ignored our command, e.g. a half-dead TX line),
+     then retry the raise from wherever it actually is. */
+  if (final_baud == 0) {
+    static const uint32_t cands[2] = { 38400U, 9600U };
+    uint32_t found = 0;
+    for (int i = 0; i < 2 && found == 0; i++) {
+      if (gps_uart_reopen(cands[i]) != 0) {
+        ErrLog_Writef("gps: uart_init@%lu FAIL", (unsigned long)cands[i]);
+        return -1;
+      }
+      int nl = 0, ux = 0;
+      if (listen_traffic(1500, &nl, &ux) >= 2) {
+        found = cands[i];
+        ErrLog_Writef("*** gps: baud fallback — module @%lu (nmea=%d ubx=%d) ***",
+                      (unsigned long)found, nl, ux);
+      }
+    }
+    if (found == 0) {
+      ErrLog_Write("*** GPS: no baud lock — silent at 9600/230400/38400 ***");
+      ErrLog_Write("*** check module supply + RX wiring (JP2 pin 13/14) ***");
+      return -1;
+    }
 
-  /* 1. Baud → 230400. The ONLY reconfiguration done on the slow line, and
-     deliberately the first: it is a single ~36 B VALSET, which even a
-     saturated 9600 link delivers. The module applies it immediately, so the
-     ACK comes back at the NEW baud — switch the local UART right after the
-     command drains (HAL_UART_Transmit blocks until transmission complete),
-     then wait for the ACK there. If the ACK was lost in the transition, a
-     MON-VER poll settles whether the module really moved. */
-  uint32_t final_baud = locked_baud;
-  if (locked_baud != GPS_UART_BAUDRATE) {
     vs_begin();
     vs_u4(CFG_UART1_BAUDRATE, GPS_UART_BAUDRATE);
     ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);
-    HAL_UART_DeInit(&g_huart4);
-    if (uart4_init_at(GPS_UART_BAUDRATE) != 0) {
+    if (gps_uart_reopen(GPS_UART_BAUDRATE) != 0) {
       ErrLog_Write("gps: uart_reinit@230400 FAIL");
       return -1;
     }
-    g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
-    __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
-                                   | UART_CLEAR_FEF  | UART_CLEAR_PEF);
-    g_rx_head = g_rx_tail = 0;
-    int confirmed = (ubx_wait_ack(0x06, 0x8A, 700) == 0);
-    if (!confirmed) {
-      ubx_send(0x0A, 0x04, NULL, 0);          /* MON-VER poll */
-      int ux = 0;
-      listen_traffic(400, NULL, &ux);
-      confirmed = (ux > 0);
-    }
-    if (confirmed) {
+    if (ubx_wait_ack(0x06, 0x8A, 700) == 0) {
       final_baud = GPS_UART_BAUDRATE;
-      ErrLog_Writef("gps: cfg baud %lu ACK (step 1)",
-                    (unsigned long)GPS_UART_BAUDRATE);
+      ErrLog_Writef("gps: cfg baud %lu ACK (from %lu)",
+                    (unsigned long)GPS_UART_BAUDRATE, (unsigned long)found);
     } else {
       fails++;
+      final_baud = found;
       ErrLog_Writef("*** gps: cfg baud %lu NOT confirmed — staying @%lu ***",
-                    (unsigned long)GPS_UART_BAUDRATE,
-                    (unsigned long)locked_baud);
-      HAL_UART_DeInit(&g_huart4);
-      if (uart4_init_at(locked_baud) != 0) {
-        ErrLog_Write("gps: uart_reinit@locked FAIL");
+                    (unsigned long)GPS_UART_BAUDRATE, (unsigned long)found);
+      if (gps_uart_reopen(found) != 0) {
+        ErrLog_Write("gps: uart_reinit@fallback FAIL");
         return -1;
       }
-      g_huart4.Instance->CR3 |= USART_CR3_OVRDIS;
-      __HAL_UART_CLEAR_FLAG(&g_huart4, UART_CLEAR_OREF | UART_CLEAR_NEF
-                                     | UART_CLEAR_FEF  | UART_CLEAR_PEF);
-      listen_traffic(200, NULL, NULL);        /* re-arm IRQ */
+      listen_traffic(200, NULL, NULL);             /* re-arm the RX IRQ */
     }
-  } else {
-    ErrLog_Writef("gps: already @%lu — no baud change needed",
-                  (unsigned long)locked_baud);
   }
 
   /* 2. Constellations: GPS + Galileo on, BeiDou + GLONASS off. */
