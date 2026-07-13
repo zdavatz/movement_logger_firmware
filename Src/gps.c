@@ -7,10 +7,13 @@
   *          nothing persists on the M10; it always cold-starts at factory
   *          9600 baud NMEA) with Peter's 2026-07-13 recipe: GPS+Galileo only
   *          (BeiDou/GLONASS off), full power, UBX NAV-PVT every nav epoch +
-  *          NAV-SAT every 10th, NMEA silenced, then the baud raised to 230400
-  *          as the LAST command (the ACK arrives at the new baud — the local
-  *          UART is switched immediately after the command drains). Every
-  *          un-ACK'd config command leaves a *** errlog entry. The parser
+  *          NAV-SAT every 10th, NMEA silenced, nav rate 10 Hz. Since v0.0.42
+  *          the baud raise to 115200 is the FIRST command, not the last — at
+  *          9600 the module's own factory NMEA already saturates the line, so
+  *          anything that adds output before the raise drowns its own ACKs.
+  *          The ACK arrives at the new baud, so the local UART is switched
+  *          immediately after the command drains. Every un-ACK'd config
+  *          command leaves a *** errlog entry. The parser
   *          handles both UBX frames (normal mode) and NMEA lines (fallback
   *          when the box→module TX path is dead and no config could land —
   *          the module then keeps its factory 9600/1 Hz NMEA output).
@@ -37,7 +40,8 @@ static UART_HandleTypeDef g_huart4;
 static uint8_t            g_rx_byte;           /* single-byte landing zone for HAL */
 
 /* GPS_RX_RING_SIZE (config.h, 2048 B) covers a worst-case full-line-rate
-   burst at 230400 baud (~1.15 KB) between two 50 ms GPS_Tick drains. */
+   burst at 115200 baud (11.5 KB/s × 50 ms ≈ 576 B) between two 50 ms
+   GPS_Tick drains — 3.5× margin. */
 static volatile uint8_t  g_rx_ring[GPS_RX_RING_SIZE];
 static volatile uint16_t g_rx_head;            /* written by IRQ, read by thread */
 static volatile uint16_t g_rx_tail;            /* written by thread, read by IRQ */
@@ -60,7 +64,7 @@ static volatile uint32_t g_latest_valid_tick;   /* HAL_GetTick() of last valid f
 static volatile uint32_t g_diag_gga;
 static volatile uint32_t g_diag_errors;        /* UART RX error callbacks invoked */
 
-/* Baud the module ended up on in GPS_Init (230400 normally; the detected
+/* Baud the module ended up on in GPS_Init (115200 normally; the detected
    baud if the switch couldn't be confirmed). Logged by the bridge. */
 static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
 
@@ -689,7 +693,7 @@ static int gps_uart_reopen(uint32_t baud)
    UBX frame syncs (0xB5 0x62 pairs) that land in the ring. Used by GPS_Init
    to verify that the currently-configured UART baud matches the module's
    output — a cold-booted module streams factory NMEA at 9600, a module that
-   survived an MCU-only reset streams this session's UBX at 230400; either
+   survived an MCU-only reset streams this session's UBX at 115200; either
    traffic pattern confirms the framing. Returns the combined count; the
    per-protocol counts land in *nl / *ubx when non-NULL. Re-arms the RX IRQ
    each entry so calling this right after a baud-rate change works. */
@@ -855,11 +859,11 @@ int GPS_Init(void)
      ran at 9600 while the module was still streaming its factory NMEA (960 B/s,
      mostly consumed). Adding NAV-PVT-every-epoch + NAV-SAT on top backed up the
      module's TX, its ACKs missed the 300 ms budget, and every later command
-     reported FAIL. Raising the baud first buys 23 kB/s of headroom, so no
+     reported FAIL. Raising the baud first buys 11.5 kB/s of headroom (~12 % utilisation at PVT@10Hz + SAT@1Hz), so no
      command can starve its own ACK. */
   int fails = 0;
 
-  /* 1. Baud → 230400, assuming 9600. No baud scan.
+  /* 1. Baud → 115200, assuming 9600. No baud scan.
      Peter (2026-07-13): "Es braucht keinen Baudratentest am Anfang. Nach dem
      Booten ist es immer 9600 Baud." Right for a cold boot — the hall switch
      cuts the whole rail, the module comes back at its factory 9600 NMEA
@@ -869,17 +873,17 @@ int GPS_Init(void)
      But NO MCU pin switches the GPS supply — GPS-off is software only
      (UBX-RXM-PMREQ backup). So on an MCU-only reset (FOTA's SWAP_BANK reboot,
      an IWDG reset, a software reset) the module keeps its power AND this
-     session's RAM config: it is still at 230400. FOTA is the primary update
+     session's RAM config: it is still at 115200. FOTA is the primary update
      path, so assuming 9600 *unconditionally* would leave the GPS dead after
      every wireless update until someone power-cycles with the magnet.
 
      Resolution: assume 9600 and send the baud command blind (no listen window
      — that is Peter's ask, and it saves 1.5 s on every cold boot), then CONFIRM
-     at 230400. The confirm covers both worlds for free:
-       - module @9600   → it accepts the command; the ACK arrives at 230400.
-       - module @230400 → it sees our 9600 bytes as framing garbage and drops
+     at 115200. The confirm covers both worlds for free:
+       - module @9600   → it accepts the command; the ACK arrives at 115200.
+       - module @115200 → it sees our 9600 bytes as framing garbage and drops
                           them (UBX checksums make a false positive impossible),
-                          but the MON-VER poll we then send at 230400 answers.
+                          but the MON-VER poll we then send at 115200 answers.
      Only if NEITHER confirms do we fall back to a real probe. */
   if (gps_uart_reopen(9600) != 0) {
     ErrLog_Write("gps: uart_init@9600 FAIL");
@@ -895,7 +899,7 @@ int GPS_Init(void)
   ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);        /* blind, at 9600 */
 
   if (gps_uart_reopen(GPS_UART_BAUDRATE) != 0) {
-    ErrLog_Write("gps: uart_reinit@230400 FAIL");
+    ErrLog_Write("gps: uart_reinit@115200 FAIL");
     return -1;
   }
 
@@ -910,18 +914,23 @@ int GPS_Init(void)
     listen_traffic(400, NULL, &ux);
     if (ux > 0) {
       final_baud = GPS_UART_BAUDRATE;
-      ErrLog_Write("gps: already @230400 (MCU-only reset) — baud step skipped");
+      ErrLog_Write("gps: already @115200 (MCU-only reset) — baud step skipped");
     }
   }
 
-  /* Last resort: the module answered at neither 9600 nor 230400. Probe the
-     remaining plausible rates (38400 = left by pre-v0.0.41 firmware; 9600
-     again = it is alive but ignored our command, e.g. a half-dead TX line),
-     then retry the raise from wherever it actually is. */
+  /* Last resort: the module answered at neither 9600 nor 115200. Probe the
+     remaining plausible rates, then retry the raise from wherever it is:
+       230400 — left by v0.0.41-v0.0.43 firmware, which used 230400 as the
+                session baud. A box updated by FOTA from one of those reboots
+                MCU-only, so the module keeps power AND its 230400 setting.
+                Without this candidate the GPS would be dead after exactly the
+                update that brings this version in.
+       38400  — left by pre-v0.0.41 firmware.
+       9600   — alive but ignored our command (e.g. a half-dead TX line). */
   if (final_baud == 0) {
-    static const uint32_t cands[2] = { 38400U, 9600U };
+    static const uint32_t cands[3] = { 230400U, 38400U, 9600U };
     uint32_t found = 0;
-    for (int i = 0; i < 2 && found == 0; i++) {
+    for (int i = 0; i < 3 && found == 0; i++) {
       if (gps_uart_reopen(cands[i]) != 0) {
         ErrLog_Writef("gps: uart_init@%lu FAIL", (unsigned long)cands[i]);
         return -1;
@@ -934,7 +943,7 @@ int GPS_Init(void)
       }
     }
     if (found == 0) {
-      ErrLog_Write("*** GPS: no baud lock — silent at 9600/230400/38400 ***");
+      ErrLog_Write("*** GPS: no baud lock — silent at 9600/115200/230400/38400 ***");
       ErrLog_Write("*** check module supply + RX wiring (JP2 pin 13/14) ***");
       return -1;
     }
@@ -943,7 +952,7 @@ int GPS_Init(void)
     vs_u4(CFG_UART1_BAUDRATE, GPS_UART_BAUDRATE);
     ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);
     if (gps_uart_reopen(GPS_UART_BAUDRATE) != 0) {
-      ErrLog_Write("gps: uart_reinit@230400 FAIL");
+      ErrLog_Write("gps: uart_reinit@115200 FAIL");
       return -1;
     }
     if (ubx_wait_ack(0x06, 0x8A, 700) == 0) {
@@ -987,7 +996,7 @@ int GPS_Init(void)
   /* 4. UBX protocol + periodic output: NAV-PVT every epoch, NAV-SAT every
      10th. In/out protocol enables included — UBX *output* is off in the
      M10 factory default, and after a power cut that default is what we get.
-     Safe to enable now: we are on the 230400 line, so the added output
+     Safe to enable now: we are on the 115200 line, so the added output
      cannot back up the module's TX and drown the ACKs (Peter, step-1 note). */
   vs_begin();
   vs_u1(CFG_UART1INPROT_UBX,             1);

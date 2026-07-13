@@ -70,7 +70,7 @@ row; it's a best-effort no-op when no session is open.
   the architectural fix that took 43 firmware revisions to find in the
   predecessor stack; do not "re-enable" it.
 - Sensors: LSM6DSV16X (SPI2), LIS2MDL + LPS22DF + STTS22H on I²C2,
-  STC3115 fuel gauge on I²C4. GPS u-blox MAX-M10S on UART4 @ 230400 baud
+  STC3115 fuel gauge on I²C4. GPS u-blox MAX-M10S on UART4 @ 115200 baud
   (raised per boot from factory 9600 — see the v0.0.41 section), captured
   by per-byte RX IRQ into a 2 KB ring.
 - **GPS wiring (authoritative — verified against ST schematic Rev 3
@@ -509,28 +509,52 @@ nothing we write ever persists (the M10 never ACKs the legacy CFG-CFG save).
 pin switches the GPS supply (grep — there is none; GPS-off is software-only,
 `UBX-RXM-PMREQ` backup). On an **MCU-only reset** — FOTA's `SWAP_BANK` reboot,
 an IWDG reset, a software reset — the module keeps its power **and this
-session's RAM config**, so it is still at **230400**. FOTA is the primary
+session's RAM config**, so it is still at **115200**. FOTA is the primary
 update path, so assuming 9600 unconditionally would leave the GPS **dead after
 every wireless firmware update** until someone power-cycles with the magnet.
 
 **Resolution — confirm, don't scan.** `GPS_Init` drops the listen-first baud
 scan entirely (saves ~1.5 s on every cold boot). It opens the UART at 9600,
-wake-pulses, sends `CFG-UART1-BAUDRATE=230400` **blind**, re-opens locally at
-230400, and then *confirms*. That single confirm covers both worlds for free:
+wake-pulses, sends `CFG-UART1-BAUDRATE=115200` **blind**, re-opens locally at
+115200, and then *confirms*. That single confirm covers both worlds for free:
 
-- module **@9600** → it accepted the command → the **ACK** arrives at 230400.
-- module **@230400** → it saw our 9600 bytes as framing garbage and dropped them
+- module **@9600** → it accepted the command → the **ACK** arrives at 115200.
+- module **@115200** → it saw our 9600 bytes as framing garbage and dropped them
   (UBX checksums make a false positive impossible), but the **MON-VER poll** we
-  then send at 230400 gets a reply → `gps: already @230400 (MCU-only reset)`.
+  then send at 115200 gets a reply → `gps: already @115200 (MCU-only reset)`.
 
-Only if **neither** confirms does a real probe run (38400 = module left by
-pre-v0.0.41 firmware; 9600 again = alive but ignoring us), and the raise is
-retried from wherever it actually is → `*** gps: baud fallback — module @… ***`.
+Only if **neither** confirms does a real probe run over **230400 → 38400 →
+9600**, and the raise is retried from wherever the module actually is →
+`*** gps: baud fallback — module @… ***`. **230400 must stay in that list**:
+v0.0.41–v0.0.43 used 230400 as the session baud, so a box updated by FOTA
+*from* one of those reboots MCU-only with its module still at 230400 — without
+the candidate, the GPS would be dead after exactly the update that brings the
+115200 firmware in.
 
 `gps_uart_reopen(baud)` is the shared helper for every baud transition
 (DeInit → init → `OVRDIS` → clear flags → empty ring).
 
 **Don't "simplify" this to a bare 9600 assumption** — that silently breaks FOTA.
+
+## GPS baud: 115200, matching Peter's u-center config (v0.0.44+) — `config.h`
+
+`GPS_UART_BAUDRATE` is **115200**, not 230400. Peter's u-center screenshot
+(2026-07-13) of the config that actually measured **15 sats / 3D fix / C/N0
+41 dB-Hz** shows `CFG-UART1-BAUDRATE = 115200`, layer RAM — and all six of his
+other keys (`CFG-RATE-MEAS 100`, `CFG-RATE-NAV 1`, `CFG-PM-OPERATEMODE 0`,
+`MSGOUT-UBX_NAV_SAT_UART1 10`, `MSGOUT-UBX_NAV_PVT_UART1 1`) plus every
+`CFG-SIGNAL` key ID match the firmware exactly. The firmware now follows that
+config 1:1.
+
+**Retracted:** an earlier note in `config.h`/`DESIGN.md` claimed *"115200 loses
+data — use 230400"*. That was a mis-transcription of Peter's advice and is
+wrong. Headroom is not close: configured traffic is ~1.4 KB/s (NAV-PVT@10 Hz +
+NAV-SAT@1 Hz) against 11.5 KB/s of line → **~12 % utilisation**.
+
+Note this is **not** why the box wasn't fixing — at 230400 the link was already
+measurably clean (`lines_good=1111 lines_bad=1`, NAV-PVT at a steady 10 Hz) and
+`rmc` was still 0. The baud change is about matching the verified config, not
+about the missing fix. See issue #10.
 
 ## GPS config order: baud FIRST (v0.0.42+) — `gps.c`
 
@@ -543,30 +567,30 @@ NMEA eats most of it; step 4 then piles NAV-PVT-every-epoch + NAV-SAT on top.
 The module's TX backs up, its ACKs miss the 300 ms `ubx_send_retry` budget, and
 every later command reports FAIL — the "collapse" Peter saw.
 
-**v0.0.42 order** (`GPS_Init`, `Src/gps.c`): baud-detect → **1. baud → 230400**
+**v0.0.42 order** (`GPS_Init`, `Src/gps.c`): baud-detect → **1. baud → 115200**
 → 2. CFG-SIGNAL → 3. CFG-PM-OPERATEMODE → 4. UBX out (INPROT/OUTPROT + MSGOUT
 PVT=1/SAT=10) → 5. NMEA off → 6. CFG-RATE 10 Hz. The baud VALSET is now the
 *only* command sent on the slow line — a single ~36 B frame, which even a
-saturated 9600 link delivers. Everything after it has 23 kB/s of headroom, so
+saturated 9600 link delivers. Everything after it has 11.5 kB/s of headroom (~12 % utilisation at PVT@10Hz + SAT@1Hz), so
 **no command can starve its own ACK**. The ACK-arrives-at-the-new-baud handling
 (re-init local UART right after the command drains, MON-VER poll as fallback
 confirmation, revert to `locked_baud` if unconfirmed) is unchanged — it just
 moved. Same reasoning now governs the fallback: if the baud switch fails, the
 nav rate stays at **1 Hz** (was 5 Hz — ~52 % of a 960 B/s line for NAV-PVT alone
-before NAV-SAT). New errlog line: `gps: cfg baud 230400 ACK (step 1)`.
+before NAV-SAT). New errlog line: `gps: cfg baud 115200 ACK (step 1)`.
 
 **Don't move the baud switch back down the list** — that's the whole bug.
 
-## GPS UBX-native at 230400, GPS+Galileo only (v0.0.41+) — `gps.c`
+## GPS UBX-native at 115200, GPS+Galileo only (v0.0.41+) — `gps.c`
 
 > **Command order superseded by v0.0.42** (above): the baud switch moved from
 > last to first. The recipe's *content* (GPS+Galileo only, full power, UBX
-> NAV-PVT/NAV-SAT, NMEA off, 230400, RAM-layer-only, ACK-verified) is unchanged.
+> NAV-PVT/NAV-SAT, NMEA off, 115200, RAM-layer-only, ACK-verified) is unchanged.
 
 **Peter's per-boot config recipe (2026-07-13), verified in u-center 2 over a
 USB-UART adapter**: GPS + Galileo only (BeiDou/GLONASS off), full power, UBX
-NAV-PVT every nav epoch + NAV-SAT every 10th, baud **230400** (115200 loses
-data) set as the **last** command, everything **RAM layer only** (re-sent every
+NAV-PVT every nav epoch + NAV-SAT every 10th, baud **115200** set as the
+**last** command, everything **RAM layer only** (re-sent every
 boot — the M10 never persists, see v0.0.38), every command ACK-verified, and
 **every un-ACK'd command writes a `***` errlog entry** (which also latches the
 red LED). Result at his window with ~40 % sky view: 15 sats used, 3D fix,
@@ -576,8 +600,8 @@ Authoritative sequence + rationale: **DESIGN.md → "GPS module configuration
 (v0.0.41+)"**. Key implementation facts:
 
 - **Boot flow (`GPS_Init`)**: listen-first baud detect (9600 cold-boot →
-  230400 MCU-only reset → 38400 pre-v0.0.41 leftover; UBX syncs count as
-  traffic, not just NMEA newlines) → **CFG-UART1-BAUDRATE=230400 first**
+  115200 MCU-only reset → 38400 pre-v0.0.41 leftover; UBX syncs count as
+  traffic, not just NMEA newlines) → **CFG-UART1-BAUDRATE=115200 first**
   (v0.0.42 — see the section above; local UART re-inited immediately because
   the ACK arrives at the NEW baud, MON-VER poll as fallback confirmation) →
   CFG-SIGNAL (9 keys, one VALSET, then 500 ms settle) → CFG-PM-OPERATEMODE=0
@@ -597,7 +621,7 @@ Authoritative sequence + rationale: **DESIGN.md → "GPS module configuration
 - **Bridge (`0x0D`)** no longer flips protocols — the port is UBX-native; it
   only throttles our periodic PVT 10 Hz → 1 Hz while a survey runs.
 - **RX ring 512 B → 2 KB** (`GPS_RX_RING_SIZE`, config.h); configured UBX
-  traffic is ~1.4 KB/s, the 230400 line is mostly idle (headroom for Peter's
+  traffic is ~1.4 KB/s, the 115200 line is mostly idle (headroom for Peter's
   future 18 Hz idea — 25 Hz "chip tuning" is out: irreversible per Peter).
 - **NMEA-fallback mode** (box→module TX dead, nothing ACKs): module stays at
   factory 9600/1 Hz NMEA defaults, GGA/RMC/GSV parsing still logs — RX-only

@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.43"
+#define PL_FW_VERSION          "0.0.44"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -54,9 +54,14 @@
 #endif
 /* Session baud, set per boot via UBX-CFG-VALSET (RAM only — the module always
    cold-starts at factory 9600; nothing we write persists across a module power
-   cut). 230400, not 115200: Peter measured data loss at 115200 with the full
-   10 Hz output (2026-07-13). */
-#define GPS_UART_BAUDRATE      230400U
+   cut). 115200 = exactly the value in Peter's u-center config, the one that
+   measured 15 sats / 3D fix / C/N0 41 dB-Hz (screenshot 2026-07-13:
+   CFG-UART1-BAUDRATE = 115200, layer RAM). An earlier note here claimed
+   "115200 loses data, use 230400" — that was wrong and is retracted; the
+   verified config is 115200 and v0.0.44 follows it 1:1.
+   Headroom check: configured traffic is ~1.4 KB/s (NAV-PVT@10Hz + NAV-SAT@1Hz)
+   against 11.5 KB/s of line → ~12 % utilisation. Ample. */
+#define GPS_UART_BAUDRATE      115200U
 #define GPS_RX_RING_SIZE       2048U         /* byte-IRQ RX ring (gps.c) */
 
 /* Cooperative scheduler ----------------------------------------------------*/
