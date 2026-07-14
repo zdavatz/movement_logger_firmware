@@ -554,6 +554,20 @@ NMEA-compatible:
 
 ### GPS module configuration (v0.0.42+ — baud first)
 
+**`GPSRAW.CFG` config bypass (v0.0.47, issue #10 A/B test).** If a file
+named `GPSRAW.CFG` exists on the SD root (content ignored), `GPS_Init`
+sends **zero bytes** to the module — no wake pulse, no baud raise, no
+CFG-* writes — and returns with the local UART at 9600. The module
+stays exactly in its factory state (9600, NMEA, 1 Hz, all
+constellations: the state of Peter's bootloader-mode experiment where
+the LED blinks) while the rest of the firmware runs at full tilt. The
+NMEA fallback parser keeps the logger fed. Discriminator: LED blinks
+with the bypass → the configuration kills acquisition; LED stays dark →
+the running system (EMI/supply) does. Errlog:
+`*** gps: GPSRAW.CFG — factory config untouched (A/B bypass) ***`
+(deliberately `***` so a bypass boot never reads as a clean production
+boot). Delete the file to restore the normal per-boot configuration.
+
 The u-blox MAX-M10S is configured **on every boot, RAM layer only**
 (UBX-CFG-VALSET; the M10 never ACKs the legacy CFG-CFG save — verified
 across 15 field boots — so nothing persists and the module always

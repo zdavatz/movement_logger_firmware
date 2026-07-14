@@ -881,6 +881,37 @@ int GPS_Init(void)
   HAL_NVIC_SetPriority(UART4_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(UART4_IRQn);
 
+  /* --- GPSRAW.CFG config bypass (v0.0.47, issue #10 A/B test) -------------
+     If a file named GPSRAW.CFG exists on the SD root, GPS_Init sends ZERO
+     bytes to the module: no wake pulse, no baud raise, no CFG-* writes. The
+     module stays exactly in its factory state (9600 baud, NMEA, 1 Hz, all
+     constellations) — the same state as Peter's bootloader-mode experiment
+     where the uputronics LED blinks — while the REST of the firmware runs at
+     full tilt (SD logging, BLE, sensors, 160 MHz). The NMEA fallback parser
+     (GGA/RMC/GSV @9600) keeps the logger fed if a fix arrives.
+
+     Discriminator: LED blinks with the bypass → our configuration is what
+     kills acquisition (then bisect CFG-SIGNAL etc.). LED stays dark → the
+     running system (EMI / supply under load) is the problem, not the config.
+     File content is ignored; delete the file to restore the normal per-boot
+     configuration. The *** entry is deliberate — a box in bypass mode must
+     never read as a clean production boot. */
+  if (SDFat_IsMounted()) {
+    PL_File raw;
+    if (SDFat_OpenRead(&raw, "GPSRAW.CFG") == PL_FX_OK) {
+      SDFat_Close(&raw);
+      if (gps_uart_reopen(9600) != 0) {
+        ErrLog_Write("gps: uart_init@9600 FAIL");
+        return -1;
+      }
+      g_locked_baud = 9600;
+      g_rate_armed  = 0;
+      ErrLog_Write("*** gps: GPSRAW.CFG — factory config untouched (A/B bypass) ***");
+      ErrLog_Write("gps: ready @9600 baud, factory NMEA 1Hz, RX-only bypass");
+      return 0;
+    }
+  }
+
   /* Peter's per-boot config (2026-07-13), RAM layer only, every command
      ACK-verified with 3 retries; every un-ACK'd command leaves a *** errlog
      entry (vs_send). Order: BAUD FIRST, then everything else on the fast line

@@ -498,6 +498,33 @@ Three coupled changes (`Src/gps.c`):
 
 Bumped `PL_FW_VERSION` → **0.0.38** (`Inc/config.h`).
 
+## GPS config bypass via `GPSRAW.CFG` (v0.0.47+) — `gps.c`
+
+**The issue-#10 A/B discriminator.** v0.0.46 (1-Hz-Akquisition) still showed
+`rmc=0` in Peter's first test, which leaves two suspects that his experiments
+can't separate — the FW's *configuration* vs. the *running system's* EMI
+(bootloader mode has neither). The bypass separates them: if a file named
+**`GPSRAW.CFG`** exists on the SD root (content ignored — create it via the
+box's USB-MSC drive), `GPS_Init` sends **zero bytes** to the module (no wake
+pulse, no baud raise, no CFG-* writes) and leaves it 100 % in the factory
+state — 9600 baud, NMEA, 1 Hz, all constellations — exactly the state in
+which the module fixes in Peter's Versuch 1+2, while SD logging, BLE and
+sensors all run normally. The NMEA fallback parser (GGA/RMC/GSV @9600) keeps
+logging fixes if they come. The nav-rate switcher is disarmed; the local
+UART stays at 9600 (`g_locked_baud`).
+
+Reading the result: **LED blinks with bypass → the config kills acquisition**
+(next: bisect — drop CFG-SIGNAL, or CFG-RST after config). **LED stays dark →
+EMI/supply of the running system** (hardware/layout track, not config).
+
+Errlog signature (the `***` is deliberate — a bypass boot must never read as
+a clean production boot; delete the file to restore normal config):
+```
+*** gps: GPSRAW.CFG — factory config untouched (A/B bypass) ***
+gps: ready @9600 baud, factory NMEA 1Hz, RX-only bypass
+```
+Bumped `PL_FW_VERSION` → **0.0.47**.
+
 ## GPS adaptive nav rate: acquire @1 Hz, track @10 Hz (v0.0.46+) — `gps.c`
 
 **The "no fix ever with the FW running" fix (issue #10).** Peter isolated it
