@@ -75,6 +75,29 @@ static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
 #define GPSPWR_CFG_NAME "GPSPWR.CFG"
 static int g_power = -1;
 
+/* ---------- Adaptive nav rate (v0.0.46, issue #10) ----------------------- */
+/* Cold acquisition happens at 1 Hz; only once a valid fix is in hand is the
+   module raised to GPS_RATE_HZ, and it drops back to 1 Hz for re-acquisition
+   after GPS_REACQ_DOWNSHIFT_MS without a fix. Background: 10-Hz-from-cold
+   never produced a single fix in the field (Peter's ERRLOG: 26'583 PVT
+   epochs in 44.5 min, rmc=0) while the same module at the factory 1 Hz fixes
+   on the same board — acquisition sensitivity at high nav rates is far worse
+   than at the 1 Hz the u-blox TTFF specs assume. Tracking at 10 Hz is fine
+   (Peter's u-center measurement: 15 sats / 3D fix at 10 Hz).
+
+   The switch VALSET is fire-and-forget from the superloop (polling-only —
+   no blocking ACK wait outside GPS_Init); its ACK-ACK is spotted by
+   gps_rx_byte and consumed by gps_rate_manage, with bounded resends and a
+   backoff so a NAK-ing module can't cause an errlog flood. */
+static uint8_t  g_rate_armed;         /* switcher active (UBX path @230400 up) */
+static uint8_t  g_rate_fast;          /* module rate now: 0 = 1 Hz, 1 = 10 Hz */
+static uint8_t  g_rate_pending;       /* switch VALSET in flight, ACK awaited */
+static uint8_t  g_rate_pending_fast;  /* rate the in-flight VALSET asks for */
+static uint8_t  g_rate_tries;         /* sends so far for the current switch */
+static uint32_t g_rate_sent_tick;     /* HAL_GetTick() of the in-flight send */
+static uint32_t g_rate_backoff_until; /* no new switch attempts before this */
+static volatile uint8_t g_ack_valset; /* async ACK-ACK for CFG-VALSET seen */
+
 /* ---------- BLE GPS bridge state ---------------------------------------- */
 static volatile uint8_t g_bridge;                 /* survey bridge active */
 
@@ -551,6 +574,12 @@ static void gps_rx_byte(uint8_t b)
         if (!g_ux_skip) {
           if      (g_ux_cls == 0x01 && g_ux_id == 0x07) parse_nav_pvt(g_ux_pay, g_ux_len);
           else if (g_ux_cls == 0x01 && g_ux_id == 0x35) parse_nav_sat(g_ux_pay, g_ux_len);
+          /* ACK-ACK for a CFG-VALSET: the adaptive-nav-rate switch is sent
+             fire-and-forget from the superloop, so its confirmation arrives
+             here instead of through the blocking init-time ubx_wait_ack. */
+          else if (g_ux_cls == 0x05 && g_ux_id == 0x01 && g_ux_len >= 2 &&
+                   g_ux_pay[0] == 0x06 && g_ux_pay[1] == 0x8A)
+            g_ack_valset = 1;
         }
       } else {
         g_diag_lines_bad++;
@@ -1022,25 +1051,34 @@ int GPS_Init(void)
     ErrLog_Write("gps: keeping NMEA (ubx out not ACK'd) — fallback parser active");
   }
 
-  /* 6. Nav rate — 10 Hz on the fast line. If step 1 failed we are still on
-     the slow one: stay at 1 Hz there. Peter's rule applies to us too — a
-     raised nav rate at 9600 is exactly what collapses the link, and 5 Hz
-     NAV-PVT alone is ~52 % of a 960 B/s line before NAV-SAT. 1 Hz keeps the
-     degraded path readable instead of trading it for garbage. */
-  uint16_t meas_ms = (final_baud == GPS_UART_BAUDRATE)
-                       ? (uint16_t)(1000U / GPS_RATE_HZ)   /* 100 ms = 10 Hz */
-                       : 1000U;                            /* 1 Hz, slow line */
+  /* 6. Nav rate — ACQUISITION rate, i.e. 1 Hz (v0.0.46, issue #10). The
+     module always cold-starts fix-less here, and acquiring at 10 Hz is what
+     kept the field boxes fix-less forever (26'583 epochs, rmc=0) while the
+     factory 1 Hz fixes on the same board. gps_rate_manage() raises the rate
+     to GPS_RATE_HZ once the first valid fix is in — tracking at 10 Hz is
+     proven fine (Peter's u-center: 15 sats / 3D at 10 Hz). On the slow
+     fallback line 1 Hz additionally keeps the link readable (5 Hz NAV-PVT
+     alone would be ~52 % of a 960 B/s line). */
   vs_begin();
-  vs_u2(CFG_RATE_MEAS, meas_ms);
+  vs_u2(CFG_RATE_MEAS, (uint16_t)GPS_ACQ_RATE_MS);
   vs_u2(CFG_RATE_NAV,  1);
-  fails += vs_send("rate");
+  fails += vs_send("rate 1Hz acq");
+
+  /* Arm the fix-driven 1↔10 Hz switcher only when the configured UBX path
+     is actually up — on the NMEA-fallback/slow line the rate must stay 1 Hz
+     (and un-ACK'd VALSETs would only spam the errlog). */
+  g_rate_armed = (final_baud == GPS_UART_BAUDRATE && pvt_rc == 0) ? 1 : 0;
+  g_rate_fast  = 0;
+  g_rate_pending = 0;
+  g_rate_tries = 0;
+  g_rate_backoff_until = 0;
 
   g_locked_baud = final_baud;
 
   /* RX IRQ stays armed across all the listen/ack calls. */
-  ErrLog_Writef("gps: ready @%lu baud, nav=%luHz, %s%s",
+  ErrLog_Writef("gps: ready @%lu baud, nav=1Hz acq%s, %s%s",
                 (unsigned long)final_baud,
-                (unsigned long)(1000U / meas_ms),
+                g_rate_armed ? " (10Hz after first fix)" : "",
                 (pvt_rc == 0) ? "UBX NAV-PVT" : "NMEA fallback",
                 (fails > 0) ? " (config incomplete)" : "");
 
@@ -1152,6 +1190,72 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   HAL_UART_Receive_IT(huart, &g_rx_byte, 1);
 }
 
+/* Fire the 1↔10 Hz CFG-RATE VALSET without blocking (single ~22 B frame,
+   <1 ms of TX time at 230400). The ACK is picked up asynchronously by
+   gps_rx_byte → g_ack_valset; gps_rate_manage() below resolves it. */
+static void gps_rate_request(uint8_t fast)
+{
+  vs_begin();
+  vs_u2(CFG_RATE_MEAS, fast ? (uint16_t)(1000U / GPS_RATE_HZ)
+                            : (uint16_t)GPS_ACQ_RATE_MS);
+  vs_u2(CFG_RATE_NAV, 1);
+  g_ack_valset = 0;
+  ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);
+  g_rate_pending      = 1;
+  g_rate_pending_fast = fast;
+  g_rate_sent_tick    = HAL_GetTick();
+}
+
+/* Fix-driven nav-rate state machine, run once per GPS_Tick while the
+   configured UBX path is up. Non-blocking by design (F-ARCH: no busy ACK
+   waits in the superloop): a switch is sent fire-and-forget, confirmed by
+   the async ACK flag, resent up to 3× on a 500 ms timeout, and backed off
+   for 60 s after a triple failure so a wedged module can't flood the errlog.
+
+   Caveat (accepted): any other CFG-VALSET ACK arriving while a switch is
+   pending (GPS-Debug survey toggling its throttle) can be misattributed to
+   the switch. Harmless — the next fix/loss edge re-syncs the state. */
+static void gps_rate_manage(void)
+{
+  if (!g_rate_armed) return;
+  uint32_t now = HAL_GetTick();
+
+  if (g_rate_pending) {
+    if (g_ack_valset) {
+      g_rate_fast    = g_rate_pending_fast;
+      g_rate_pending = 0;
+      g_rate_tries   = 0;
+      ErrLog_Writef("gps: nav rate → %s ACK",
+                    g_rate_fast ? "10Hz (fix acquired)" : "1Hz (re-acq)");
+    } else if ((now - g_rate_sent_tick) > 500U) {
+      if (++g_rate_tries >= 3) {
+        ErrLog_Writef("*** gps: nav rate switch (%s) NOT ACK'd x3 ***",
+                      g_rate_pending_fast ? "10Hz" : "1Hz");
+        g_rate_pending       = 0;
+        g_rate_tries         = 0;
+        g_rate_backoff_until = now + 60000U;
+      } else {
+        gps_rate_request(g_rate_pending_fast);
+      }
+    }
+    return;
+  }
+
+  if (g_rate_backoff_until != 0 && (int32_t)(now - g_rate_backoff_until) < 0)
+    return;
+
+  /* Same 3 s freshness window GPS_LastFixQuality uses. */
+  uint8_t have_fix = (g_latest_valid_tick != 0) &&
+                     (now - g_latest_valid_tick) <= 3000U;
+
+  if (!g_rate_fast && have_fix) {
+    gps_rate_request(1);                      /* first fix → tracking rate */
+  } else if (g_rate_fast && !have_fix && g_latest_valid_tick != 0 &&
+             (now - g_latest_valid_tick) > GPS_REACQ_DOWNSHIFT_MS) {
+    gps_rate_request(0);                      /* fix long gone → re-acquire @1 Hz */
+  }
+}
+
 void GPS_Tick(void)
 {
   /* GPS powered off (backup mode): no NMEA is arriving. Discard anything that
@@ -1173,6 +1277,8 @@ void GPS_Tick(void)
     if (g_bridge) bridge_capture(b);
     g_diag_bytes++;
   }
+
+  gps_rate_manage();
 }
 
 void GPS_GetStats(uint32_t *bytes, uint32_t *lines_good, uint32_t *lines_bad,

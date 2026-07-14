@@ -88,7 +88,7 @@ int ErrLog_Init(void)
   SDFat_Append(&g_log, hdr, (uint32_t)strlen(hdr));
 
   snprintf(hdr, sizeof(hdr),
-           "fw: build %s %s | GPS %uHz | flash~?\n",
+           "fw: build %s %s | GPS 1-%uHz | flash~?\n",
            __DATE__, __TIME__, (unsigned)GPS_RATE_HZ);
   SDFat_Append(&g_log, hdr, (uint32_t)strlen(hdr));
 

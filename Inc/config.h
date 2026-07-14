@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.45"
+#define PL_FW_VERSION          "0.0.46"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -50,8 +50,17 @@
 
 /* GPS / UART4 --------------------------------------------------------------*/
 #ifndef GPS_RATE_HZ
-#define GPS_RATE_HZ            10
+#define GPS_RATE_HZ            10            /* tracking rate (after first fix) */
 #endif
+/* Adaptive nav rate (v0.0.46, issue #10): cold acquisition happens at 1 Hz —
+   the rate the u-blox TTFF specs assume and the rate the factory default
+   acquires at. 10-Hz-from-cold never produced a single fix in the field
+   (Peter's ERRLOG: 26'583 PVT epochs in 44.5 min, rmc=0, while the same
+   module at factory 1 Hz fixes on the same board). gps.c switches the module
+   to GPS_RATE_HZ only once a valid fix is in hand, and drops back to 1 Hz
+   for re-acquisition when the fix has been gone GPS_REACQ_DOWNSHIFT_MS. */
+#define GPS_ACQ_RATE_MS         1000U        /* acquisition nav period (1 Hz) */
+#define GPS_REACQ_DOWNSHIFT_MS 60000U        /* fix lost this long → back to 1 Hz */
 /* Session baud, set per boot via UBX-CFG-VALSET (RAM only — the module always
    cold-starts at factory 9600; nothing we write persists across a module power
    cut).

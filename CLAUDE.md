@@ -498,6 +498,46 @@ Three coupled changes (`Src/gps.c`):
 
 Bumped `PL_FW_VERSION` → **0.0.38** (`Inc/config.h`).
 
+## GPS adaptive nav rate: acquire @1 Hz, track @10 Hz (v0.0.46+) — `gps.c`
+
+**The "no fix ever with the FW running" fix (issue #10).** Peter isolated it
+cleanly: same module, same board — factory config (bootloader mode / PC
+power) fixes and blinks the uputronics TP LED; FW v0.0.45 running → LED dark
+forever. His ERRLOG proves the module is healthy and the config lands 100 %
+(all ACKs, `lines_bad=1`, `ubx_drop=0`) yet **26'583 NAV-PVT epochs over
+44.5 min with `rmc=0`** — the module navigates at 10 Hz but never *acquires*.
+Root cause hypothesis: **cold acquisition at 10 Hz is far less sensitive than
+at the 1 Hz the u-blox TTFF specs assume** (the factory default acquires at
+1 Hz; Peter's u-center session proves *tracking* at 10 Hz is fine: 15 sats /
+3D fix).
+
+v0.0.46 therefore splits the nav rate:
+
+- `GPS_Init` step 6 sets **1 Hz** (`GPS_ACQ_RATE_MS`, config.h) — the
+  acquisition rate — and arms the switcher only when the configured UBX path
+  is up (`230400 + pvt ACK`); the NMEA-fallback/slow line stays 1 Hz, switcher
+  off.
+- `gps_rate_manage()` (end of `GPS_Tick`) raises the module to `GPS_RATE_HZ`
+  (10 Hz) once a valid fix is fresh (3 s window), and drops back to 1 Hz for
+  re-acquisition when the fix has been gone `GPS_REACQ_DOWNSHIFT_MS` (60 s
+  hysteresis).
+- The switch VALSET is **fire-and-forget from the superloop** (F-ARCH: no
+  blocking ACK waits outside `GPS_Init`). Its ACK-ACK is recognized by the
+  UBX router (`g_ack_valset` — new `0x05 0x01` branch in `gps_rx_byte`),
+  resent up to 3× on a 500 ms timeout, then backed off 60 s with a `***`
+  errlog entry (Peter's rule). Known benign race: a survey-toggle VALSET ACK
+  can be misattributed to a pending switch; the next fix/loss edge re-syncs.
+- ERRLOG: boot banner now says `GPS 1-10Hz`; ready line
+  `gps: ready @230400 baud, nav=1Hz acq (10Hz after first fix), UBX NAV-PVT`;
+  switches log `gps: nav rate → 10Hz (fix acquired) ACK` / `→ 1Hz (re-acq) ACK`.
+- Logger/CSV: unaffected — GPS rows exist only on valid fixes, and the first
+  fix immediately triggers the 10 Hz upshift.
+
+Don't revert step 6 to a flat 10 Hz — that resurrects the no-fix field bug.
+If 1-Hz acquisition alone turns out not to be enough, the next lever is the
+`GPSRAW.CFG` config-bypass A/B test (see issue #10) to separate config from
+running-system EMI. Bumped `PL_FW_VERSION` → **0.0.46**.
+
 ## GPS: no baud scan — assume 9600, then confirm (v0.0.43+) — `gps.c`
 
 **Peter, 2026-07-13:** *"Es braucht keinen Baudratentest am Anfang. Nach dem

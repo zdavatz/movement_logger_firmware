@@ -608,8 +608,34 @@ the 4-constellation default never fixed):
    `MSGOUT-UBX_NAV_SAT_UART1 = 10`.
 5. **NMEA silenced** (GGA/RMC/GSV/GSA/VTG/GLL/ZDA rates → 0) — only
    after step 4 ACK'd, so a partial failure never leaves the module mute.
-6. **CFG-RATE**: measRate 100 ms / navRate 1 (10 Hz). Falls back to
-   **1 Hz** if step 1 failed and the box is stuck on a slow line.
+6. **CFG-RATE**: measRate **1000 ms / navRate 1 (1 Hz — the ACQUISITION
+   rate, v0.0.46)**. The tracking rate (100 ms = 10 Hz, `GPS_RATE_HZ`)
+   is applied only *after the first valid fix* — see "Adaptive nav
+   rate" below. On the slow fallback line the rate stays 1 Hz and the
+   switcher is disarmed.
+
+**Adaptive nav rate (v0.0.46, issue #10).** Cold acquisition at 10 Hz
+never produced a fix in the field: Peter's ERRLOG shows 26'583 NAV-PVT
+epochs over 44.5 min with `rmc=0`, while the *same module on the same
+board* fixes at the factory 1 Hz (bootloader-mode experiment), and his
+u-center measurement (15 sats / 3D fix at 10 Hz) proves *tracking* at
+10 Hz is fine. So the firmware acquires at 1 Hz and tracks at 10 Hz:
+
+- `gps_rate_manage()` (called from `GPS_Tick`) raises the module to
+  `GPS_RATE_HZ` when a valid fix is fresh (same 3 s window as
+  `GPS_LastFixQuality`) and drops back to `GPS_ACQ_RATE_MS` (1 Hz) for
+  re-acquisition once the fix has been gone `GPS_REACQ_DOWNSHIFT_MS`
+  (60 s — hysteresis against flapping; hot re-acquisition usually
+  succeeds long before that at 10 Hz).
+- The switch VALSET is **fire-and-forget from the superloop** (F-ARCH:
+  no blocking ACK waits outside `GPS_Init`); its ACK-ACK is spotted by
+  the UBX router (`g_ack_valset`), resent up to 3× on a 500 ms timeout,
+  then backed off 60 s with a `***` errlog entry (Peter's rule).
+- Logged as `gps: nav rate → 10Hz (fix acquired) ACK` /
+  `gps: nav rate → 1Hz (re-acq) ACK`.
+- Logger/CSV impact: none — GPS rows are only written on valid fixes,
+  and fixes only exist ≥1 s after acquisition, by which point the
+  module is already switching to 10 Hz.
 
 **Why baud first (changed in v0.0.42).** Peter, 2026-07-13: *"Die
 Baudrate als ersten Schritt auf 230400 erhöhen. Mit 9600 kollabiert die
