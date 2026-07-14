@@ -48,16 +48,32 @@ static void format_date(char *out, size_t len)
 static void decode_reset(char *out, size_t len, uint32_t csr)
 {
   out[0] = '\0';
-  const char *names[] = { "LPWR","WWDG","IWDG","SOFTWARE","BOR","PIN","POR","OBL" };
-  /* STM32U5 CSR bits: bit23=LPWRRSTF, bit24=WWDGRSTF, bit25=IWDGRSTF,
-     bit26=SFTRSTF, bit27=BORRSTF, bit28=PINRSTF, bit29=OBLRSTF.
-     (No bit-29 POR alone — POR appears as BORRSTF+PINRSTF on STM32U5.) */
-  uint32_t bits = (csr >> 23) & 0x7F;
+  /* STM32U5 RCC_CSR reset flags (RM0456 / stm32u585xx.h):
+       bit25 = OBLRSTF  (option-byte-loader launch — every FOTA bank swap)
+       bit26 = PINRSTF  (NRST pin — accompanies most internal resets)
+       bit27 = BORRSTF  (brown-out — power was cut/ramped: magnet cycle)
+       bit28 = SFTRSTF  (NVIC_SystemReset)
+       bit29 = IWDGRSTF   bit30 = WWDGRSTF   bit31 = LPWRRSTF
+     Until v0.0.47 this table was shifted (assumed bit23=LPWR…29=OBL), so
+     every cause in older field logs is MISLABELED: PIN+BOR (magnet
+     power-cycle) printed as "SOFTWARE+BOR", PIN+OBL (FOTA swap) as
+     "IWDG+SOFTWARE", SFT+PIN as "SOFTWARE+PIN", IWDG+PIN (real watchdog)
+     as "SOFTWARE+POR", and a bare PIN reset (NRST glitch!) as "SOFTWARE".
+     Translate accordingly when reading logs older than this fix. */
+  const struct { uint32_t msk; const char *name; } flags[] = {
+    { RCC_CSR_OBLRSTF_Msk,  "OBL"      },
+    { RCC_CSR_PINRSTF_Msk,  "PIN"      },
+    { RCC_CSR_BORRSTF_Msk,  "BOR"      },
+    { RCC_CSR_SFTRSTF_Msk,  "SOFTWARE" },
+    { RCC_CSR_IWDGRSTF_Msk, "IWDG"     },
+    { RCC_CSR_WWDGRSTF_Msk, "WWDG"     },
+    { RCC_CSR_LPWRRSTF_Msk, "LPWR"     },
+  };
   int any = 0;
-  for (int i = 0; i < 7; i++) {
-    if (bits & (1u << i)) {
+  for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+    if (csr & flags[i].msk) {
       if (any) strncat(out, "+", len - strlen(out) - 1);
-      strncat(out, names[i], len - strlen(out) - 1);
+      strncat(out, flags[i].name, len - strlen(out) - 1);
       any = 1;
     }
   }
