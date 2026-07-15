@@ -568,6 +568,18 @@ the running system (EMI/supply) does. Errlog:
 (deliberately `***` so a bypass boot never reads as a clean production
 boot). Delete the file to restore the normal per-boot configuration.
 
+**v0.0.49 fix — the bypass must arm the RX IRQ itself.** On the normal
+path the UART4 RX byte interrupt is first armed as a side-effect of
+`listen_traffic`/`ubx_wait_ack` and then kept alive by the
+`HAL_UART_RxCpltCallback` re-arm; the bypass path runs neither, so
+v0.0.47/48 shipped with the RX ring dead in bypass mode (`gps_diag
+bytes=0` — a fixing module would still have read `rmc=0`, turning the
+A/B test's log half false-negative; the LED half was unaffected). The
+bypass branch now calls `HAL_UART_AbortReceive_IT` +
+`HAL_UART_Receive_IT` right after `gps_uart_reopen(9600)`, same pattern
+as `listen_traffic`. **Run the A/B test on ≥0.0.49** if the ERRLOG/CSV
+side of the result matters, not just the LED.
+
 The u-blox MAX-M10S is configured **on every boot, RAM layer only**
 (UBX-CFG-VALSET; the M10 never ACKs the legacy CFG-CFG save — verified
 across 15 field boots — so nothing persists and the module always

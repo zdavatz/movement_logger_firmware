@@ -875,9 +875,11 @@ int GPS_Init(void)
   extern void ErrLog_Writef(const char *fmt, ...);
 
   /* Enable UART4 IRQ early — we need it armed during the baud-detection
-     listen window so bytes accumulate in the ring. Priority 6 (below
-     SDMMC1 at ~14 so SD writes aren't preempted; above SysTick at 15
-     so a single-byte ring push finishes in <10 µs). */
+     listen window so bytes accumulate in the ring. Priority 6: on Cortex-M
+     a LOWER number preempts, so the <10 µs single-byte ring push preempts
+     every other app IRQ (OTG_FS at 13, SysTick at 15; SDMMC is polled, its
+     IRQ never enabled) — nothing at IRQ level can starve the UART into
+     silent byte loss (OVRDIS discards overruns uncounted). */
   HAL_NVIC_SetPriority(UART4_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(UART4_IRQn);
 
@@ -903,6 +905,17 @@ int GPS_Init(void)
       if (gps_uart_reopen(9600) != 0) {
         ErrLog_Write("gps: uart_init@9600 FAIL");
         return -1;
+      }
+      /* Arm the RX byte IRQ ourselves (v0.0.49). On the normal path the IRQ
+         is armed as a side-effect of listen_traffic/ubx_wait_ack and then
+         kept alive by HAL_UART_RxCpltCallback re-arms — the bypass path runs
+         neither, and v0.0.47/48 shipped with the ring stone-dead here: even
+         a fixing module would have logged bytes=0/rmc=0 and read as a
+         false-negative A/B result. Same abort-first pattern as
+         listen_traffic (HAL RxState can hold BUSY_RX leftovers). */
+      HAL_UART_AbortReceive_IT(&g_huart4);
+      if (HAL_UART_Receive_IT(&g_huart4, &g_rx_byte, 1) != HAL_OK) {
+        ErrLog_Write("*** gps: bypass: HAL_UART_Receive_IT FAIL ***");
       }
       g_locked_baud = 9600;
       g_rate_armed  = 0;
@@ -1322,7 +1335,8 @@ void GPS_GetStats(uint32_t *bytes, uint32_t *lines_good, uint32_t *lines_bad,
   if (rmc)         *rmc         = g_diag_rmc;
   if (gga)         *gga         = g_diag_gga;
   if (errors)      *errors      = g_diag_errors;
-  /* rx_dropped: STM32 512 B RX ring overflowed (main loop fell behind).
+  /* rx_dropped: STM32 RX ring (GPS_RX_RING_SIZE, 2 KB) overflowed (main
+     loop fell behind).
      ubx_dropped: 2048 B UBX relay ring overflowed (BLE drain fell behind).
      Both near 0 while the survey still drops replies ⇒ the MODULE never sent
      them ⇒ UART bandwidth saturation (baud/NMEA), not an STM32-side loss. */

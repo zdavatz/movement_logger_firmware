@@ -525,6 +525,16 @@ gps: ready @9600 baud, factory NMEA 1Hz, RX-only bypass
 ```
 Bumped `PL_FW_VERSION` → **0.0.47**.
 
+**v0.0.49: bypass RX-IRQ fix — run the A/B test on ≥0.0.49.** v0.0.47/48
+never armed the UART RX interrupt on the bypass path (normal boots get it as
+a side-effect of `listen_traffic`/`ubx_wait_ack`, which the bypass skips), so
+the ring stayed dead: `gps_diag bytes=0`, and even a fixing module would have
+logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
+(the LED half was always valid). The bypass branch now aborts + re-arms
+`HAL_UART_Receive_IT` right after `gps_uart_reopen(9600)`, mirroring
+`listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
+audit (adversarial gps.c review), not in the field.
+
 ## GPS adaptive nav rate: acquire @1 Hz, track @10 Hz (v0.0.46+) — `gps.c`
 
 **The "no fix ever with the FW running" fix (issue #10).** Peter isolated it
