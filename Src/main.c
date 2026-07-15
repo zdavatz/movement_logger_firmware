@@ -31,6 +31,10 @@
    reset reason in ErrLog_Init(). */
 uint32_t BootResetCsr;
 
+/* BLEOFF.CFG A/B flag (v0.0.50): 1 = BLE never initialized this boot and
+   the BlueNRG-LP is held in hardware reset. Set once during init. */
+static int g_ble_off;
+
 static void gpio_init_leds(void);
 static void beep_pattern(uint16_t freq, uint8_t reps, uint16_t ms_on, uint16_t ms_off);
 
@@ -149,7 +153,33 @@ int main(void)
     } else {
       ErrLog_Write("logger: session opened");
     }
-    if (BLE_Init() != 0) {
+    /* --- BLEOFF.CFG BLE-off bypass (v0.0.50, issue #10 A/B test) ---------
+       If a file named BLEOFF.CFG exists on the SD root (content ignored),
+       BLE_Init is skipped entirely and the BlueNRG-LP is held in hardware
+       reset (PD4 low — RSTN is active-low, see ble.c ble_chip_reset) so
+       the 2.4 GHz radio is provably silent. The box is then deliberately
+       invisible over Bluetooth: no advertising, no FileSync, no FOTA —
+       update/undo requires USB (delete the file) or DFU. Logging, GPS,
+       sensors and USB MSC run normally. Combine with GPSRAW.CFG to test
+       "factory GPS + no BLE". The *** entry latches the red LED so a
+       test boot never reads as a clean production boot. */
+    {
+      PL_File bleoff;
+      if (SDFat_OpenRead(&bleoff, "BLEOFF.CFG") == PL_FX_OK) {
+        SDFat_Close(&bleoff);
+        g_ble_off = 1;
+        __HAL_RCC_GPIOD_CLK_ENABLE();
+        GPIO_InitTypeDef g = {0};
+        g.Mode  = GPIO_MODE_OUTPUT_PP;
+        g.Pull  = GPIO_NOPULL;
+        g.Speed = GPIO_SPEED_FREQ_LOW;
+        g.Pin   = GPIO_PIN_4;
+        HAL_GPIO_Init(GPIOD, &g);
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_4, GPIO_PIN_RESET);
+        ErrLog_Write("*** ble: BLEOFF.CFG — BLE disabled, chip held in reset (A/B test) ***");
+      }
+    }
+    if (!g_ble_off && BLE_Init() != 0) {
       ErrLog_Write("ble: init FAIL");
       beep_pattern(2000, 7, 60, 80);
     }
@@ -179,7 +209,7 @@ int main(void)
     UsbMsc_Tick();
     Logger_Tick();
     GPS_Tick();
-    BLE_Tick();
+    if (!g_ble_off) BLE_Tick();
 
     /* Once the box has run stably past FW_CONFIRM_UPTIME_MS, mark a freshly
        BLE-flashed image healthy so the boot-attempt rollback won't revert it.

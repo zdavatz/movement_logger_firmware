@@ -568,6 +568,19 @@ the running system (EMI/supply) does. Errlog:
 (deliberately `***` so a bypass boot never reads as a clean production
 boot). Delete the file to restore the normal per-boot configuration.
 
+**`BLEOFF.CFG` BLE-off bypass (v0.0.50, issue #10 A/B test).** Same
+mechanic, other radio: if a file named `BLEOFF.CFG` exists on the SD
+root (content ignored), `main()` skips `BLE_Init`/`BLE_Tick` entirely
+and holds the BlueNRG-LP in hardware reset (PD4 low — RSTN is
+active-low), so the 2.4 GHz transmitter is provably silent (TX power
+was never raised: 0 dBm since the initial import, `ble.c` adv config).
+The box is then deliberately invisible over Bluetooth — no advertising,
+no FileSync, **no FOTA**; undo requires USB access (delete the file) or
+DFU. Logging, GPS, sensors and USB MSC run normally. Combine with
+`GPSRAW.CFG` for "factory GPS + no BLE". Errlog signature (`***`
+latches the red LED):
+`*** ble: BLEOFF.CFG — BLE disabled, chip held in reset (A/B test) ***`
+
 **v0.0.49 fix — the bypass must arm the RX IRQ itself.** On the normal
 path the UART4 RX byte interrupt is first armed as a side-effect of
 `listen_traffic`/`ubx_wait_ack` and then kept alive by the

@@ -525,6 +525,16 @@ gps: ready @9600 baud, factory NMEA 1Hz, RX-only bypass
 ```
 Bumped `PL_FW_VERSION` → **0.0.47**.
 
+**v0.0.50: `BLEOFF.CFG` BLE-off bypass (issue #10).** Same file-switch
+mechanic for the other radio: `BLEOFF.CFG` on the SD root → `main()` skips
+`BLE_Init`/`BLE_Tick` and holds the BlueNRG-LP in hardware reset (PD4 low,
+RSTN active-low) — 2.4 GHz provably silent, box invisible over Bluetooth
+(no FileSync/FOTA; undo = delete file via USB, or DFU). Logging/GPS/
+sensors/USB unaffected. Combine with `GPSRAW.CFG` for "factory GPS + no
+BLE". Errlog: `*** ble: BLEOFF.CFG — BLE disabled, chip held in reset
+(A/B test) ***`. Context: Peter suspects the BLE TX as the RF jammer; TX
+power was never raised (0 dBm since import, `ble.c` adv config).
+
 **v0.0.49: bypass RX-IRQ fix — run the A/B test on ≥0.0.49.** v0.0.47/48
 never armed the UART RX interrupt on the bypass path (normal boots get it as
 a side-effect of `listen_traffic`/`ubx_wait_ack`, which the bypass skips), so
