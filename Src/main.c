@@ -289,7 +289,6 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef     osc  = {0};
   RCC_ClkInitTypeDef     clk  = {0};
-  RCC_PeriphCLKInitTypeDef pc = {0};
 
   if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK) {
     Error_Handler(__FILE__, __LINE__);
@@ -326,31 +325,15 @@ void SystemClock_Config(void)
     Error_Handler(__FILE__, __LINE__);
   }
 
-  pc.PeriphClockSelection = RCC_PERIPHCLK_MDF1 | RCC_PERIPHCLK_ADF1 | RCC_PERIPHCLK_ADCDAC;
-  pc.Mdf1ClockSelection   = RCC_MDF1CLKSOURCE_PLL3;
-  pc.Adf1ClockSelection   = RCC_ADF1CLKSOURCE_PLL3;
-  pc.AdcDacClockSelection = RCC_ADCDACCLKSOURCE_PLL2;
-  pc.PLL3.PLL3Source      = RCC_PLLSOURCE_HSI;
-  pc.PLL3.PLL3M           = 2;
-  pc.PLL3.PLL3N           = 48;
-  pc.PLL3.PLL3P           = 2;
-  pc.PLL3.PLL3Q           = 25;
-  pc.PLL3.PLL3R           = 2;
-  pc.PLL3.PLL3RGE         = RCC_PLLVCIRANGE_1;
-  pc.PLL3.PLL3FRACN       = 0;
-  pc.PLL3.PLL3ClockOut    = RCC_PLL3_DIVQ;
-  pc.PLL2.PLL2Source      = RCC_PLLSOURCE_HSI;
-  pc.PLL2.PLL2M           = 2;
-  pc.PLL2.PLL2N           = 48;
-  pc.PLL2.PLL2P           = 2;
-  pc.PLL2.PLL2Q           = 7;
-  pc.PLL2.PLL2R           = 25;
-  pc.PLL2.PLL2RGE         = RCC_PLLVCIRANGE_1;
-  pc.PLL2.PLL2FRACN       = 0;
-  pc.PLL2.PLL2ClockOut    = RCC_PLL2_DIVR;
-  if (HAL_RCCEx_PeriphCLKConfig(&pc) != HAL_OK) {
-    Error_Handler(__FILE__, __LINE__);
-  }
+  /* PLL2/PLL3 stay OFF (v0.0.51, issue #10 EMI hygiene). The original import
+     carried two extra 384 MHz VCOs here (PLL2 → ADC/DAC kernel clock, PLL3 →
+     MDF/ADF) for peripherals this firmware never initializes — no HAL_ADC/
+     HAL_MDF/HAL_DAC call exists anywhere in Src/. Two free-running RF
+     oscillators next to a GPS front end are pure noise sources (VCO harmonics
+     and phase-noise skirts land near the 1575.42 MHz L1 band), so they are
+     simply never enabled now. USB uses HSI48 and SDMMC's ICLK defaults to
+     HSI48 too — neither touches PLL2/PLL3. If ADC/MDF support is ever added,
+     bring the PLL back WITH its consumer, not before. */
 
   /* Phase 3 peripheral kernel-clock sources. Required so I²C2 / SPI2 /
      UART4 / I²C4 run at the rate their Timing/baud config assumes

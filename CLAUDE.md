@@ -545,6 +545,35 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## PLL2/PLL3 never enabled (v0.0.51+) — `main.c`, issue #10 EMI hygiene
+
+**Issue-#10 verdict so far (2026-07-16):** the combined `GPSRAW.CFG` +
+`BLEOFF.CFG` run (v0.0.50, 2 h 1 min, radio provably silent per BT scan,
+factory GPS config, working RX ring) still logged `rmc=0` — **BLE and the GPS
+config are both exonerated.** Peter's separation experiments (case open,
+antenna/GPS/mainboard spread apart → GPS LED blinks + FW triple-flash;
+repacked after lock → keeps tracking; ~2 min to re-acquire when re-spread)
+pin the jammer on **broadband near-field noise from the mainboard/MCU**
+reaching the active antenna + module — acquisition is the sensitive phase,
+tracking survives. EMV write-up: Peter's `ML EMV.pdf` (WhatsApp,
+2026-07-16). The live diagnosis tool is the desktop **GPS Debug tab over the
+BLE bridge** (`gps-debug` `run_core`): NAV-PVT/SAT/SIG + MON-RF
+(jamInd/noisePerMS/agcCnt) + **MON-SPAN spectrum** (added 2026-07-16 in
+`movement_logger_desktop`).
+
+**The v0.0.51 change:** `SystemClock_Config` carried two extra 384 MHz VCOs
+from the original import — PLL2 (→ ADC/DAC kernel clock) and PLL3 (→
+MDF1/ADF1) — for peripherals this firmware **never initializes** (no
+`HAL_ADC`/`HAL_MDF`/`HAL_DAC` call exists in `Src/`). Two free-running RF
+oscillators next to a GPS front end are gratuitous noise sources (VCO
+harmonics/phase-noise skirts near L1 1575.42 MHz), so the
+`HAL_RCCEx_PeriphCLKConfig` block that enabled them is gone; they never
+start now. Safe because USB runs on HSI48 and SDMMC's ICLK defaults to
+HSI48 — no consumer of PLL2/PLL3 exists. If ADC/MDF support is ever added,
+re-enable the PLL **together with its consumer**. Don't expect this alone to
+fix issue #10 (the noise is broadband digital switching, not one VCO) — it's
+one lever of several; measure the delta with the GPS-Debug live C/N0 view.
+
 ## GPS adaptive nav rate: acquire @1 Hz, track @10 Hz (v0.0.46+) — `gps.c`
 
 **The "no fix ever with the FW running" fix (issue #10).** Peter isolated it
