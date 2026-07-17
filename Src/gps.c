@@ -98,6 +98,23 @@ static uint32_t g_rate_sent_tick;     /* HAL_GetTick() of the in-flight send */
 static uint32_t g_rate_backoff_until; /* no new switch attempts before this */
 static volatile uint8_t g_ack_valset; /* async ACK-ACK for CFG-VALSET seen */
 
+/* ---------- Periodic RF/signal health errlog line (v0.0.52) -------------- */
+/* One `gps_rf:` line every GPS_RF_LOG_INTERVAL_MS while the UBX path is up:
+   Peter's assembly metrics (2026-07-17) — fixType, numSV used, avg/min/max
+   C/N0 of the 6 strongest GPS+Galileo satellites (from the NAV-SAT frames
+   already flowing every 10th epoch) — plus the MON-RF EMI set (noisePerMS,
+   agcCnt, jamInd, jammingState, antStatus) from a fire-and-forget poll.
+   Makes every logged session an EMI record for issue #10 without a live
+   survey. Deliberately NEVER a `***` line: the desktop errlog_check grades
+   `***` markers as FAIL; RF health is trend data, graded host-side. */
+static uint32_t g_rf_next_poll;       /* tick of the next MON-RF poll */
+static uint32_t g_rf_poll_tick;       /* tick of the in-flight poll; 0 = none */
+static uint8_t  g_rf_noreply_logged;  /* one-shot no-reply marker per boot */
+static uint8_t  g_fix_type;           /* raw NAV-PVT fixType (0/2D/3D scale) */
+static uint8_t  g_top6[6];            /* strongest GPS+Galileo C/N0s, desc */
+static uint8_t  g_top6_n;
+static uint32_t g_top6_tick;          /* HAL_GetTick() of the last NAV-SAT */
+
 /* ---------- BLE GPS bridge state ---------------------------------------- */
 static volatile uint8_t g_bridge;                 /* survey bridge active */
 
@@ -472,6 +489,7 @@ static void parse_nav_pvt(const uint8_t *p, uint16_t len)
   uint8_t  fixtype = p[20];
   uint8_t  flags   = p[21];
   uint8_t  ok      = (flags & 0x01) && fixtype >= 2 && fixtype <= 4;
+  g_fix_type       = fixtype;                    /* raw scale for gps_rf line */
 
   g_latest.fix_q   = ok ? 1 : 0;
   g_latest.num_sat = p[23];
@@ -508,17 +526,84 @@ static void parse_nav_sat(const uint8_t *p, uint16_t len)
   uint16_t n = p[5];
   if ((uint16_t)(8 + 12 * n) > len) n = (uint16_t)((len - 8) / 12);
   uint8_t cn0max = 0, nsig = 0;
+  uint8_t t6[6] = {0}, t6n = 0;              /* strongest GPS+GAL, descending */
   for (uint16_t i = 0; i < n; i++) {
-    uint8_t cno = p[8 + 12 * i + 2];
+    uint8_t gnss = p[8 + 12 * i + 0];
+    uint8_t cno  = p[8 + 12 * i + 2];
     if (cno == 0) continue;                  /* in view but not tracked */
     if (cno > 99) cno = 99;
     if (nsig < 255) nsig++;
     if (cno > cn0max) cn0max = cno;
+    /* Top-6 insert for the gps_rf line — Peter's constellation filter:
+       GPS (gnssId 0) + Galileo (2) only. */
+    if (gnss == 0 || gnss == 2) {
+      for (uint8_t k = 0; k < 6; k++) {
+        if (k >= t6n || cno > t6[k]) {
+          for (uint8_t m = (t6n < 6) ? t6n : 5; m > k; m--) t6[m] = t6[m - 1];
+          t6[k] = cno;
+          if (t6n < 6) t6n++;
+          break;
+        }
+      }
+    }
   }
+  memcpy((void *)g_top6, t6, sizeof(t6));
+  g_top6_n        = t6n;
+  g_top6_tick     = HAL_GetTick();
   g_gsv_cn0_max   = cn0max;
   g_gsv_nsat_sig  = nsig;
   g_gsv_burst     = 1;
   g_gsv_seen_tick = HAL_GetTick();
+}
+
+/* UBX fixType rendered the way Peter reads it (0/2D/3D…), not a raw enum.
+   Mirrors the desktop gps-debug `fix_type_name`. */
+static const char *fix_name(uint8_t t)
+{
+  switch (t) {
+    case 0:  return "0";
+    case 1:  return "DR";
+    case 2:  return "2D";
+    case 3:  return "3D";
+    case 4:  return "3D+DR";
+    case 5:  return "TIME";
+    default: return "?";
+  }
+}
+
+/* UBX-MON-RF (0x0A 0x38): RF block 0 → the periodic `gps_rf:` errlog line.
+   Only consumed while OUR poll is in flight — during a BLE survey the host
+   polls MON-RF ~1/s and logging every relayed reply would flood the log. */
+static void parse_mon_rf(const uint8_t *p, uint16_t len)
+{
+  if (g_rf_poll_tick == 0) return;
+  if (len < 4 + 24 || p[1] < 1) return;      /* header + ≥1 RF block */
+  g_rf_poll_tick = 0;
+
+  uint8_t  jam_state = p[4 + 1] & 0x03;
+  uint8_t  ant_stat  = p[4 + 2];
+  uint16_t noise     = rd_u16(p + 4 + 12);
+  uint16_t agc       = rd_u16(p + 4 + 14);
+  uint8_t  jam_ind   = p[4 + 16];
+
+  /* Top-6 roll-up; zeroed when the last NAV-SAT is stale (> 15 s: signal
+     lost or module quiet — don't report a dead sky view as healthy). */
+  unsigned avg10 = 0, mn = 0, mx = 0, tn = g_top6_n;
+  if (tn > 0 && (HAL_GetTick() - g_top6_tick) <= 15000U) {
+    unsigned sum = 0;
+    for (unsigned k = 0; k < tn; k++) sum += g_top6[k];
+    avg10 = sum * 10U / tn;
+    mx = g_top6[0];
+    mn = g_top6[tn - 1];
+  }
+  static const char *js[4] = { "unk", "ok", "warn", "crit" };
+  static const char *as[5] = { "init", "?", "ok", "SHORT", "OPEN" };
+  ErrLog_Writef("gps_rf: fix=%s used=%u avg6=%u.%u min6=%u max6=%u "
+                "noise=%u agc=%u jam=%u state=%s ant=%s",
+                fix_name(g_fix_type), (unsigned)g_latest.num_sat,
+                avg10 / 10U, avg10 % 10U, mn, mx,
+                (unsigned)noise, (unsigned)agc, (unsigned)jam_ind,
+                js[jam_state], (ant_stat <= 4) ? as[ant_stat] : "?");
 }
 
 /* Protocol router: assembles UBX frames (sync 0xB5 0x62, Fletcher checksum)
@@ -574,6 +659,7 @@ static void gps_rx_byte(uint8_t b)
         if (!g_ux_skip) {
           if      (g_ux_cls == 0x01 && g_ux_id == 0x07) parse_nav_pvt(g_ux_pay, g_ux_len);
           else if (g_ux_cls == 0x01 && g_ux_id == 0x35) parse_nav_sat(g_ux_pay, g_ux_len);
+          else if (g_ux_cls == 0x0A && g_ux_id == 0x38) parse_mon_rf(g_ux_pay, g_ux_len);
           /* ACK-ACK for a CFG-VALSET: the adaptive-nav-rate switch is sent
              fire-and-forget from the superloop, so its confirmation arrives
              here instead of through the blocking init-time ubx_wait_ack. */
@@ -1300,6 +1386,30 @@ static void gps_rate_manage(void)
   }
 }
 
+/* Fire-and-forget MON-RF poll every GPS_RF_LOG_INTERVAL_MS, feeding the
+   `gps_rf:` errlog line via parse_mon_rf. Skipped while the survey bridge
+   owns the channel (the host polls MON-RF itself) and on the NMEA-fallback
+   line (UBX out never landed — the poll could not be answered). A lost
+   reply retries at the next interval; one plain (non-***) marker per boot
+   satisfies Peter's every-unanswered-command-logs rule without spamming. */
+static void gps_rf_manage(void)
+{
+  if (!g_rate_armed || g_bridge) return;
+  uint32_t now = HAL_GetTick();
+  if (g_rf_poll_tick != 0) {
+    if ((now - g_rf_poll_tick) <= 2000U) return;   /* reply still pending */
+    if (!g_rf_noreply_logged) {
+      g_rf_noreply_logged = 1;
+      ErrLog_Write("gps_rf: MON-RF poll unanswered (module without MON-RF?)");
+    }
+    g_rf_poll_tick = 0;
+  }
+  if ((int32_t)(now - g_rf_next_poll) < 0) return;
+  g_rf_next_poll = now + GPS_RF_LOG_INTERVAL_MS;
+  g_rf_poll_tick = now | 1U;                       /* never 0 (= idle) */
+  ubx_send(0x0A, 0x38, NULL, 0);
+}
+
 void GPS_Tick(void)
 {
   /* GPS powered off (backup mode): no NMEA is arriving. Discard anything that
@@ -1323,6 +1433,7 @@ void GPS_Tick(void)
   }
 
   gps_rate_manage();
+  gps_rf_manage();
 }
 
 void GPS_GetStats(uint32_t *bytes, uint32_t *lines_good, uint32_t *lines_bad,

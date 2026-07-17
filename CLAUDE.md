@@ -545,6 +545,38 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## Periodic `gps_rf:` RF/signal health errlog line (v0.0.52+) — `gps.c`
+
+One errlog line every `GPS_RF_LOG_INTERVAL_MS` (60 s, `config.h`) while the
+UBX path is up, carrying Peter's assembly metrics (2026-07-17) so every
+logged session doubles as an EMI record for issue #10 — no live survey
+needed:
+
+```
+gps_rf: fix=3D used=12 avg6=41.3 min6=38 max6=45 noise=88 agc=3120 jam=3 state=ok ant=ok
+```
+
+- `fix`/`used` from the NAV-PVT already flowing (raw fixType on Peter's
+  0/2D/3D scale, numSV used in the solution); `avg6/min6/max6` = mean/min/max
+  C/N0 of the 6 strongest **GPS+Galileo** satellites from the NAV-SAT frames
+  already arriving every 10th epoch (top-6 collected in `parse_nav_sat`,
+  zeroed when the last NAV-SAT is > 15 s stale). `noise` (noisePerMS), `agc`
+  (agcCnt), `jam` (jamInd/cwSuppression), `state` (jammingState), `ant`
+  (antStatus) from **UBX-MON-RF**, polled fire-and-forget by
+  `gps_rf_manage()` in `GPS_Tick` and parsed by `parse_mon_rf` in the
+  frame router.
+- The poll is skipped while the survey bridge is active (the host polls
+  MON-RF itself ~1/s — `parse_mon_rf` also ignores replies when no own poll
+  is in flight, so relayed survey replies never spam the log) and on the
+  NMEA-fallback line (`!g_rate_armed` — UBX out never landed, a poll could
+  not answer). A lost reply retries next interval; one plain marker per boot
+  (`gps_rf: MON-RF poll unanswered …`) satisfies Peter's
+  every-unanswered-command-logs rule without spam.
+- **Never make this a `***` line** — the desktop `errlog_check` grades `***`
+  markers as FAIL; RF health is trend data and is graded host-side (the
+  desktop warns on `ant=SHORT/OPEN` and `state=crit`, shows the rest as
+  Info). Keep the `key=value` tokens stable — the desktop parses them.
+
 ## PLL2/PLL3 never enabled (v0.0.51+) — `main.c`, issue #10 EMI hygiene
 
 **Issue-#10 verdict so far (2026-07-16):** the combined `GPSRAW.CFG` +

@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.51"
+#define PL_FW_VERSION          "0.0.52"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -82,6 +82,12 @@
    against 23 KB/s of line → ~6 % utilisation. */
 #define GPS_UART_BAUDRATE      230400U
 #define GPS_RX_RING_SIZE       2048U         /* byte-IRQ RX ring (gps.c) */
+/* Periodic `gps_rf:` errlog line (v0.0.52): Peter's assembly metrics
+   (fixType, numSV used, top-6 GPS+Galileo C/N0) + the MON-RF EMI set
+   (noisePerMS, agcCnt, jamInd, jammingState, antStatus) — one line per
+   interval while the UBX path is up. ~110 B/line → ~160 KB/day at 60 s,
+   small next to the 5 s gps_diag cadence. */
+#define GPS_RF_LOG_INTERVAL_MS 60000U
 
 /* Cooperative scheduler ----------------------------------------------------*/
 #define PL_TICK_HZ             1000U         /* SysTick @ 1 ms */
