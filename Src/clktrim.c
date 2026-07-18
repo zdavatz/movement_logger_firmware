@@ -68,6 +68,11 @@ void ClkTrim_Init(void)
      Legal only while LSEON=0 (true at boot). */
   __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_MEDIUMHIGH);
   SET_BIT(RCC->BDCR, RCC_BDCR_LSEON);
+  /* LSEON alone feeds only the RTC domain. Peripherals (LPTIM1 kernel
+     clock here) receive LSE only with LSESYSEN set — without it the
+     first flash of v0.0.54 saw LSERDY but LPTIM1's ARR never synced
+     (kernel clock dead) and the trim bailed with "LPTIM1 setup failed". */
+  SET_BIT(RCC->BDCR, RCC_BDCR_LSESYSEN);
 
   g_lse_wait_t0 = HAL_GetTick();
   g_state       = CT_WAIT_LSE;
@@ -85,7 +90,9 @@ static int lptim_read(uint16_t *out)
   return -1;
 }
 
-/* Bring LPTIM1 up free-running from LSE. Returns 0 on success. */
+/* Bring LPTIM1 up free-running from LSE. Returns 0 on success, -1 on a
+   kernel-clock mux failure, -2 when the ARR write never syncs into the
+   LSE domain (kernel clock not actually ticking). */
 static int lptim_start(void)
 {
   RCC_PeriphCLKInitTypeDef pc = {0};
@@ -102,7 +109,7 @@ static int lptim_start(void)
      bounded wait, torn setup degrades to CT_OFF rather than blocking. */
   uint32_t t0 = HAL_GetTick();
   while (!(LPTIM1->ISR & LPTIM_ISR_ARROK)) {
-    if (HAL_GetTick() - t0 > 10u) return -1;
+    if (HAL_GetTick() - t0 > 10u) return -2;
   }
   LPTIM1->CR = LPTIM_CR_ENABLE | LPTIM_CR_CNTSTRT;
   return 0;
@@ -143,9 +150,11 @@ void ClkTrim_Tick(void)
     return;
 
   case CT_WAIT_LSE:
-    if (RCC->BDCR & RCC_BDCR_LSERDY) {
-      if (lptim_start() != 0) {
-        ErrLog_Write("clk: LSE ready but LPTIM1 setup failed — tick untrimmed");
+    if ((RCC->BDCR & RCC_BDCR_LSERDY) && (RCC->BDCR & RCC_BDCR_LSESYSRDY)) {
+      int rc = lptim_start();
+      if (rc != 0) {
+        ErrLog_Writef("clk: LSE ready but LPTIM1 setup failed (%s) — tick untrimmed",
+                      (rc == -1) ? "kernel mux" : "ARR sync");
         g_state = CT_OFF;
         return;
       }
