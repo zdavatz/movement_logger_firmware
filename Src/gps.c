@@ -114,6 +114,14 @@ static uint8_t  g_fix_type;           /* raw NAV-PVT fixType (0/2D/3D scale) */
 static uint8_t  g_top6[6];            /* strongest GPS+Galileo C/N0s, desc */
 static uint8_t  g_top6_n;
 static uint32_t g_top6_tick;          /* HAL_GetTick() of the last NAV-SAT */
+/* Cached MON-RF reply for the SensorStream RF extension (v0.0.55): the
+   Live tabs show Peter's assembly metrics without the GPS-Debug survey.
+   Polls run every GPS_RF_POLL_MS; the errlog line keeps its own slower
+   GPS_RF_LOG_INTERVAL_MS cadence. */
+static uint8_t  g_rf_jam_state, g_rf_ant, g_rf_jam_ind;
+static uint16_t g_rf_noise, g_rf_agc;
+static uint32_t g_rf_seen_tick;       /* last MON-RF reply; 0 = never */
+static uint32_t g_rf_last_log;        /* last gps_rf errlog line */
 
 /* ---------- BLE GPS bridge state ---------------------------------------- */
 static volatile uint8_t g_bridge;                 /* survey bridge active */
@@ -585,6 +593,19 @@ static void parse_mon_rf(const uint8_t *p, uint16_t len)
   uint16_t noise     = rd_u16(p + 4 + 12);
   uint16_t agc       = rd_u16(p + 4 + 14);
   uint8_t  jam_ind   = p[4 + 16];
+
+  /* Cache for the SensorStream RF extension (read by GPS_GetRfLive). */
+  g_rf_jam_state = jam_state;
+  g_rf_ant       = ant_stat;
+  g_rf_jam_ind   = jam_ind;
+  g_rf_noise     = noise;
+  g_rf_agc       = agc;
+  g_rf_seen_tick = HAL_GetTick();
+
+  /* The errlog line keeps its slower cadence even though polls now run
+     every GPS_RF_POLL_MS for the live stream. */
+  if ((HAL_GetTick() - g_rf_last_log) < GPS_RF_LOG_INTERVAL_MS) return;
+  g_rf_last_log = HAL_GetTick();
 
   /* Top-6 roll-up; zeroed when the last NAV-SAT is stale (> 15 s: signal
      lost or module quiet — don't report a dead sky view as healthy). */
@@ -1405,9 +1426,37 @@ static void gps_rf_manage(void)
     g_rf_poll_tick = 0;
   }
   if ((int32_t)(now - g_rf_next_poll) < 0) return;
-  g_rf_next_poll = now + GPS_RF_LOG_INTERVAL_MS;
+  g_rf_next_poll = now + GPS_RF_POLL_MS;
   g_rf_poll_tick = now | 1U;                       /* never 0 (= idle) */
   ubx_send(0x0A, 0x38, NULL, 0);
+}
+
+/* Live RF/signal health for the SensorStream extension (v0.0.55). All
+   fields zero when unknown; `fresh` is 1 only when a MON-RF reply landed
+   within the last 15 s (the top-6 roll-up has its own 15 s staleness
+   guard, mirroring the gps_rf errlog line). */
+void GPS_GetRfLive(PL_GpsRfLive *out)
+{
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  uint32_t now = HAL_GetTick();
+  out->fix_type = g_fix_type;
+  out->used_sv  = g_latest.num_sat;
+  if (g_top6_n > 0 && (now - g_top6_tick) <= 15000U) {
+    unsigned sum = 0;
+    for (unsigned k = 0; k < g_top6_n; k++) sum += g_top6[k];
+    out->avg6_x10 = (uint16_t)(sum * 10U / g_top6_n);
+    out->max6     = g_top6[0];
+    out->min6     = g_top6[g_top6_n - 1];
+  }
+  if (g_rf_seen_tick != 0 && (now - g_rf_seen_tick) <= 15000U) {
+    out->noise_per_ms = g_rf_noise;
+    out->agc_cnt      = g_rf_agc;
+    out->jam_ind      = g_rf_jam_ind;
+    out->jam_state    = g_rf_jam_state;
+    out->ant_status   = g_rf_ant;
+    out->fresh        = 1;
+  }
 }
 
 void GPS_Tick(void)

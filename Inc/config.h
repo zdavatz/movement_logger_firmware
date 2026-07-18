@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.54"
+#define PL_FW_VERSION          "0.0.55"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -88,6 +88,10 @@
    interval while the UBX path is up. ~110 B/line → ~160 KB/day at 60 s,
    small next to the 5 s gps_diag cadence. */
 #define GPS_RF_LOG_INTERVAL_MS 60000U
+/* MON-RF poll cadence (v0.0.55): faster than the errlog line so the
+   SensorStream RF extension (Live tabs) stays fresh; the errlog keeps its
+   60 s cadence via g_rf_last_log. One ~24 B poll + ~28 B reply per period. */
+#define GPS_RF_POLL_MS         5000U
 
 /* SysTick trim vs the LSE crystal (v0.0.54, clktrim.c) ---------------------.
    sysclk is HSI16-derived (±1 % RC; HSE unusable on the 3.3 V mod) and the
@@ -95,7 +99,7 @@
    session vs host SET_TIME anchors). If the 32.768 kHz LSE starts, LPTIM1
    free-runs from it and the SysTick reload is slewed until 1 tick == 1 wall
    millisecond. No LSE → plain errlog note, behaviour unchanged. */
-#define CLK_LSE_TIMEOUT_MS     10000U   /* give up on LSERDY after this     */
+#define CLK_LSE_TIMEOUT_MS     30000U   /* give up on LSERDY after this — the Rev_C crystal measured 11.1 s to LSESYSRDY on first hardware, so 10 s was one unlucky tick away from a false "no LSE" */
 #define CLK_TRIM_WINDOW_MS     60000U   /* measure/correct once per window  */
 #define CLK_TRIM_MAX_PPM       20000U   /* cumulative slew clamp (2 %)      */
 

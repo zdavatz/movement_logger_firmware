@@ -28,9 +28,28 @@ typedef struct {
   uint8_t  sats_in_view;     /* satellites reporting a C/N0 in the last burst */
 } PL_GpsFix;
 
+/* Live RF/signal health for the SensorStream extension (v0.0.55): Peter's
+   assembly metrics (fixType, sats used, top-6 GPS+Galileo C/N0) + the
+   MON-RF EMI set, cached from the periodic gps_rf poll so the Live tabs
+   can show them without the GPS-Debug survey. Zeroed when unknown. */
+typedef struct {
+  uint8_t  fix_type;      /* raw NAV-PVT fixType (0..5)                  */
+  uint8_t  used_sv;       /* satellites used in the solution             */
+  uint16_t avg6_x10;      /* mean of 6 strongest GPS+Galileo C/N0, x10   */
+  uint8_t  min6;          /* weakest of the top-6 (dB-Hz)                */
+  uint8_t  max6;          /* strongest of the top-6 (dB-Hz)              */
+  uint16_t noise_per_ms;  /* MON-RF noisePerMS (broadband)               */
+  uint16_t agc_cnt;       /* MON-RF agcCnt                               */
+  uint8_t  jam_ind;       /* MON-RF jamInd (narrowband CW, 0..255)       */
+  uint8_t  jam_state;     /* MON-RF jammingState 0..3                    */
+  uint8_t  ant_status;    /* MON-RF antStatus 0..4 (3=SHORT, 4=OPEN)     */
+  uint8_t  fresh;         /* 1 = MON-RF reply within the last 15 s       */
+} PL_GpsRfLive;
+
 int  GPS_Init(void);
 void GPS_Tick(void);
 int  GPS_GetLatestFix(PL_GpsFix *out);
+void GPS_GetRfLive(PL_GpsRfLive *out);
 /* True if a fresh fix was published since last Get-call. Auto-cleared. */
 uint8_t GPS_FixUpdated(void);
 /* Diagnostic counters for Build #8 GPS bring-up. Pass NULL for fields you

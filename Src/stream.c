@@ -34,6 +34,7 @@ static inline void wr32(uint8_t *p, int32_t v)
 }
 
 void Stream_Pack(const PL_Snapshot *s, uint8_t logging_active,
+                 const PL_GpsRfLive *rf,
                  uint8_t out[STREAM_PACKET_SIZE])
 {
   memset(out, 0, STREAM_PACKET_SIZE);
@@ -80,6 +81,24 @@ void Stream_Pack(const PL_Snapshot *s, uint8_t logging_active,
   if (s->gps.valid)      flags |= 0x01;   /* bit 0: gps_valid */
   /* bit 1 (low_battery) is owned by the battery module — Phase 7 */
   if (logging_active)    flags |= 0x04;   /* bit 2: logging_active */
+  if (rf && rf->fresh)   flags |= 0x08;   /* bit 3: RF extension fresh */
   out[44] = flags;
   out[45] = s->gps.cn0_max;                /* GPS strongest C/N0 (dB-Hz), 0 = no data */
+
+  /* GPS RF extension (v0.0.55, bytes 46..57) — Peter's assembly metrics
+     for the Live tabs. All zero when `rf` is NULL / nothing cached. */
+  if (rf) {
+    out[46] = rf->fix_type;
+    out[47] = rf->used_sv;
+    out[48] = (uint8_t)(rf->avg6_x10 & 0xFF);
+    out[49] = (uint8_t)(rf->avg6_x10 >> 8);
+    out[50] = rf->min6;
+    out[51] = rf->max6;
+    out[52] = (uint8_t)(rf->noise_per_ms & 0xFF);
+    out[53] = (uint8_t)(rf->noise_per_ms >> 8);
+    out[54] = (uint8_t)(rf->agc_cnt & 0xFF);
+    out[55] = (uint8_t)(rf->agc_cnt >> 8);
+    out[56] = rf->jam_ind;
+    out[57] = (uint8_t)((rf->jam_state & 0x0F) | ((rf->ant_status & 0x0F) << 4));
+  }
 }

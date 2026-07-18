@@ -316,13 +316,29 @@ offset  size  field                   units             source
  43       1   gps_nsat                # satellites      used in the solution
  44       1   flags                   bit field         see below
  45       1   gps_cn0_max             dB-Hz (u8)        strongest satellite C/N0 (NAV-SAT; GSV in NMEA fallback); 0 = no data
+ 46       1   rf_fix_type             raw NAV-PVT       v0.0.55+ GPS RF extension (bytes 46-57): 0 none, 2=2D, 3=3D, 4=3D+DR, 5=time
+ 47       1   rf_used_sv              # satellites      used in the solution (NAV-PVT numSV)
+ 48       2   rf_avg6_x10             dB-Hz × 10 (u16)  mean of the 6 strongest GPS+Galileo C/N0s; 0 = no data (NAV-SAT stale > 15 s)
+ 50       1   rf_min6                 dB-Hz (u8)        weakest of that top-6
+ 51       1   rf_max6                 dB-Hz (u8)        strongest of that top-6
+ 52       2   rf_noise_per_ms         u16               MON-RF noisePerMS (broadband noise floor)
+ 54       2   rf_agc_cnt              u16               MON-RF agcCnt (0..8191)
+ 56       1   rf_jam_ind              u8                MON-RF jamInd (narrowband CW, 0..255)
+ 57       1   rf_jam_ant              packed            bits 0-3 jammingState (0 unk / 1 ok / 2 warn / 3 crit), bits 4-7 antStatus (0 init / 2 ok / 3 SHORT / 4 OPEN)
 ```
+
+The RF extension (v0.0.55+) makes the packet **58 bytes**; hosts MUST
+accept both 46 (legacy firmware) and 58. Values come from the cached
+periodic MON-RF poll (`GPS_RF_POLL_MS`, 5 s) + the NAV-SAT top-6 roll-up
+— the same sources as the `gps_rf:` errlog line, so the Live tabs show
+Peter's assembly metrics without the GPS-Debug survey bridge.
 
 **flags** (bit 0 = LSB):
 - bit 0: gps_valid (set when the most-recent GPS fix is fresh — within the last 5 seconds).
 - bit 1: low_battery_warning_active.
 - bit 2: logging_active (1 = the box is recording this snapshot to SD as well; with the no-mode design this is normally always 1).
-- bits 3-7: reserved, must be 0.
+- bit 3: rf_fresh (v0.0.55+) — the MON-RF fields of the RF extension were updated within the last 15 s; 0 = module quiet / legacy.
+- bits 4-7: reserved, must be 0.
 
 **Gyro scaling**: the LSM6DSV16X at ±500 dps with 17.5 mdps/LSB has a
 ±9 deg/s range across an int16 — we'd lose precision. So we send

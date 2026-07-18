@@ -1882,8 +1882,10 @@ static void ble_stream_tick(void)
 
   PL_Snapshot snap;
   Logger_GetSnapshot(&snap);
+  PL_GpsRfLive rf;
+  GPS_GetRfLive(&rf);
   uint8_t pkt[STREAM_PACKET_SIZE];
-  Stream_Pack(&snap, (uint8_t)Logger_IsActive(), pkt);
+  Stream_Pack(&snap, (uint8_t)Logger_IsActive(), &rf, pkt);
   /* Non-blocking single attempt — if the TX buffer is full we just skip
      this 100 ms slot rather than stall the main loop. */
   ble_notify(g_stream_handle + 1, pkt, STREAM_PACKET_SIZE);
