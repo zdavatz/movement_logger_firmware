@@ -260,6 +260,7 @@ design + wire protocol in DESIGN.md §"Firmware update over BLE (FOTA)".
 | HW-9 | Power switch: **Hall sensor + magnet** wired as a hardware supply-rail interrupter (not a signal to the MCU). Hall-sensor part + circuit are a hardware-team task, no firmware visibility required. |
 | HW-10 | Wireless charging receiver IC + coil. Charging runs entirely outside firmware (MCU is off in that state) — no status pin to MCU is required. |
 | HW-11 | Buzzer: existing piezo via a TIM channel. |
+| HW-12 | Timebase: sysclk is HSI16 → PLL (HSE unusable on the 3.3 V board mod; measured tick error ~+4400 ppm). When the 32.768 kHz LSE crystal starts, `clktrim.c` (v0.0.54+) slews SysTick against LPTIM1-on-LSE so 1 tick == 1 wall millisecond; no LSE → tick stays raw HSI, recorded per boot with a plain `clk:` errlog line. |
 | HW-12 | Clock source: HSI (internal). HSE crystal is unreliable on battery due to the 3.3 V board mod. PLL targets 160 MHz sysclk. |
 | HW-13 | Waterproof enclosure: no user-accessible buttons, no SD-card swap, no USB connector. Magnet (in transport case) is the only user interface. |
 

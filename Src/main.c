@@ -26,6 +26,7 @@
 #include "usb_msc.h"
 #include "fwupdate.h"
 #include "calibration.h"
+#include "clktrim.h"
 
 /* Captured *before* HAL clears anything so the error log can decode the
    reset reason in ErrLog_Init(). */
@@ -51,6 +52,11 @@ int main(void)
   __HAL_RCC_CLEAR_RESET_FLAGS();
 
   SystemClock_Config();
+
+  /* Kick the LSE crystal now (non-blocking) so it has the whole sensor
+     bring-up (~7 s) to start; ClkTrim_Tick picks it up from the superloop
+     and slews SysTick to it. Logs nothing — errlog isn't up yet. */
+  ClkTrim_Init();
 
   /* Red LED on while we set up peripherals; green LED idle off. */
   gpio_init_leds();
@@ -216,6 +222,12 @@ int main(void)
        Self-gating one-shot — cheap no-op on every later call and when no update
        is pending. */
     FwUpdate_ConfirmBoot();
+
+    /* LSE-referenced SysTick trim (v0.0.54). Cheap: two register reads per
+       call until a 60 s window closes. */
+    if (sched_due(PL_SCHED_CLKTRIM, PL_CADENCE_CLKTRIM)) {
+      ClkTrim_Tick();
+    }
 
     /* Green-LED pattern based on GPS fix quality. Phase advances every
        125 ms; eight 125 ms slots = one second per cycle. Pattern table:

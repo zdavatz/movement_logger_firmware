@@ -545,6 +545,36 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## SysTick trim vs LSE crystal (v0.0.54+) — `clktrim.c`
+
+sysclk is HSI16 → PLL (HSE unusable on the 3.3 V mod) and HSI16 is a ±1 %
+RC: measured **+4400 ppm tick-fast** in the field (15 host `# SYNC` anchors
+in one 38-min session — the tick gained ~10 s vs wall clock). One SET_TIME
+anchor is therefore NOT enough to time a long session; the desktop's
+piecewise multi-anchor mapping was masking this. The trim makes the tick
+itself wall-accurate:
+
+- `ClkTrim_Init()` (right after `SystemClock_Config`) sets LSEON
+  **non-blocking** — whether the 32.768 kHz crystal actually works on
+  Rev_C was unproven (ST's own MKBOXPRO examples never enable it), so this
+  is a probe, not an assumption. Errlog answers it per boot: `clk: LSE ok —
+  SysTick trim armed` vs `clk: no LSE within 10 s — tick untrimmed`.
+- LPTIM1 free-runs from LSE (register-level — `HAL_LPTIM_MODULE_ENABLED`
+  stays off). `ClkTrim_Tick` (superloop, `PL_CADENCE_CLKTRIM` 500 ms — must
+  stay < 1500 ms, the 16-bit unwrap wraps at 2 s) accumulates LSE counts,
+  and once per `CLK_TRIM_WINDOW_MS` (60 s) folds the tick-vs-LSE error into
+  `SysTick->LOAD`. First window logs `clk: trim -#### ppm vs LSE — tick
+  wall-locked`; later windows only log a `re-trim` above 300 ppm.
+- Guards: cumulative slew clamped to ±2 % (`CLK_TRIM_MAX_PPM`); a window
+  claiming > ±3 % is discarded as torn; a > 1.5 s sample gap (superloop
+  stall) restarts the window instead of mis-unwrapping.
+- **Plain errlog lines only, never `***`** — an absent crystal is not a
+  mission failure and must not FAIL the boot in the desktop grader.
+- Scope: the trim moves SysTick only (logger timestamps, sensor cadence —
+  real 100.0 Hz — LED phases, HAL timeouts). UART/SPI/I²C bit clocks are
+  untouched and keep the raw HSI error (~0.44 %), which every peripheral
+  tolerates.
+
 ## Periodic `gps_rf:` RF/signal health errlog line (v0.0.52+) — `gps.c`
 
 One errlog line every `GPS_RF_LOG_INTERVAL_MS` (60 s, `config.h`) while the

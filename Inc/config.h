@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.53"
+#define PL_FW_VERSION          "0.0.54"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -89,6 +89,16 @@
    small next to the 5 s gps_diag cadence. */
 #define GPS_RF_LOG_INTERVAL_MS 60000U
 
+/* SysTick trim vs the LSE crystal (v0.0.54, clktrim.c) ---------------------.
+   sysclk is HSI16-derived (±1 % RC; HSE unusable on the 3.3 V mod) and the
+   tick measured ~+4400 ppm fast in the field (~10 s gained over a 38-min
+   session vs host SET_TIME anchors). If the 32.768 kHz LSE starts, LPTIM1
+   free-runs from it and the SysTick reload is slewed until 1 tick == 1 wall
+   millisecond. No LSE → plain errlog note, behaviour unchanged. */
+#define CLK_LSE_TIMEOUT_MS     10000U   /* give up on LSERDY after this     */
+#define CLK_TRIM_WINDOW_MS     60000U   /* measure/correct once per window  */
+#define CLK_TRIM_MAX_PPM       20000U   /* cumulative slew clamp (2 %)      */
+
 /* Cooperative scheduler ----------------------------------------------------*/
 #define PL_TICK_HZ             1000U         /* SysTick @ 1 ms */
 
@@ -102,6 +112,7 @@
 #define PL_CADENCE_HEARTBEAT   60000U        /* error-log heartbeat */
 #define PL_CADENCE_WATCHDOG    1U            /* kick IWDG every tick */
 #define PL_CADENCE_PLAUSIBLE   1000U         /* check sensor freshness 1 Hz */
+#define PL_CADENCE_CLKTRIM     500U          /* LSE-vs-SysTick sample 2 Hz — must stay < 1500 ms or the LPTIM 16-bit unwrap (2 s wrap) goes ambiguous */
 
 /* Sample-buffer sizes -----------------------------------------------------*/
 #define PL_SD_BLOCK_SIZE       512U

@@ -28,6 +28,7 @@ typedef enum {
   PL_SCHED_FLUSH,         /* SD flush @ PL_CADENCE_FLUSH   (1 Hz)   */
   PL_SCHED_LED,           /* Green LED toggle              (2 Hz)   */
   PL_SCHED_PLAUSIBLE,     /* Sensor-plausibility watchdog          */
+  PL_SCHED_CLKTRIM,       /* LSE-vs-SysTick trim @ PL_CADENCE_CLKTRIM */
   PL_SCHED_SLOT_COUNT
 } pl_sched_slot_t;
 
