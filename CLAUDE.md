@@ -545,6 +545,39 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## GPS mid-session link watchdog (v0.0.56+) — `gps.c`
+
+**The "Antennendaten manchmal sichtbar, manchmal nicht → dann tot bis zum
+Power-Cycle" fix (2026-07-20).** The module's TP LED kept blinking (module
+alive and *fixing*) while the box received nothing parseable — because the
+baud was negotiated **only in `GPS_Init`**, a module that reboots
+mid-session (supply glitch on the hand-soldered 3.3 V line → factory
+9600/NMEA, box still @230400) left the GPS deaf until a magnet cycle.
+Three pieces (constants `GPS_LINK_*` in `config.h`, spec in DESIGN.md
+§"Mid-session link watchdog"):
+
+- `link_mark_ok()` stamps every checksum-valid UBX frame / NMEA line;
+  garbage never stamps, so a baud mismatch reads as silence.
+- Gaps > 5 s that self-heal log one plain line on resume
+  (`gps: link gap NNNN ms (self-healed)`) — forensic trace of a flaky
+  joint. Deliberately not `***`.
+- 30 s of silence (UBX path armed, bridge off) → **blocking** recover:
+  assume-9600-then-confirm (no multi-baud probe — mid-session the module
+  is either rebooted → 9600 or alive-but-unheard → 230400), then the full
+  config replay via the new shared `gps_apply_config()` (= GPS_Init steps
+  2-6, factored out — keep them one function, both callers need identical
+  behavior). Success: `gps: link recovered #N @230400 baud` + nav-rate/
+  MON-RF state reset. Both bauds silent → physical problem:
+  `*** gps: link recover FAIL — module silent @9600+230400 (check
+  supply/RX joint) ***` + 5 min backoff. This is a **sanctioned
+  exception** to "no blocking ACK waits outside GPS_Init" (worst ~7 s,
+  under the 8 s IWDG, at most once per 5 min on a dead link) — don't
+  "fix" it into a fire-and-forget FSM without reading DESIGN.md first.
+  Not armed on the NMEA-fallback line / `GPSRAW.CFG` bypass; paused
+  while the survey bridge is active; GPS-off slides the stamp.
+
+Bumped `PL_FW_VERSION` → **0.0.56** (`Inc/config.h`).
+
 ## SysTick trim vs LSE crystal (v0.0.54+) — `clktrim.c`
 
 sysclk is HSI16 → PLL (HSE unusable on the 3.3 V mod) and HSI16 is a ±1 %

@@ -714,6 +714,54 @@ format (the desktop errlog_check parses it strictly): `lines_good/bad`
 count decoded/corrupt *units* — NMEA lines or UBX frames; `gga` counts
 epochs (PVT or GGA), `rmc` counts valid fixes.
 
+**Mid-session link watchdog (v0.0.56).** Field failure 2026-07-20: the
+Live-tab antenna data went "manchmal sichtbar, manchmal nicht", then
+dead for good — no PVT, no NAV-SAT, no MON-RF reply — while the
+module's TP LED kept blinking (module alive, powered *and fixing*; only
+the box deaf). The baud was negotiated **only** in `GPS_Init`, so a
+module that reboots mid-session (supply glitch on the hand-soldered
+3.3 V line → back at factory 9600/NMEA while the box UART sits at
+230400) stayed unreadable until a magnet power-cycle. Three additions
+in `gps.c` (constants `GPS_LINK_*` in `config.h`):
+
+- **Valid-frame stamp** (`link_mark_ok`): every checksum-valid unit —
+  UBX frame or NMEA line — refreshes `g_link_last_ok`. Garbage never
+  refreshes it, so a baud mismatch reads as silence.
+- **Gap logging**: an outage longer than `GPS_LINK_GAP_LOG_MS` (5 s)
+  that self-heals before the watchdog fires logs one plain line when
+  traffic resumes — `gps: link gap 8342 ms (self-healed)` — the
+  forensic trace of a flaky UART/supply joint. Never `***` (an outage
+  that healed is trend data, not a mission failure).
+- **Recovery** (`gps_link_manage` → `gps_link_recover`): after
+  `GPS_LINK_SILENCE_MS` (30 s = 30 missed PVT epochs at the 1 Hz
+  acquisition rate) with the UBX path armed and the survey bridge off,
+  one **blocking** recover runs: the same assume-9600-then-confirm
+  sequence as `GPS_Init` (wake pulse → blind baud raise at 9600 →
+  confirm via ACK-at-230400 or MON-VER poll), **minus the multi-baud
+  probe** — mid-session the module is either rebooted (→ 9600) or
+  alive-but-unheard (→ 230400); nothing else is reachable. On confirm
+  it replays the full config (steps 2-6, shared `gps_apply_config`)
+  and resets the nav-rate/MON-RF state machines; logged as
+  `gps: link recovered #N @230400 baud`. If **neither** baud answers,
+  the problem is physical (RX joint / supply, not config): restore the
+  session UART, log `*** gps: link recover FAIL — module silent
+  @9600+230400 (check supply/RX joint) ***`, back off
+  `GPS_LINK_RETRY_MS` (5 min) so a permanently dead link stalls the
+  superloop at most once per interval.
+
+This is a **sanctioned exception** to "no blocking ACK waits outside
+`GPS_Init`": it runs at most once per 30 s of proven link death (once
+per 5 min when dead for good), and the alternative — a non-blocking
+re-implementation of the whole config sequence — would duplicate the
+init path as a second state machine (§11: fewer FSMs, fewer wedges).
+Worst case ~1.6 s when the module is gone, ~7 s if every config ACK
+needs its full retry budget — under the 8 s IWDG, which is fed fresh
+at the top of the same superloop pass. Not armed on the NMEA-fallback
+line or in `GPSRAW.CFG` bypass (`g_rate_armed == 0` — the bypass must
+never see a config write), and paused while the survey bridge owns the
+channel (relayed replies keep the stamp fresh anyway). GPS-off slides
+the stamp so the silence window only starts at power-on.
+
 ### `BatNNN.csv` (one row per second)
 
 ```

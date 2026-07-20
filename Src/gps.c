@@ -123,6 +123,11 @@ static uint16_t g_rf_noise, g_rf_agc;
 static uint32_t g_rf_seen_tick;       /* last MON-RF reply; 0 = never */
 static uint32_t g_rf_last_log;        /* last gps_rf errlog line */
 
+/* Mid-session link watchdog (v0.0.56) — see GPS_LINK_* in config.h. */
+static uint32_t g_link_last_ok;       /* tick of last checksum-valid frame/line; 0 = not armed yet */
+static uint32_t g_link_next_attempt;  /* earliest tick for the next recover; 0 = no backoff */
+static uint16_t g_link_recoveries;    /* successful mid-session recovers this boot */
+
 /* ---------- BLE GPS bridge state ---------------------------------------- */
 static volatile uint8_t g_bridge;                 /* survey bridge active */
 
@@ -295,6 +300,23 @@ static int vs_send(const char *what)
   return 1;
 }
 
+/* Stamp a checksum-valid frame/line for the mid-session link watchdog, and
+   log the outage length when a > GPS_LINK_GAP_LOG_MS gap self-heals before
+   the watchdog fires (Peter, 2026-07-20: antenna data "manchmal sichtbar,
+   manchmal nicht" — these lines are the forensic trace of a flaky UART/
+   supply joint). Called from both protocol paths' good-frame sites only;
+   garbage bytes never refresh the stamp. */
+static void link_mark_ok(void)
+{
+  uint32_t now = HAL_GetTick();
+  if (g_link_last_ok != 0 && (now - g_link_last_ok) > GPS_LINK_GAP_LOG_MS) {
+    extern void ErrLog_Writef(const char *fmt, ...);
+    ErrLog_Writef("gps: link gap %lu ms (self-healed)",
+                  (unsigned long)(now - g_link_last_ok));
+  }
+  g_link_last_ok = now;
+}
+
 /* ---------- NMEA parser ------------------------------------------------- */
 
 static uint8_t nmea_checksum_ok(const char *line)
@@ -434,6 +456,7 @@ static void nmea_handle_line(char *line)
     return;
   }
   g_diag_lines_good++;
+  link_mark_ok();
   char *fields[24];
   int n = nmea_split(line, fields, 24);
   if (n < 1) return;
@@ -677,6 +700,7 @@ static void gps_rx_byte(uint8_t b)
       if (b == g_ux_ckb) {
         g_diag_lines_good++;
         g_diag_ubx_frames++;
+        link_mark_ok();
         if (!g_ux_skip) {
           if      (g_ux_cls == 0x01 && g_ux_id == 0x07) parse_nav_pvt(g_ux_pay, g_ux_len);
           else if (g_ux_cls == 0x01 && g_ux_id == 0x35) parse_nav_sat(g_ux_pay, g_ux_len);
@@ -957,6 +981,85 @@ static void gps_wake_pulse(void)
   HAL_Delay(120);
 }
 
+/* Steps 2-6 of Peter's per-boot recipe (constellations → power mode → UBX
+   output → NMEA off → 1 Hz acquisition rate), on whatever baud the UART is
+   currently locked to. Shared by GPS_Init and the mid-session link watchdog
+   (gps_link_recover) — a module that rebooted from a supply glitch is back
+   at its factory defaults and needs the full replay. Returns the failure
+   count; *pvt_ok_out (may be NULL) reports whether the UBX-output step
+   ACK'd — the gate for both the NMEA silencing and the 1↔10 Hz switcher. */
+static int gps_apply_config(int *pvt_ok_out)
+{
+  extern void ErrLog_Write(const char *msg);
+  int fails = 0;
+
+  /* 2. Constellations: GPS + Galileo on, BeiDou + GLONASS off. */
+  vs_begin();
+  vs_u1(CFG_SIGNAL_GPS_ENA,      1);
+  vs_u1(CFG_SIGNAL_GPS_L1CA_ENA, 1);
+  vs_u1(CFG_SIGNAL_GAL_ENA,      1);
+  vs_u1(CFG_SIGNAL_GAL_E1_ENA,   1);
+  vs_u1(CFG_SIGNAL_BDS_ENA,      0);
+  vs_u1(CFG_SIGNAL_BDS_B1_ENA,   0);
+  vs_u1(CFG_SIGNAL_BDS_B1C_ENA,  0);
+  vs_u1(CFG_SIGNAL_GLO_ENA,      0);
+  vs_u1(CFG_SIGNAL_GLO_L1_ENA,   0);
+  fails += vs_send("signal GPS+GAL -BDS -GLO");
+  HAL_Delay(500);   /* the receiver restarts its GNSS subsystem on a
+                       constellation change — give it a moment before the
+                       next command (u-blox M10 integration manual) */
+
+  /* 3. Full-power mode (no power-save duty cycling). */
+  vs_begin();
+  vs_u1(CFG_PM_OPERATEMODE, 0);
+  fails += vs_send("pm full-power");
+
+  /* 4. UBX protocol + periodic output: NAV-PVT every epoch, NAV-SAT every
+     10th. In/out protocol enables included — UBX *output* is off in the
+     M10 factory default, and after a power cut that default is what we get.
+     Safe to enable now: we are on the 230400 line, so the added output
+     cannot back up the module's TX and drown the ACKs (Peter, step-1 note). */
+  vs_begin();
+  vs_u1(CFG_UART1INPROT_UBX,             1);
+  vs_u1(CFG_UART1OUTPROT_UBX,            1);
+  vs_u1(CFG_MSGOUT_UBX_NAV_PVT_UART1,    1);
+  vs_u1(CFG_MSGOUT_UBX_NAV_SAT_UART1,   10);
+  int pvt_rc = vs_send("ubx out pvt=1 sat=10");
+  fails += pvt_rc;
+
+  /* 5. Silence NMEA — but only once the UBX feed is confirmed, so a partial
+     failure can never leave the module emitting nothing at all. */
+  if (pvt_rc == 0) {
+    vs_begin();
+    vs_u1(CFG_MSGOUT_NMEA_GGA_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_RMC_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GSV_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GSA_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_VTG_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_GLL_UART1, 0);
+    vs_u1(CFG_MSGOUT_NMEA_ZDA_UART1, 0);
+    fails += vs_send("nmea off");
+  } else {
+    ErrLog_Write("gps: keeping NMEA (ubx out not ACK'd) — fallback parser active");
+  }
+
+  /* 6. Nav rate — ACQUISITION rate, i.e. 1 Hz (v0.0.46, issue #10). The
+     module always cold-starts fix-less here, and acquiring at 10 Hz is what
+     kept the field boxes fix-less forever (26'583 epochs, rmc=0) while the
+     factory 1 Hz fixes on the same board. gps_rate_manage() raises the rate
+     to GPS_RATE_HZ once the first valid fix is in — tracking at 10 Hz is
+     proven fine (Peter's u-center: 15 sats / 3D at 10 Hz). On the slow
+     fallback line 1 Hz additionally keeps the link readable (5 Hz NAV-PVT
+     alone would be ~52 % of a 960 B/s line). */
+  vs_begin();
+  vs_u2(CFG_RATE_MEAS, (uint16_t)GPS_ACQ_RATE_MS);
+  vs_u2(CFG_RATE_NAV,  1);
+  fails += vs_send("rate 1Hz acq");
+
+  if (pvt_ok_out) *pvt_ok_out = (pvt_rc == 0);
+  return fails;
+}
+
 int GPS_Init(void)
 {
   memset(&g_latest, 0, sizeof(g_latest));
@@ -1152,73 +1255,15 @@ int GPS_Init(void)
     }
   }
 
-  /* 2. Constellations: GPS + Galileo on, BeiDou + GLONASS off. */
-  vs_begin();
-  vs_u1(CFG_SIGNAL_GPS_ENA,      1);
-  vs_u1(CFG_SIGNAL_GPS_L1CA_ENA, 1);
-  vs_u1(CFG_SIGNAL_GAL_ENA,      1);
-  vs_u1(CFG_SIGNAL_GAL_E1_ENA,   1);
-  vs_u1(CFG_SIGNAL_BDS_ENA,      0);
-  vs_u1(CFG_SIGNAL_BDS_B1_ENA,   0);
-  vs_u1(CFG_SIGNAL_BDS_B1C_ENA,  0);
-  vs_u1(CFG_SIGNAL_GLO_ENA,      0);
-  vs_u1(CFG_SIGNAL_GLO_L1_ENA,   0);
-  fails += vs_send("signal GPS+GAL -BDS -GLO");
-  HAL_Delay(500);   /* the receiver restarts its GNSS subsystem on a
-                       constellation change — give it a moment before the
-                       next command (u-blox M10 integration manual) */
-
-  /* 3. Full-power mode (no power-save duty cycling). */
-  vs_begin();
-  vs_u1(CFG_PM_OPERATEMODE, 0);
-  fails += vs_send("pm full-power");
-
-  /* 4. UBX protocol + periodic output: NAV-PVT every epoch, NAV-SAT every
-     10th. In/out protocol enables included — UBX *output* is off in the
-     M10 factory default, and after a power cut that default is what we get.
-     Safe to enable now: we are on the 230400 line, so the added output
-     cannot back up the module's TX and drown the ACKs (Peter, step-1 note). */
-  vs_begin();
-  vs_u1(CFG_UART1INPROT_UBX,             1);
-  vs_u1(CFG_UART1OUTPROT_UBX,            1);
-  vs_u1(CFG_MSGOUT_UBX_NAV_PVT_UART1,    1);
-  vs_u1(CFG_MSGOUT_UBX_NAV_SAT_UART1,   10);
-  int pvt_rc = vs_send("ubx out pvt=1 sat=10");
-  fails += pvt_rc;
-
-  /* 5. Silence NMEA — but only once the UBX feed is confirmed, so a partial
-     failure can never leave the module emitting nothing at all. */
-  if (pvt_rc == 0) {
-    vs_begin();
-    vs_u1(CFG_MSGOUT_NMEA_GGA_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_RMC_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_GSV_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_GSA_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_VTG_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_GLL_UART1, 0);
-    vs_u1(CFG_MSGOUT_NMEA_ZDA_UART1, 0);
-    fails += vs_send("nmea off");
-  } else {
-    ErrLog_Write("gps: keeping NMEA (ubx out not ACK'd) — fallback parser active");
-  }
-
-  /* 6. Nav rate — ACQUISITION rate, i.e. 1 Hz (v0.0.46, issue #10). The
-     module always cold-starts fix-less here, and acquiring at 10 Hz is what
-     kept the field boxes fix-less forever (26'583 epochs, rmc=0) while the
-     factory 1 Hz fixes on the same board. gps_rate_manage() raises the rate
-     to GPS_RATE_HZ once the first valid fix is in — tracking at 10 Hz is
-     proven fine (Peter's u-center: 15 sats / 3D at 10 Hz). On the slow
-     fallback line 1 Hz additionally keeps the link readable (5 Hz NAV-PVT
-     alone would be ~52 % of a 960 B/s line). */
-  vs_begin();
-  vs_u2(CFG_RATE_MEAS, (uint16_t)GPS_ACQ_RATE_MS);
-  vs_u2(CFG_RATE_NAV,  1);
-  fails += vs_send("rate 1Hz acq");
+  /* Steps 2-6: constellation / power / UBX-out / NMEA-off / 1 Hz acq rate
+     (shared with the mid-session link watchdog — gps_apply_config above). */
+  int pvt_ok = 0;
+  fails += gps_apply_config(&pvt_ok);
 
   /* Arm the fix-driven 1↔10 Hz switcher only when the configured UBX path
      is actually up — on the NMEA-fallback/slow line the rate must stay 1 Hz
      (and un-ACK'd VALSETs would only spam the errlog). */
-  g_rate_armed = (final_baud == GPS_UART_BAUDRATE && pvt_rc == 0) ? 1 : 0;
+  g_rate_armed = (final_baud == GPS_UART_BAUDRATE && pvt_ok) ? 1 : 0;
   g_rate_fast  = 0;
   g_rate_pending = 0;
   g_rate_tries = 0;
@@ -1230,7 +1275,7 @@ int GPS_Init(void)
   ErrLog_Writef("gps: ready @%lu baud, nav=1Hz acq%s, %s%s",
                 (unsigned long)final_baud,
                 g_rate_armed ? " (10Hz after first fix)" : "",
-                (pvt_rc == 0) ? "UBX NAV-PVT" : "NMEA fallback",
+                pvt_ok ? "UBX NAV-PVT" : "NMEA fallback",
                 (fails > 0) ? " (config incomplete)" : "");
 
   /* Apply the persisted GPS-power choice. If the user turned GPS off to save
@@ -1431,6 +1476,100 @@ static void gps_rf_manage(void)
   ubx_send(0x0A, 0x38, NULL, 0);
 }
 
+/* Mid-session link recovery (v0.0.56): the module went silent while the UBX
+   path was armed. By far the most likely field cause is a supply glitch on
+   the hand-soldered 3.3 V line — the module reboots into its factory
+   9600/NMEA state while our UART stays at 230400, so nothing parseable
+   ever arrives again (before v0.0.56 the baud was negotiated ONLY in
+   GPS_Init; the box stayed deaf until a magnet power-cycle). Same
+   assume-9600-then-confirm sequence as GPS_Init, minus the multi-baud
+   probe: mid-session there are exactly two plausible module states
+   (rebooted → 9600, alive-but-unheard → 230400); if neither answers, the
+   link itself is dead and no probing helps.
+
+   Blocking by design, like GPS_Init: worst case ~1.6 s when the module is
+   gone, ~7 s if every config ACK needs its full retry budget — both under
+   the 8 s IWDG (fresh-fed at the top of this superloop pass), and the
+   GPS_LINK_RETRY_MS backoff keeps a permanently dead link from stalling
+   the superloop more than once per interval. */
+static void gps_link_recover(void)
+{
+  extern void ErrLog_Write(const char *msg);
+  extern void ErrLog_Writef(const char *fmt, ...);
+
+  ErrLog_Writef("*** gps: link silent %lu s — reconfiguring module ***",
+                (unsigned long)((HAL_GetTick() - g_link_last_ok) / 1000U));
+
+  uint8_t confirmed = 0;
+  if (gps_uart_reopen(9600) == 0) {
+    gps_wake_pulse();
+    vs_begin();
+    vs_u4(CFG_UART1_BAUDRATE, GPS_UART_BAUDRATE);
+    ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);        /* blind, at 9600 */
+    if (gps_uart_reopen(GPS_UART_BAUDRATE) == 0) {
+      if (ubx_wait_ack(0x06, 0x8A, 700) == 0) {
+        confirmed = 1;
+        ErrLog_Write("gps: link recover — module was @9600 (module reboot)");
+      } else {
+        ubx_send(0x0A, 0x04, NULL, 0);               /* MON-VER poll */
+        int ux = 0;
+        listen_traffic(400, NULL, &ux);
+        if (ux > 0) {
+          confirmed = 1;
+          ErrLog_Write("gps: link recover — module alive @230400");
+        }
+      }
+    }
+  }
+
+  if (!confirmed) {
+    /* Silent at both bauds: not a config problem — RX joint or supply.
+       Restore the session UART (re-arms the RX IRQ) and back off. */
+    if (gps_uart_reopen(g_locked_baud) == 0)
+      listen_traffic(50, NULL, NULL);
+    ErrLog_Write("*** gps: link recover FAIL — module silent @9600+230400 (check supply/RX joint) ***");
+    g_link_next_attempt = HAL_GetTick() + GPS_LINK_RETRY_MS;
+    g_link_last_ok = HAL_GetTick();
+    return;
+  }
+
+  /* Module is talking again — replay the full config (a rebooted module is
+     back at factory defaults; a merely-unheard one just re-ACKs) and reset
+     every state machine that assumed the old session. */
+  int pvt_ok = 0;
+  int fails = gps_apply_config(&pvt_ok);
+  g_locked_baud        = GPS_UART_BAUDRATE;
+  g_rate_armed         = pvt_ok ? 1 : 0;
+  g_rate_fast          = 0;
+  g_rate_pending       = 0;
+  g_rate_tries         = 0;
+  g_rate_backoff_until = 0;
+  g_rf_poll_tick       = 0;      /* any in-flight MON-RF poll is void now */
+  g_link_recoveries++;
+  g_link_last_ok      = HAL_GetTick();
+  g_link_next_attempt = 0;
+  ErrLog_Writef("gps: link recovered #%u @%lu baud%s",
+                (unsigned)g_link_recoveries,
+                (unsigned long)GPS_UART_BAUDRATE,
+                (fails > 0) ? " (config incomplete)" : "");
+}
+
+/* Mid-session link watchdog (v0.0.56) — see GPS_LINK_* in config.h for the
+   field story. Armed only on the configured UBX path (g_rate_armed): the
+   NMEA-fallback line stays best-effort as before, and the GPSRAW.CFG bypass
+   must never see a config write. Paused while the survey bridge owns the
+   channel (the host is mid-conversation with the module; its relayed
+   replies keep the stamp fresh anyway). */
+static void gps_link_manage(void)
+{
+  if (!g_rate_armed || g_bridge) return;
+  uint32_t now = HAL_GetTick();
+  if (g_link_last_ok == 0) { g_link_last_ok = now; return; }
+  if ((now - g_link_last_ok) < GPS_LINK_SILENCE_MS) return;
+  if (g_link_next_attempt != 0 && (int32_t)(now - g_link_next_attempt) < 0) return;
+  gps_link_recover();
+}
+
 /* Live RF/signal health for the SensorStream extension (v0.0.55). All
    fields zero when unknown; `fresh` is 1 only when a MON-RF reply landed
    within the last 15 s (the top-6 roll-up has its own 15 s staleness
@@ -1465,6 +1604,9 @@ void GPS_Tick(void)
      trickled in (e.g. wake-up junk) so the ring can't wrap, and skip parsing. */
   if (g_power == 0) {
     g_rx_tail = g_rx_head;
+    /* Slide the link-watchdog stamp: a deliberately sleeping module is not
+       a dead link, and the silence window must not start until power-on. */
+    g_link_last_ok = HAL_GetTick();
     return;
   }
 
@@ -1483,6 +1625,7 @@ void GPS_Tick(void)
 
   gps_rate_manage();
   gps_rf_manage();
+  gps_link_manage();
 }
 
 void GPS_GetStats(uint32_t *bytes, uint32_t *lines_good, uint32_t *lines_bad,

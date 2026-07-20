@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.55"
+#define PL_FW_VERSION          "0.0.56"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -92,6 +92,28 @@
    SensorStream RF extension (Live tabs) stays fresh; the errlog keeps its
    60 s cadence via g_rf_last_log. One ~24 B poll + ~28 B reply per period. */
 #define GPS_RF_POLL_MS         5000U
+/* Mid-session GPS link watchdog (v0.0.56, gps.c). Field report 2026-07-20:
+   the Live-tab antenna data went "manchmal sichtbar, manchmal nicht", then
+   dead for good while the module's TP LED kept blinking — the module was
+   alive and fixing, the box deaf. GPS_Init was the ONLY place the baud was
+   ever negotiated, so a module that reboots mid-session (supply glitch on
+   the hand-soldered 3.3 V line → back at factory 9600/NMEA while our UART
+   sits at 230400) left the GPS dead until a magnet power-cycle.
+     GPS_LINK_SILENCE_MS  — no checksum-valid UBX frame or NMEA line for
+                            this long (UBX path armed, bridge off) → one
+                            blocking recover: assume-9600-then-confirm +
+                            full config replay. 30 s = 30 missed PVT epochs
+                            at the 1 Hz acquisition rate; a healthy line
+                            never pauses that long.
+     GPS_LINK_RETRY_MS    — backoff after a failed recover (module silent
+                            at both bauds → RX joint / supply, not config;
+                            re-probing sooner only stalls the superloop).
+     GPS_LINK_GAP_LOG_MS  — shorter outages that self-heal before the
+                            watchdog log one line when traffic resumes:
+                            the forensic trace of a flaky joint. */
+#define GPS_LINK_SILENCE_MS    30000U
+#define GPS_LINK_RETRY_MS     300000U
+#define GPS_LINK_GAP_LOG_MS     5000U
 
 /* SysTick trim vs the LSE crystal (v0.0.54, clktrim.c) ---------------------.
    sysclk is HSI16-derived (±1 % RC; HSE unusable on the 3.3 V mod) and the
