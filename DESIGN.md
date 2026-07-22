@@ -84,6 +84,8 @@ payload.
 | `0x12` | `GPS_GET_POWER` | none | Box replies one byte on FileData: `0` = off, `1` = on. Legacy firmware (< v0.0.35) never replies — the host treats a timeout as "unknown, assume on". |
 | `0x13` | `CAL_GET` | none | Box replies the 32-byte **calibration blob** (layout below). All hosts that connect to the same box see the same calibration — a per-box source of truth so a calibration set on the iPhone survives on the Desktop / Android without a re-tap. Legacy firmware (< v0.0.37) never replies — the host treats a timeout as "unknown, use local UserDefaults / config.toml as before". |
 | `0x14` | `CAL_SET` | 32-byte calibration blob | Merge the incoming blob into the box's persisted `CAL.CFG`. **Merge is per-field, not blob-replace**: only fields whose valid-mask bit is set in the incoming blob overwrite the stored ones; unset bits leave the corresponding field untouched. Lets a host push a single new field (e.g. just `nosePlusY`) without knowing the box's current `magOffsetMg`. Returns single-byte status. |
+| `0x15` | `BLE_QUIET` | `[<dur_s:u16-LE>]` | Arm the **BT-off GPS A/B window** (v0.0.57, issue #10): 1-byte status reply, then ~3 s of BT-on pre-samples, a clean box-side disconnect, and the BlueNRG-LP held in **hardware reset** for `dur_s` seconds (default 10, clamped 5–120) — 2.4 GHz provably silent — while the GPS RF metrics keep being sampled at 1 Hz into RAM **and** `gps_rfq:` errlog lines. Then full chip re-init + re-advertise + ~5 s post-samples. `0xB0 BUSY` while a transfer/FOTA, the GPS bridge, or another window is active. See the section below. |
+| `0x16` | `BLE_QUIET_RESULT` | none | Fetch the recorded window after the reconnect: one 8-byte header notify (`'Q'`, version `1`, `sample_size:u8`, `count:u16-LE`, `dur_s:u16-LE`, reserved), then `count` samples of `sample_size` bytes packed into MTU-sized FileData notifies. `count = 0` is a valid reply (no window ran). `0xB0 BUSY` while the window is still running. |
 | any other | reserved | — | Box replies `0xE3 BAD_REQUEST` on FileData. |
 
 **LOG mode: AUTO (default) vs MANUAL.** There is still no STREAM_START /
@@ -154,6 +156,57 @@ from RAM, `CAL_SET` mutates RAM and re-writes the whole 32-byte file
 (cheap — one SD block, no cluster rewrite unless the file didn't exist
 yet). Missing / corrupt / wrong-version `CAL.CFG` → RAM copy is zeroed
 (`valid_mask = 0`), same as "unset".
+
+### BLE quiet window (`BLE_QUIET` / `BLE_QUIET_RESULT`, v0.0.57+)
+
+Peter's issue-#10 hypothesis test: *does the BLE radio degrade GPS
+reception?* The window measures the C/N0 delta BT-on vs BT-off inside one
+session, under the same sky, seconds apart — far sharper than the
+session-long `BLEOFF.CFG` A/B (which exonerated BLE for the *total*
+acquisition block pre-v0.0.55, but was binary fix/no-fix; the open
+question now is *degradation* in dB-Hz).
+
+Driver: `ble_quiet_tick()` in `ble.c`, a 4-state machine
+(`IDLE → PRE → OFF → POST`) run at the very top of `BLE_Tick`:
+
+- **PRE (3 s, BT fully on)**: normal tick keeps running — the live stream
+  traffic IS the realistic BT-on baseline. 1 Hz samples begin immediately
+  (`GPS_RfFastPoll(1)` raises the MON-RF poll 5 s → 1 s).
+- **PRE→OFF edge**: `ErrLog_Flush()` (persist intent before going
+  off-air), clean `HCI_Disconnect` (the phone sees a real disconnect, no
+  limbo), clear conn state, then **RSTN low** — the `BLEOFF.CFG` lever,
+  the only state in which 2.4 GHz is provably silent (BT-scan verified in
+  the v0.0.50 run). A plain adv-stop would keep the chip's clocks and
+  DC-DC running and TX advertising bursts.
+- **OFF (`dur_s`, clamped 5–120 s)**: `ble_quiet_tick` returns 1 and
+  `BLE_Tick` skips its ENTIRE body — every branch talks SPI to a chip
+  that isn't there, and the periodic re-adv would count its inevitable
+  failures toward the wedged-chip escalation (full re-init after 3 fails
+  → `NVIC_SystemReset`) and cut a longer window short. GPS, logger,
+  sensors, USB run untouched from the superloop.
+- **OFF→POST edge**: full `BLE_Init()` — the proven mid-session bring-up
+  from the v0.0.23 wedged-re-adv escalation (~4 s blocking, IWDG kicked
+  around it; logging pauses those seconds — acceptable for a
+  hand-triggered diagnostic). Re-init failure → same last rung as the
+  wedged path: `*** ble: quiet re-init FAIL — system reset ***` +
+  `NVIC_SystemReset` (a reboot beats a box silent on 2.4 GHz forever;
+  the `gps_rfq:` lines survive on SD).
+- **POST (5 s, BT back on)**: box advertises again, hosts auto-reconnect
+  while the tail samples record. Then `GPS_RfFastPoll(0)`, buffer kept
+  for `0x16`.
+
+Every sample goes to BOTH sinks (zdavatz's requirement — in the log AND
+shown in the app after reconnect): a 16-byte packed record
+(`phase, t_s, fix_type, used_sv, avg6_x10:u16, min6, max6, noise:u16,
+agc:u16, jam_ind, jam_state, ant_status, rf_fresh`) into a static
+132-entry RAM buffer (~2.1 KB), and one plain `gps_rfq: p=pre|off|post
+t=… fix=… used=… avg6=… min6=… max6=… noise=… agc=… jam=… state=… ant=…
+fresh=…` errlog line. **Never `***` lines** — a deliberate test window
+is not a mission failure; the desktop grader must stay green.
+
+On a GPS-less / NMEA-fallback / GPS-off box the window still runs and
+records — samples just carry `fresh=0` and zeroed C/N0 (`gps_rf_manage`
+keeps its own `g_rate_armed` gate; `GPS_RfFastPoll` is a no-op there).
 
 ### Box → host (FileData notifies)
 

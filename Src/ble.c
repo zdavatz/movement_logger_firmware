@@ -147,6 +147,26 @@
                                         Per-field merge: only fields whose
                                         valid_mask bit is set are updated. */
 
+/* BT-off GPS A/B test (v0.0.57, issue #10 — Peter: "BT stört den Empfänger?").
+   BLE_QUIET arms a timed window in which the BlueNRG-LP is held in hardware
+   reset (2.4 GHz provably silent — same lever as the BLEOFF.CFG boot bypass)
+   while the GPS RF metrics (the Live-RF card set: fixType, used SVs, top-6
+   C/N0, MON-RF noise/agc/jam/ant) keep being sampled once per second into a
+   RAM buffer AND written to the errlog as `gps_rfq:` lines. Afterwards the
+   chip is fully re-initialized (proven mid-session BLE_Init path from the
+   v0.0.23 wedged-re-adv escalation), the host auto-reconnects and fetches
+   the buffer — the C/N0 delta BT-on vs BT-off answers the hypothesis
+   directly in the app. */
+#define FSYNC_OP_BLE_QUIET        0x15  /* [<dur_s:u16-LE>] → 1-byte status,
+                                           then: ~3 s pre-samples (BT on) →
+                                           disconnect + chip reset for dur_s →
+                                           re-init + ~5 s post-samples. */
+#define FSYNC_OP_BLE_QUIET_RESULT 0x16  /* (none) → 8-byte header
+                                           ('Q',ver,sample_size,count:u16-LE,
+                                           dur_s:u16-LE,rsvd) + `count`
+                                           16-byte samples, packed into
+                                           MTU-sized notifies. */
+
 /* Status bytes for READ/DELETE replies */
 #define FSYNC_ST_OK         0x00
 #define FSYNC_ST_BUSY       0xB0
@@ -630,6 +650,86 @@ static void ble_notify_or_defer(uint16_t val_handle, const uint8_t *data,
   g_pending_reply.queued_at  = HAL_GetTick();
   g_pending_reply.valid      = 1;
   ErrLog_Writef("ble: notify deferred (val=%u len=%u)", val_handle, len);
+}
+
+/* ----- BLE quiet window (BT-off GPS A/B test, 0x15/0x16) ------------------ */
+
+/* Timing: a short BT-on lead-in so the buffer carries its own baseline, the
+   host-requested off window, and a BT-on tail after the re-init. Durations
+   outside [QW_MIN_S, QW_MAX_S] are clamped — a runaway value must never
+   leave the box off-air for minutes. */
+#define QW_PRE_MS        3000U
+#define QW_POST_MS       5000U
+#define QW_MIN_S         5U
+#define QW_MAX_S         120U
+#define QW_SAMPLE_MS     1000U
+#define QW_MAX_SAMPLES   132U    /* 3 pre + 120 off + 5 post + margin */
+
+enum { QW_IDLE = 0, QW_PRE, QW_OFF, QW_POST };          /* driver state */
+enum { QW_PHASE_PRE = 0, QW_PHASE_OFF = 1, QW_PHASE_POST = 2 };
+
+/* One per-second RF snapshot — 16 B, the `sample_size` byte in the 0x16
+   header is authoritative on the wire so fields can grow later. Multi-byte
+   fields are little-endian (Cortex-M native = wire order). */
+typedef struct __attribute__((packed)) {
+  uint8_t  phase;         /* QW_PHASE_*: 0 = BT on (pre), 1 = BT off, 2 = post */
+  uint8_t  t_s;           /* seconds since window start */
+  uint8_t  fix_type;      /* raw NAV-PVT fixType */
+  uint8_t  used_sv;
+  uint16_t avg6_x10;      /* mean of top-6 GPS+Galileo C/N0, x10; 0 = no data */
+  uint8_t  min6;
+  uint8_t  max6;
+  uint16_t noise;         /* MON-RF noisePerMS */
+  uint16_t agc;           /* MON-RF agcCnt */
+  uint8_t  jam_ind;
+  uint8_t  jam_state;
+  uint8_t  ant_status;
+  uint8_t  rf_fresh;      /* 1 = MON-RF reply within the last 15 s */
+} qw_sample_t;
+
+static struct {
+  uint8_t  state;         /* QW_IDLE/PRE/OFF/POST */
+  uint32_t t0;            /* tick at window start (= PRE entry) */
+  uint32_t phase_start;   /* tick at current-state entry */
+  uint32_t next_sample;   /* tick of the next 1 Hz sample */
+  uint16_t dur_s;         /* requested BT-off duration */
+  uint16_t n;             /* samples recorded (kept after the window for 0x16) */
+} g_quiet;
+static qw_sample_t g_quiet_buf[QW_MAX_SAMPLES];
+
+/* Record one sample into the buffer AND the errlog — zdavatz: the values
+   must be in the log AND shown in the app after reconnect. Plain lines,
+   never `***` (the desktop errlog grader treats `***` as FAIL; a deliberate
+   test window is not a failure). */
+static void qw_take_sample(uint8_t phase)
+{
+  static const char *ph_name[3] = { "pre", "off", "post" };
+  PL_GpsRfLive rf;
+  GPS_GetRfLive(&rf);
+  uint32_t t_s = (HAL_GetTick() - g_quiet.t0) / 1000U;
+  if (g_quiet.n < QW_MAX_SAMPLES) {
+    qw_sample_t *s = &g_quiet_buf[g_quiet.n++];
+    s->phase      = phase;
+    s->t_s        = (uint8_t)(t_s > 255U ? 255U : t_s);
+    s->fix_type   = rf.fix_type;
+    s->used_sv    = rf.used_sv;
+    s->avg6_x10   = rf.avg6_x10;
+    s->min6       = rf.min6;
+    s->max6       = rf.max6;
+    s->noise      = rf.noise_per_ms;
+    s->agc        = rf.agc_cnt;
+    s->jam_ind    = rf.jam_ind;
+    s->jam_state  = rf.jam_state;
+    s->ant_status = rf.ant_status;
+    s->rf_fresh   = rf.fresh;
+  }
+  ErrLog_Writef("gps_rfq: p=%s t=%lu fix=%u used=%u avg6=%u.%u min6=%u max6=%u "
+                "noise=%u agc=%u jam=%u state=%u ant=%u fresh=%u",
+                ph_name[phase], (unsigned long)t_s,
+                rf.fix_type, rf.used_sv,
+                rf.avg6_x10 / 10U, rf.avg6_x10 % 10U, rf.min6, rf.max6,
+                rf.noise_per_ms, rf.agc_cnt, rf.jam_ind, rf.jam_state,
+                rf.ant_status, rf.fresh);
 }
 
 /* ----- FileSync command handling ----------------------------------------- */
@@ -1446,6 +1546,84 @@ static void ble_process_command(void)
     if (g_cmd_len > 1) {
       GPS_BridgeTx(&g_cmd_buf[1], (uint16_t)(g_cmd_len - 1));
     }
+  } else if (op == FSYNC_OP_BLE_QUIET) {
+    /* BLE_QUIET [<dur_s:u16-LE>]: arm the BT-off A/B window (default 10 s,
+       clamped to [QW_MIN_S, QW_MAX_S]). Status byte first — the host needs
+       the ACK to start its countdown — then the driver in ble_quiet_tick()
+       takes over: pre-samples, disconnect, chip reset, re-init, post-samples.
+       Refused while a transfer/FOTA or the GPS survey bridge is active: both
+       would be killed mid-flight by the disconnect. */
+    uint16_t dur = 10;
+    if (g_cmd_len >= 3) dur = (uint16_t)(g_cmd_buf[1] | (g_cmd_buf[2] << 8));
+    if (dur < QW_MIN_S) dur = QW_MIN_S;
+    if (dur > QW_MAX_S) dur = QW_MAX_S;
+    if (g_fsm.state != FSM_IDLE || GPS_BridgeActive() ||
+        g_quiet.state != QW_IDLE) {
+      uint8_t st = FSYNC_ST_BUSY;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: QUIET busy (fsm/bridge/window active)");
+    } else {
+      uint8_t st = FSYNC_ST_OK;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      g_quiet.state       = QW_PRE;
+      g_quiet.t0          = HAL_GetTick();
+      g_quiet.phase_start = g_quiet.t0;
+      g_quiet.next_sample = g_quiet.t0;      /* first sample this tick */
+      g_quiet.dur_s       = dur;
+      g_quiet.n           = 0;
+      GPS_RfFastPoll(1);
+      snprintf(buf, sizeof(buf), "ble: cmd BLE_QUIET dur=%us — window armed",
+               (unsigned)dur);
+      ErrLog_Write(buf);
+      /* Persist the intent before going off-air: if anything goes wrong
+         during the window, the SD copy explains what the box was doing. */
+      ErrLog_Flush();
+    }
+  } else if (op == FSYNC_OP_BLE_QUIET_RESULT) {
+    /* BLE_QUIET_RESULT: dump the recorded window. Header notify first
+       ('Q', version, sample_size, count u16-LE, dur_s u16-LE, reserved),
+       then the samples packed into MTU-sized notifies — the count tells the
+       host when the dump is complete, no terminator needed. count=0 (no
+       window ever ran, or it recorded nothing) is a valid reply. BUSY while
+       the window is still running — fetch after the reconnect. */
+    if (g_quiet.state != QW_IDLE) {
+      uint8_t st = FSYNC_ST_BUSY;
+      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ErrLog_Write("ble: QUIET_RESULT busy — window still running");
+    } else {
+      uint8_t hdr[8];
+      hdr[0] = 'Q';
+      hdr[1] = 1;                                   /* format version */
+      hdr[2] = (uint8_t)sizeof(qw_sample_t);
+      hdr[3] = (uint8_t)(g_quiet.n & 0xFF);
+      hdr[4] = (uint8_t)(g_quiet.n >> 8);
+      hdr[5] = (uint8_t)(g_quiet.dur_s & 0xFF);
+      hdr[6] = (uint8_t)(g_quiet.dur_s >> 8);
+      hdr[7] = 0;
+      if (ble_notify_try(g_filedata_handle + 1, hdr, sizeof(hdr), 500) != 0) {
+        ErrLog_Write("ble: QUIET_RESULT header notify failed");
+      } else {
+        uint16_t payload = (g_att_mtu > 3u) ? (uint16_t)(g_att_mtu - 3u) : 20u;
+        uint16_t per     = (uint16_t)(payload / sizeof(qw_sample_t));
+        if (per == 0) per = 1;
+        uint16_t sent = 0;
+        int      ok   = 1;
+        while (sent < g_quiet.n) {
+          uint16_t k = (uint16_t)(g_quiet.n - sent);
+          if (k > per) k = per;
+          if (ble_notify_try(g_filedata_handle + 1,
+                             (const uint8_t *)&g_quiet_buf[sent],
+                             (uint16_t)(k * sizeof(qw_sample_t)), 500) != 0) {
+            ok = 0;
+            break;
+          }
+          sent = (uint16_t)(sent + k);
+        }
+        ErrLog_Writef("ble: QUIET_RESULT → %u/%u samples%s",
+                      (unsigned)sent, (unsigned)g_quiet.n,
+                      ok ? "" : " (notify stalled — host retries)");
+      }
+    }
   } else if (op == FSYNC_OP_DISCONNECT) {
     /* DISCONNECT: the host is done and wants the link gone. On macOS its
        cancelPeripheralConnection leaves the ACL alive controller-side, so we
@@ -1475,6 +1653,97 @@ static void ble_gps_bridge_tick(void)
     if (n == 0) break;
     /* Congested → leave the rest in the ring for the next tick. */
     if (ble_notify_try(g_filedata_handle + 1, buf, n, 100) != 0) break;
+  }
+}
+
+/* ----- BLE quiet window driver ------------------------------------------- */
+
+/* Advances the 0x15 window. Returns 1 while the chip is in reset — the
+   caller (BLE_Tick) must then skip its entire normal body: every branch of
+   it talks SPI to a chip that isn't there, and the periodic re-adv would
+   count its inevitable failures toward the wedged-chip escalation (full
+   re-init after ADV_REARM_MAX_FAILS, then NVIC_SystemReset) and cut a
+   longer window short. Returns 0 in PRE/POST, where BT is fully on and the
+   normal tick must keep running (stream keeps flowing during PRE — that IS
+   the realistic BT-on baseline).
+
+   Superloop impact: the only blocking piece is the one BLE_Init() at the
+   OFF→POST edge (~4 s, IWDG kicked around it — the exact pattern the
+   v0.0.23 wedged-re-adv escalation already ships). Logging pauses for
+   those seconds; acceptable for a hand-triggered diagnostic. */
+static int ble_quiet_tick(void)
+{
+  if (g_quiet.state == QW_IDLE) return 0;
+  uint32_t now = HAL_GetTick();
+
+  /* 1 Hz sampling in every phase. Absolute re-arm (now + period), so a
+     stalled superloop can't burst-log missed seconds. */
+  if ((int32_t)(now - g_quiet.next_sample) >= 0) {
+    g_quiet.next_sample = now + QW_SAMPLE_MS;
+    qw_take_sample((g_quiet.state == QW_PRE) ? QW_PHASE_PRE :
+                   (g_quiet.state == QW_OFF) ? QW_PHASE_OFF : QW_PHASE_POST);
+  }
+
+  switch (g_quiet.state) {
+  case QW_PRE:
+    if ((now - g_quiet.phase_start) >= QW_PRE_MS) {
+      ErrLog_Writef("ble: quiet — BT off for %us (chip reset held)",
+                    (unsigned)g_quiet.dur_s);
+      ErrLog_Flush();
+      /* Clean teardown so the phone sees a real disconnect, then hold the
+         BlueNRG-LP in hardware reset — RSTN low is the BLEOFF.CFG lever,
+         the only state in which 2.4 GHz is provably silent (BT-scan
+         verified during the v0.0.50 A/B run). */
+      if (g_conn_handle != 0) {
+        ble_hci_disconnect(g_conn_handle, 0x13);
+        g_conn_handle = 0;
+      }
+      g_stream_subscribed   = 0;
+      g_battery_subscribed  = 0;
+      g_conn_param_due_ms   = 0;
+      g_pending_reply.valid = 0;
+      g_disconnect_latched  = 0;
+      cs_hi();
+      HAL_GPIO_WritePin(BLE_RST_PORT, BLE_RST_PIN, GPIO_PIN_RESET);
+      g_adv_active        = 0;
+      g_quiet.state       = QW_OFF;
+      g_quiet.phase_start = now;
+    }
+    return 0;
+  case QW_OFF:
+    if ((now - g_quiet.phase_start) >= (uint32_t)g_quiet.dur_s * 1000U) {
+      ErrLog_Write("ble: quiet — window over, chip re-init");
+      memset(&g_fsm, 0, sizeof(g_fsm));            /* defensive, is IDLE */
+      g_adv_fail_streak = 0;
+      Watchdog_Kick();
+      int rc = BLE_Init();       /* releases RSTN + full bring-up (~4 s) */
+      Watchdog_Kick();
+      ErrLog_Writef("ble: quiet re-init rc=%d", rc);
+      if (rc != 0) {
+        /* Same last rung as the wedged-re-adv escalation: a reboot beats a
+           box that stays silent on 2.4 GHz forever. AUTO mode reopens a
+           session; the buffer is lost but the gps_rfq: errlog lines and
+           this marker survive on SD. */
+        ErrLog_Write("*** ble: quiet re-init FAIL — system reset ***");
+        ErrLog_Flush();
+        HAL_Delay(50);
+        NVIC_SystemReset();
+      }
+      g_quiet.state       = QW_POST;
+      g_quiet.phase_start = HAL_GetTick();         /* re-init ate ~4 s */
+      g_quiet.next_sample = g_quiet.phase_start;
+    }
+    return 1;
+  case QW_POST:
+  default:
+    if ((now - g_quiet.phase_start) >= QW_POST_MS) {
+      GPS_RfFastPoll(0);
+      g_quiet.state = QW_IDLE;
+      ErrLog_Writef("ble: quiet done — %u samples buffered (fetch via 0x16)",
+                    (unsigned)g_quiet.n);
+      ErrLog_Flush();
+    }
+    return 0;
   }
 }
 
@@ -1923,6 +2192,11 @@ static void ble_battery_tick(void)
 void BLE_Tick(void)
 {
   if (!g_advertising) return;
+
+  /* BT-off A/B window (0x15): while the chip is held in reset this returns 1
+     and the ENTIRE normal tick is skipped — see ble_quiet_tick's comment.
+     GPS/logger/sensors keep running from the main superloop meanwhile. */
+  if (ble_quiet_tick()) return;
 
   /* Drain any status-byte reply that ble_notify_or_defer couldn't push out
      inside its 500 ms initial window (typically a DELETE reply that raced

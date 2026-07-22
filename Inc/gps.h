@@ -50,6 +50,10 @@ int  GPS_Init(void);
 void GPS_Tick(void);
 int  GPS_GetLatestFix(PL_GpsFix *out);
 void GPS_GetRfLive(PL_GpsRfLive *out);
+/* 1 = poll MON-RF at 1 Hz instead of the 5 s default — used by the BLE
+   quiet window (0x15) so its per-second samples carry fresh EMI values.
+   Harmless no-op when the UBX path isn't armed (fallback/no module). */
+void GPS_RfFastPoll(uint8_t on);
 /* True if a fresh fix was published since last Get-call. Auto-cleared. */
 uint8_t GPS_FixUpdated(void);
 /* Diagnostic counters for Build #8 GPS bring-up. Pass NULL for fields you

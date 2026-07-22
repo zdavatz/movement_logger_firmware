@@ -109,6 +109,7 @@ static volatile uint8_t g_ack_valset; /* async ACK-ACK for CFG-VALSET seen */
    `***` markers as FAIL; RF health is trend data, graded host-side. */
 static uint32_t g_rf_next_poll;       /* tick of the next MON-RF poll */
 static uint32_t g_rf_poll_tick;       /* tick of the in-flight poll; 0 = none */
+static uint8_t  g_rf_fast;            /* 1 = 1 Hz MON-RF polls (quiet window) */
 static uint8_t  g_rf_noreply_logged;  /* one-shot no-reply marker per boot */
 static uint8_t  g_fix_type;           /* raw NAV-PVT fixType (0/2D/3D scale) */
 static uint8_t  g_top6[6];            /* strongest GPS+Galileo C/N0s, desc */
@@ -1471,7 +1472,9 @@ static void gps_rf_manage(void)
     g_rf_poll_tick = 0;
   }
   if ((int32_t)(now - g_rf_next_poll) < 0) return;
-  g_rf_next_poll = now + GPS_RF_POLL_MS;
+  /* 1 Hz while a BLE quiet window samples per-second RF values (v0.0.57);
+     the normal 5 s cadence otherwise. */
+  g_rf_next_poll = now + (g_rf_fast ? 1000U : GPS_RF_POLL_MS);
   g_rf_poll_tick = now | 1U;                       /* never 0 (= idle) */
   ubx_send(0x0A, 0x38, NULL, 0);
 }
@@ -1596,6 +1599,17 @@ void GPS_GetRfLive(PL_GpsRfLive *out)
     out->ant_status   = g_rf_ant;
     out->fresh        = 1;
   }
+}
+
+void GPS_RfFastPoll(uint8_t on)
+{
+  /* BLE quiet window (v0.0.57): per-second RF samples need per-second
+     MON-RF replies. Arming also makes the next poll due immediately so
+     the first sample isn't up to 5 s stale. No-op on the NMEA-fallback
+     line or with GPS off — gps_rf_manage keeps its own g_rate_armed
+     gate and simply never polls there. */
+  g_rf_fast = on ? 1 : 0;
+  if (g_rf_fast) g_rf_next_poll = HAL_GetTick();
 }
 
 void GPS_Tick(void)

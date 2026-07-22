@@ -545,6 +545,30 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## BLE quiet window — BT-off GPS A/B test (v0.0.57+) — `0x15`/`0x16`, `ble.c`
+
+**Peter's issue-#10 hypothesis test: "BT stört den Empfänger?"** FileSync
+opcode **`0x15 BLE_QUIET [<dur_s:u16-LE>]`** (default 10 s, clamped 5–120)
+answers with a status byte, records ~3 s of BT-on pre-samples, does a clean
+box-side HCI disconnect and then holds the BlueNRG-LP in **hardware reset**
+(RSTN/PD4 low — the `BLEOFF.CFG` lever, the only provably-silent state) for
+the window, samples the Live-RF metric set (`GPS_GetRfLive`) at **1 Hz**
+(`GPS_RfFastPoll(1)` raises the MON-RF poll 5 s → 1 s) into a 132×16 B RAM
+buffer **and** as plain `gps_rfq: p=pre|off|post …` errlog lines (zdavatz:
+values must be in the log AND visible in the app after reconnect; never
+`***` — grader stays green), then runs a full mid-session `BLE_Init()`
+(the proven v0.0.23 wedged-re-adv path, ~4 s blocking, IWDG kicked around
+it) + ~5 s post-samples. Hosts auto-reconnect and fetch via **`0x16
+BLE_QUIET_RESULT`** (8-byte header `'Q',ver,sample_size,count:u16,dur_s:u16,
+rsvd` + samples packed into MTU-sized notifies). The C/N0/noise/agc delta
+BT-on vs BT-off, seconds apart under the same sky, is the verdict — much
+sharper than the binary session-long `BLEOFF.CFG` A/B. Spec: **DESIGN.md
+§"BLE quiet window"**. Key invariants: while OFF, `ble_quiet_tick()`
+returns 1 and `BLE_Tick` **skips its entire body** (otherwise the periodic
+re-adv escalation would `NVIC_SystemReset` mid-window); re-init failure =
+system reset (reachable-after-reboot beats silent-forever); refused
+(`0xB0`) during transfers/FOTA/bridge. Bumped `PL_FW_VERSION` → **0.0.57**.
+
 ## GPS mid-session link watchdog (v0.0.56+) — `gps.c`
 
 **The "Antennendaten manchmal sichtbar, manchmal nicht → dann tot bis zum
