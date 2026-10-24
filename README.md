@@ -35,6 +35,15 @@ make clean && make            # outputs: build/PumpLogger.elf, build/firmware.bi
 
 Each `make` bumps `STM32CubeIDE/.build_counter` and bakes the value into the ErrLog boot banner via `-DPL_BUILD_NUM=N`, so it's obvious which binary is on the box.
 
+## SD card must be FAT32 (MBR)
+
+The box only understands **FAT32 on an MBR partition table**. Since v0.0.59 it refuses anything else at power-on: **solid red LED + one long beep, then halt** (same as no card). Before v0.0.59 a FAT16 card (common on cards ≤ 2 GB, or "MS-DOS (FAT)" in macOS Disk Utility) seemed to work but the file list stayed empty and nothing was logged. Reformat over USB-C (see below) — this erases the card:
+
+```sh
+diskutil list external                          # macOS: find the "PumpLogger SD" disk
+diskutil eraseDisk FAT32 BOX MBRFormat /dev/diskN
+```
+
 ## Read the SD card over USB-C (Phase 9, v0.0.9+)
 
 Power the box on (magnet attached) and plug it into a host over USB-C — the microSD enumerates as a standard USB mass-storage drive. No button, no DFU dance:
