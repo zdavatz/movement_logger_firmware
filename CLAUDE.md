@@ -545,6 +545,22 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## FAT32-only mount — reject FAT12/FAT16 cards (v0.0.59+) — `sd_fatfs.c`
+
+`SDFat_Mount` used to accept any BPB with 512 B sectors and a "root
+cluster" ≥ 2 at offset 44. On FAT12/FAT16 that offset is volume-label text,
+so a FAT16 card (Zeno's 2 GB card, 2026-10-24 — small cards / macOS
+"MS-DOS (FAT)" often come out FAT16) mounted "fine": LIST walked a random
+cluster and returned nothing, and every log/errlog/LOGMODE.CFG write went to
+an arbitrary place on the card (mode fell back to AUTO on every boot, no
+files ever synced). Now the mount also requires the FAT32 markers from the
+spec — `BPB_RootEntCnt (17) == 0`, `BPB_FATSz16 (22) == 0`, `BPB_FATSz32 (36)
+!= 0` — and otherwise returns `PL_FX_ERR_NO_FAT32`, i.e. `Error_Handler`
+(solid red, long beep, halt). Fix for the operator: reformat FAT32 with an
+MBR partition table, e.g. over the box's USB MSC drive:
+`diskutil eraseDisk FAT32 BOX MBRFormat /dev/diskN`. Bumped `PL_FW_VERSION`
+→ **0.0.59**.
+
 ## LIST reports SD walk errors (v0.0.58+) — `ble.c`
 
 The LIST handler used to drop `SDFat_ListRoot`'s status and always send the

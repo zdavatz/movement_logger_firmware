@@ -313,6 +313,17 @@ pl_fx_status_t SDFat_Mount(void)
   if (g_bytes_per_sec != 512 || g_sec_per_clus == 0 || g_root_cluster < 2)
     return PL_FX_ERR_NO_FAT32;
 
+  /* v0.0.59: reject FAT12/FAT16. Their BPB has a fixed root directory
+     (BPB_RootEntCnt != 0) and a 16-bit FAT size; offset 44 — read above as
+     the FAT32 root cluster — is volume-label text there. A 2 GB FAT16 card
+     used to "mount" fine: LIST walked a random cluster (empty) and every
+     log write landed somewhere arbitrary on the card. Failing the mount
+     halts in Error_Handler (solid red + long beep) instead — the operator
+     reformats as FAT32. Per the FAT spec FAT32 has RootEntCnt == 0 and
+     FATSz16 == 0. */
+  if (rd16(boot, 17) != 0 || fat_sz16 != 0 || fat_sz32 == 0)
+    return PL_FX_ERR_NO_FAT32;
+
   g_fat_lba  = bpb_lba + g_rsvd_secs;
   g_data_lba = g_fat_lba + g_num_fats * g_fat_size_secs;
 
