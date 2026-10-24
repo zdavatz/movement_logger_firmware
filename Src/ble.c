@@ -747,10 +747,10 @@ static uint8_t   g_cmd_pending = 0;
 /* LIST: one notification per root-dir entry, "name,size\n", then a lone
    "\n" terminator. Callback runs inside SDFat_ListRoot's walk. Returns
    non-zero to abort enumeration if a notify fails — keeps LIST bounded
-   when the peer goes silent. */
+   when the peer goes silent. `user` points at the handler's row counter
+   (v0.0.58) so the LIST-done errlog line can tell "0 rows" apart. */
 static int list_emit_cb(const char *name, uint32_t size, void *user)
 {
-  (void)user;
   char row[40];
   int n = snprintf(row, sizeof(row), "%s,%lu\n", name, (unsigned long)size);
   if (n <= 0) return 0;
@@ -758,6 +758,7 @@ static int list_emit_cb(const char *name, uint32_t size, void *user)
     ErrLog_Write("fsm: LIST aborted code=2 why=notify-stalled");
     return 1;   /* abort enumeration */
   }
+  if (user) (*(unsigned *)user)++;
   return 0;
 }
 
@@ -1118,10 +1119,28 @@ static void ble_process_command(void)
     snprintf(buf, sizeof(buf), "ble: cmd LIST conn=0x%04x fdh=0x%04x",
              g_conn_handle, (uint16_t)(g_filedata_handle + 1));
     ErrLog_Write(buf);
-    SDFat_ListRoot(list_emit_cb, NULL);
+    /* v0.0.58: the walk's status used to be dropped, so an SD read error
+       (card lost contact after the boot-time mount) went out as a bare
+       terminator — indistinguishable on the host from "no files", and
+       invisible in the errlog. Now the status + row count are logged, and
+       a walk error sends one comma-less "!SDERR rc=N" row before the
+       terminator. Comma-less on purpose: hosts parse rows by the last ','
+       and silently skip anything without one, so older apps still see a
+       clean (empty) LIST while new ones can surface the error. */
+    unsigned rows = 0;
+    pl_fx_status_t lrc = SDFat_ListRoot(list_emit_cb, &rows);
+    if (lrc != PL_FX_OK) {
+      char err[24];
+      int n = snprintf(err, sizeof(err), "!SDERR rc=%d\n", (int)lrc);
+      if (n > 0) ble_notify_try(g_filedata_handle + 1, (const uint8_t *)err, (uint16_t)n, 500);
+      snprintf(buf, sizeof(buf), "*** ble: LIST sd walk FAIL rc=%d rows=%u",
+               (int)lrc, rows);
+      ErrLog_Write(buf);
+    }
     uint8_t term = '\n';
     int rc = ble_notify_try(g_filedata_handle + 1, &term, 1, 500);
-    snprintf(buf, sizeof(buf), "ble: LIST done term_rc=%d", rc);
+    snprintf(buf, sizeof(buf), "ble: LIST done rows=%u sd_rc=%d term_rc=%d",
+             rows, (int)lrc, rc);
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_READ) {
     /* READ <name>\0[<offset:u32-LE>]: NUL-terminated 8.3 filename, optional

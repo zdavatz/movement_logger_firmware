@@ -545,6 +545,21 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## LIST reports SD walk errors (v0.0.58+) — `ble.c`
+
+The LIST handler used to drop `SDFat_ListRoot`'s status and always send the
+lone `\n` terminator, so an SD read error (card lost contact after the
+boot-time mount — mount failure itself halts in `Error_Handler`) looked to
+every host exactly like "box has no files", with nothing in the errlog.
+Now `list_emit_cb` counts the rows it sent, every LIST logs
+`ble: LIST done rows=N sd_rc=R term_rc=T`, and a walk error logs
+`*** ble: LIST sd walk FAIL rc=R rows=N` and sends one **comma-less**
+`!SDERR rc=R\n` row before the terminator. Comma-less on purpose: hosts
+parse rows by the last `,` and skip anything without one, so older apps
+still see a clean (empty) LIST while new ones can surface the error.
+`rc` is `pl_fx_status_t` (3 = `PL_FX_ERR_IO`). Bumped `PL_FW_VERSION` →
+**0.0.58**.
+
 ## BLE quiet window — BT-off GPS A/B test (v0.0.57+) — `0x15`/`0x16`, `ble.c`
 
 **Peter's issue-#10 hypothesis test: "BT stört den Empfänger?"** FileSync
