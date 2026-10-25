@@ -72,8 +72,18 @@ static HAL_StatusTypeDef sd_read_block(uint32_t lba, uint8_t *buf)
   return HAL_SD_ReadBlocks(&g_hsd, buf, lba, 1, 1000);
 }
 
+/* v0.0.63: set while a USB host has the card mounted over MSC. Every write
+   this FAT layer would issue is refused at this single choke point, so the
+   box can never write blocks behind the host's back — two FAT writers on one
+   card (box appending ERRLOG.LOG with its cached FAT page / alloc hint /
+   file chain while macOS wrote Spotlight + fseventsd) corrupted the FAT.
+   The MSC bridge writes through SDFat_RawHandle(), not here, so the host
+   is unaffected. Cleared only after SDFat_Remount() re-read the volume. */
+static volatile int g_host_owned = 0;
+
 static HAL_StatusTypeDef sd_write_block(uint32_t lba, const uint8_t *buf)
 {
+  if (g_host_owned) return HAL_ERROR;
   return HAL_SD_WriteBlocks(&g_hsd, buf, lba, 1, 1000);
 }
 
@@ -275,11 +285,45 @@ static pl_fx_status_t sd_hw_init(void)
   return PL_FX_OK;
 }
 
+static int g_hw_ok = 0;    /* SDMMC + card initialised (MSC can use it) */
+
+static pl_fx_status_t mount_volume(void);
+
 pl_fx_status_t SDFat_Mount(void)
 {
   pl_fx_status_t s = sd_hw_init();
   if (s != PL_FX_OK) return s;
+  g_hw_ok = 1;
+  return mount_volume();
+}
 
+/* v0.0.63: re-read MBR + BPB and drop every cached piece of FAT state after
+   a USB host released the card — it may have allocated clusters, moved
+   directory entries or even reformatted. No sd_hw_init: the card stayed
+   powered and initialised throughout. On failure g_mounted stays 0 (all
+   FAT ops refuse) and host ownership stays set, but SDFat_RawHandle() still
+   works so the card can be reformatted over USB on the next plug-in. */
+pl_fx_status_t SDFat_Remount(void)
+{
+  if (!g_hw_ok) return PL_FX_ERR_INIT;
+  g_mounted = 0;
+  pl_fx_status_t s = mount_volume();
+  if (s == PL_FX_OK) g_host_owned = 0;
+  return s;
+}
+
+void SDFat_SetHostOwned(void)
+{
+  /* Write back the box's last FAT page while writes are still allowed —
+     the host must see a consistent FAT from its very first read. */
+  if (!g_host_owned) (void)fat_flush_page();
+  g_host_owned = 1;
+}
+
+int SDFat_HostOwned(void) { return g_host_owned; }
+
+static pl_fx_status_t mount_volume(void)
+{
   /* Read LBA 0; could be MBR or volume boot sector. */
   uint8_t boot[512];
   if (sd_read_block(0, boot) != HAL_OK) return PL_FX_ERR_IO;
@@ -336,7 +380,7 @@ pl_fx_status_t SDFat_Mount(void)
 
 int SDFat_IsMounted(void) { return g_mounted; }
 
-SD_HandleTypeDef *SDFat_RawHandle(void) { return g_mounted ? &g_hsd : NULL; }
+SD_HandleTypeDef *SDFat_RawHandle(void) { return g_hw_ok ? &g_hsd : NULL; }
 
 uint64_t SDFat_FreeBytes(void)
 {

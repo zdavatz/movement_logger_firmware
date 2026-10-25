@@ -545,6 +545,41 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## USB MSC owns the card exclusively (v0.0.63+) — `usb_msc.c`, `sd_fatfs.c`, `errlog.c`
+
+**Root cause of the repeated card corruption (2026-10-24/25).** On
+`tud_mount_cb` only the *session logger* paused. `ERRLOG.LOG` kept
+appending (gps_diag every 5 s, every BLE opcode line, the "usb: mounted"
+line itself) through its cached FAT page / alloc hint / file chain while
+the host (macOS: Spotlight, fseventsd, a format) wrote the same FAT — two
+writers on one FAT. And `tud_umount_cb` resumed without re-reading the
+volume, so the box kept working from pre-USB state. Symptoms: LIST →
+`!SDERR rc=3`, macOS refuses to mount, ERRLOG growing oddly.
+
+Now:
+- `tud_mount_cb`: `Logger_Stop()` → `ErrLog_Flush()` → `SDFat_SetHostOwned()`
+  (flushes the dirty FAT page, then `sd_write_block` refuses **every**
+  box-side write — the single choke point; the MSC bridge writes via
+  `SDFat_RawHandle()` and is unaffected). `ErrLog_Write` buffers lines in a
+  2 KB RAM hold (overflow counted, not wrapped) and never touches the SD.
+- `tud_umount_cb` (only if host-owned): `SDFat_Remount()` (re-reads MBR/BPB,
+  drops all FAT caches, clears host ownership) → `ErrLog_ReopenAfterHost()`
+  (discards the stale handle **without** flush/close, reopens, appends the
+  held lines + dropped count) → logger resume. Remount failure → `***` line,
+  writes stay blocked until reboot.
+- `SDFat_RawHandle()` / `tud_msc_test_unit_ready_cb` key off SD *hardware*
+  init (`g_hw_ok`), not the box's FAT mount, so a card the box can't mount
+  stays reachable over USB for a reformat.
+- BLE ops that write the card (DELETE, SET_MODE, CAL_SET, …) fail with an
+  I/O status while the host owns it; `ErrLog_Clear` refuses outright.
+- `tud_umount_cb` fires on unplug / bus reset, not on a macOS eject — after
+  an eject the box stays hands-off until the cable is pulled.
+
+Also seen on this card earlier: the DELETE-of-an-open-file bug fixed in
+v0.0.61/62 corrupts the FAT the same way. A card already damaged by either
+bug must be reformatted — firmware can't repair it. Bumped `PL_FW_VERSION`
+→ **0.0.63**.
+
 ## FAT32-only mount — reject FAT12/FAT16 cards (v0.0.59+) — `sd_fatfs.c`
 
 `SDFat_Mount` used to accept any BPB with 512 B sectors and a "root

@@ -200,6 +200,9 @@ int ErrLog_IsLogFile(const char *name)
 int ErrLog_Clear(void)
 {
   if (!g_inited) return SDFat_Delete(LOG_FILENAME);
+  /* v0.0.63: the card belongs to a USB host — every write would fail and
+     the reopen below would leave the log dead until reboot. */
+  if (SDFat_HostOwned()) return PL_FX_ERR_IO;
   g_inited = 0;                          /* no writes while the handle is down */
   SDFat_Close(&g_log);
   int s = SDFat_Delete(LOG_FILENAME);
@@ -227,6 +230,44 @@ static volatile uint8_t g_warning_latched = 0;
 
 uint8_t ErrLog_WarningLatched(void) { return g_warning_latched; }
 
+/* v0.0.63: lines written while a USB host owns the card. Kept small — a
+   host window is minutes of gps_diag at most; overflow is counted, not
+   wrapped, so the oldest (most diagnostic) lines survive. */
+static char     g_hold[2048];
+static uint16_t g_hold_len;
+static uint16_t g_hold_dropped;
+
+static void hold_line(const char *line, int n)
+{
+  if (g_hold_len + n > (int)sizeof(g_hold)) { g_hold_dropped++; return; }
+  memcpy(&g_hold[g_hold_len], line, (size_t)n);
+  g_hold_len += (uint16_t)n;
+}
+
+void ErrLog_ReopenAfterHost(void)
+{
+  if (!g_inited) return;
+  /* Discard the old handle without SDFat_Close: its flush would patch a
+     directory slot and write a sector at positions the host may have
+     reused. The host may also have deleted or truncated the file. */
+  memset(&g_log, 0, sizeof(g_log));
+  if (SDFat_OpenAppend(&g_log, LOG_FILENAME) != PL_FX_OK) {
+    g_inited = 0;                        /* nowhere to write — stay silent */
+    return;
+  }
+  if (g_hold_len) SDFat_Append(&g_log, g_hold, g_hold_len);
+  if (g_hold_dropped) {
+    char line[64];
+    int n = snprintf(line, sizeof(line),
+                     "[%lu ms] usb: %u errlog lines dropped while host-owned\n",
+                     (unsigned long)HAL_GetTick(), (unsigned)g_hold_dropped);
+    if (n > 0) SDFat_Append(&g_log, line, (uint32_t)n);
+  }
+  g_hold_len = 0;
+  g_hold_dropped = 0;
+  SDFat_Flush(&g_log);
+}
+
 void ErrLog_Write(const char *s)
 {
   if (!g_inited || !s) return;
@@ -242,6 +283,7 @@ void ErrLog_Write(const char *s)
                    (unsigned long)HAL_GetTick(), s);
   if (n <= 0) return;
   if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+  if (SDFat_HostOwned()) { hold_line(line, n); return; }
   SDFat_Append(&g_log, line, (uint32_t)n);
 }
 
@@ -259,7 +301,7 @@ void ErrLog_Writef(const char *fmt, ...)
 
 void ErrLog_Flush(void)
 {
-  if (!g_inited) return;
+  if (!g_inited || SDFat_HostOwned()) return;
   SDFat_Flush(&g_log);
 }
 

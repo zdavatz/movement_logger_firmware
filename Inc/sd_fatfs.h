@@ -63,6 +63,16 @@ pl_fx_status_t SDFat_Mount(void);
 /* True iff Mount succeeded. */
 int SDFat_IsMounted(void);
 
+/* USB MSC host ownership (v0.0.63). SetHostOwned flushes the cached FAT
+   page, then refuses every block write this layer would issue until
+   Remount — call it when a USB host mounts the card, after closing open
+   files. Remount re-reads MBR/BPB, drops all cached FAT state and clears
+   host ownership on success; open PL_File handles from before are stale
+   and must be reopened, never flushed or closed. */
+void SDFat_SetHostOwned(void);
+int  SDFat_HostOwned(void);
+pl_fx_status_t SDFat_Remount(void);
+
 /* Choose the next free NNN s.t. SensNNN.csv / GpsNNN.csv / BatNNN.csv do not
    exist on the card. Returns 0..999, or -1 on error. */
 int  SDFat_NextSessionNumber(void);
@@ -118,9 +128,10 @@ int SDFat_HandleIs(const PL_File *f, const char *name);
 
 /* Raw HAL_SD handle accessor — exposed for USB MSC, which speaks SCSI
    block-level to the host PC and bypasses our FatFs entirely. Returns
-   NULL if SDFat_Mount has not run. Sole owner of HAL_SD calls is still
-   sd_fatfs.c; usb_msc.c is the one sanctioned exception, gated on
-   UsbMsc_IsMounted() so it cannot race the logger's own writes. */
+   NULL if the SD hardware never initialised; stays valid after a failed
+   Remount so the host can still reformat the card. Sole owner of HAL_SD
+   calls is still sd_fatfs.c; usb_msc.c is the one sanctioned exception —
+   SDFat_SetHostOwned() keeps the box's own writes off the card meanwhile. */
 SD_HandleTypeDef *SDFat_RawHandle(void);
 
 #endif /* PL_SD_FATFS_H */

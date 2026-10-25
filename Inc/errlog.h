@@ -48,6 +48,13 @@ void ErrLog_Heartbeat(void);
 /* Flush whatever is buffered to SD. */
 void ErrLog_Flush(void);
 
+/* USB MSC hand-back (v0.0.63). While a USB host owns the card
+   (SDFat_HostOwned) ErrLog_Write keeps lines in a small RAM buffer instead
+   of touching the SD. After SDFat_Remount this reopens ERRLOG.LOG fresh —
+   the pre-USB handle's cached chain is stale and is discarded, never
+   flushed — and appends the buffered lines plus a dropped-lines count. */
+void ErrLog_ReopenAfterHost(void);
+
 /* Warning latch — set to 1 the first time ErrLog_Write is called with a
    line starting with '***' (the convention for prominent errlog
    markers). Main loop reads this to drive the red LED on solid, so an

@@ -1202,7 +1202,7 @@ OTG_FS_IRQ forwards to `tud_int_handler(0)`.
 | TinyUSB callback | What it does | Bridge target |
 |---|---|---|
 | `tud_msc_inquiry_cb` | Returns vendor/product/rev strings | static `ywesee/PumpLogger SD/0001` |
-| `tud_msc_test_unit_ready_cb` | "Are you ready?" once/sec | `SDFat_IsMounted()` |
+| `tud_msc_test_unit_ready_cb` | "Are you ready?" once/sec | `SDFat_RawHandle() != NULL` (SD hardware up; v0.0.63) |
 | `tud_msc_capacity_cb` | Block count + block size | `HAL_SD_GetCardInfo(SDFat_RawHandle())` |
 | `tud_msc_read10_cb` | SCSI READ(10) | `HAL_SD_ReadBlocks(...)` |
 | `tud_msc_write10_cb` | SCSI WRITE(10) | `HAL_SD_WriteBlocks(...)` |
@@ -1219,13 +1219,24 @@ the OTG_FS_IRQ just sets TinyUSB internal flags.
 
 `tud_mount_cb` fires when the host has set the configuration and is
 about to issue MSC traffic. The callback calls `Logger_Stop()`, which
-flushes + closes the open CSVs and sets `g_active = 0`. The existing
-`g_active` gates in `Logger_Tick` then suppress every `SDFat_*` write
-for the duration of the mount.
+flushes + closes the open CSVs and sets `g_active = 0`, then
+`ErrLog_Flush()` and `SDFat_SetHostOwned()` (v0.0.63): the dirty FAT
+page is written back and from then on `sd_write_block` refuses **every**
+box-side write — errlog, BLE DELETE/SET_MODE/CAL_SET, everything.
+`ErrLog_Write` keeps lines in a 2 KB RAM hold meanwhile. (Before v0.0.63
+only the `g_active` logger gates applied, so `ERRLOG.LOG` kept appending
+with cached FAT state while the host wrote the same FAT — the card
+corruption of 2026-10-24/25.)
 
-`tud_umount_cb` (host eject) and physical USB unplug both end the
-mount. On the next tick, `Logger_Init()` is called and AUTO mode opens
-a fresh session; MANUAL stays idle until the next `START_LOG`.
+`tud_umount_cb` fires on physical unplug / bus reset (a host eject alone
+does not end it). Only if the card was host-owned: `SDFat_Remount()`
+re-reads MBR/BPB and drops all cached FAT state, `ErrLog_ReopenAfterHost()`
+reopens the log from scratch (the stale handle is discarded, never
+flushed) and appends the held lines, then `Logger_Init()` — AUTO opens a
+fresh session; MANUAL stays idle until the next `START_LOG`. A failed
+remount leaves writes blocked until reboot; the card stays reachable
+over USB (ready/capacity key off SD hardware init, not the FAT mount) so
+it can be reformatted.
 
 ### State-machine table addendum
 
@@ -1233,13 +1244,14 @@ Added to §11's audit table:
 
 | Module | States | `g_phase` | Backoff | Resets | Errlog code | Notes |
 |---|---|---|---|---|---|---|
-| `usb_msc` | unmounted ↔ mounted | none (TinyUSB-internal) | n/a | `Logger_Stop` on mount; `Logger_Init` on unmount | `usb: …` | Driven by TinyUSB mount/umount callbacks |
+| `usb_msc` | unmounted ↔ mounted (host-owned) | none (TinyUSB-internal) | n/a | mount: `Logger_Stop` + `SDFat_SetHostOwned`; unmount: `SDFat_Remount` + `ErrLog_ReopenAfterHost` + `Logger_Init` | `usb: …` | Driven by TinyUSB mount/umount callbacks |
 
 ### Memory budget addendum (§10)
 
 | Module | Static RAM | Notes |
 |---|---|---|
 | TinyUSB (usbd + dwc2 + msc) | ~3 KB | endpoint FIFOs, control state, MSC SCSI buffer (1×512 B) |
+| errlog USB hold buffer (v0.0.63) | 2 KB | lines written while a USB host owns the card |
 
 Total firmware text grew ~15 KB.
 

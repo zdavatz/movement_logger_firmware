@@ -53,7 +53,7 @@ lsblk            # find the new device (e.g. /dev/sda1, label PUMPTSUERI)
 sudo mount /dev/sda1 /mnt
 ```
 
-While the host has the drive mounted, the box pauses its own SD writes (two filesystem drivers can't share the card). Eject / unplug and the logger automatically resumes the previous mode (AUTO → new session, MANUAL → wait for `START_LOG`). BLE FileSync remains the wireless path; they coexist but are mutually exclusive at runtime.
+While the host has the drive mounted, the box makes **no** SD writes at all (two filesystem drivers can't share the card) — since v0.0.63 that includes the error log, which before kept writing and corrupted the card's FAT. On unplug the box re-reads the card before writing again. Eject / unplug and the logger automatically resumes the previous mode (AUTO → new session, MANUAL → wait for `START_LOG`). BLE FileSync remains the wireless path; they coexist but are mutually exclusive at runtime.
 
 See REQUIREMENTS.md F-USB-1..6, DESIGN.md §14, and [issue #5](https://github.com/zdavatz/movement_logger_firmware/issues/5) for the full design.
 

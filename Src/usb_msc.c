@@ -164,16 +164,37 @@ void tud_mount_cb(void)
 {
   s_mounted = true;
   s_ever_mounted = true;
-  ErrLog_Write("usb: mounted — pausing logger");
+  ErrLog_Write("usb: mounted — pausing logger + all SD writes");
   /* Flush + close any open session, then mark inactive. Logger_Stop is
      idempotent so it's safe to call even if no session is open. */
   Logger_Stop();
+  /* v0.0.63: until here only the session logger paused — ERRLOG.LOG kept
+     appending (gps_diag every 5 s, every BLE opcode) with its cached FAT
+     state while the host wrote the same FAT, and that corrupted the card.
+     Flush the log, then hand the card over: from now on every box-side
+     block write is refused and ErrLog_Write buffers in RAM. */
+  ErrLog_Flush();
+  SDFat_SetHostOwned();
 }
 
 void tud_umount_cb(void)
 {
   s_mounted = false;
-  ErrLog_Write("usb: unmounted — resuming logger");
+  /* The host may have changed anything (allocated clusters, rewritten the
+     root dir, reformatted) — re-read the volume before the box writes a
+     single block. Refuse to resume on a volume we can't mount; writes stay
+     blocked until reboot, the card is still reachable over USB. Only when
+     the card was actually handed over — the reopen discards the log
+     handle's unflushed tail, which must not happen on a stray callback. */
+  if (!SDFat_HostOwned()) return;
+  pl_fx_status_t rc = SDFat_Remount();
+  if (rc != PL_FX_OK) {
+    ErrLog_Writef("*** usb: unmounted — SD remount FAIL rc=%d, SD writes "
+                  "blocked until reboot", (int)rc);
+    return;
+  }
+  ErrLog_ReopenAfterHost();
+  ErrLog_Write("usb: unmounted — SD remounted, resuming logger");
   /* Resume logging. In AUTO mode this opens a fresh session immediately.
      In MANUAL mode it stays idle until the next START_LOG. */
   if (Logger_GetMode() != LOGGER_MODE_MANUAL) {
@@ -229,7 +250,10 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
   (void) lun;
-  return SDFat_IsMounted();
+  /* Card hardware, not the box's own FAT mount: after a failed post-USB
+     remount (host left an unreadable volume) the host must still be able
+     to reach the card to reformat it. */
+  return SDFat_RawHandle() != NULL;
 }
 
 /* READ CAPACITY(10) — host learns the block count and block size. */
