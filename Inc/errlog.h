@@ -33,6 +33,15 @@ void ErrLog_SetWallClock(uint64_t epoch_ms);
 void ErrLog_SetWallClockGps(unsigned year, unsigned mon, unsigned day,
                             unsigned hh, unsigned mm, unsigned ss);
 
+/* BLE DELETE of the log itself (v0.0.61). The log is held open from boot,
+   so a plain SDFat_Delete left a stale handle writing into freed clusters
+   and the file stayed invisible until a reboot. This closes the handle,
+   deletes the file, and immediately starts a fresh ERRLOG.LOG (with a
+   "log cleared" banner + the current clock: line). Returns the
+   SDFat_Delete status. */
+int  ErrLog_IsLogFile(const char *name);
+int  ErrLog_Clear(void);
+
 /* Heartbeat dump — called once per minute by main. */
 void ErrLog_Heartbeat(void);
 

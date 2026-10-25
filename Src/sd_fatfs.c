@@ -824,6 +824,14 @@ pl_fx_status_t SDFat_Seek(PL_File *f, uint32_t offset)
   return PL_FX_OK;
 }
 
+int SDFat_HandleIs(const PL_File *f, const char *name)
+{
+  if (!f || !f->used || !name) return 0;
+  char n83[11];
+  to_83(name, n83);
+  return memcmp(f->name83, n83, 11) == 0;
+}
+
 pl_fx_status_t SDFat_Delete(const char *name)
 {
   if (!g_mounted || !name) return PL_FX_ERR_INVAL;

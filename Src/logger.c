@@ -83,6 +83,13 @@ int Logger_Init(void)
 
 int Logger_IsActive(void) { return g_active; }
 
+int Logger_HoldsFile(const char *name)
+{
+  return g_active && (SDFat_HandleIs(&g_sens, name) ||
+                      SDFat_HandleIs(&g_gps, name)  ||
+                      SDFat_HandleIs(&g_bat, name));
+}
+
 int Logger_GetMode(void)
 {
   if (g_mode >= 0) return g_mode;            /* cached */

@@ -36,6 +36,9 @@ typedef struct {
 int  Logger_Init(void);            /* opens session files; returns 0 on success */
 void Logger_Tick(void);            /* called every 1 ms from main loop */
 int  Logger_IsActive(void);
+/* True iff `name` is one of the Sens/Gps/Bat files the running session holds
+   open (BLE DELETE refuses those with BUSY — v0.0.61). */
+int  Logger_HoldsFile(const char *name);
 void Logger_FlushAll(void);
 
 /* Read the persisted log-mode from the SD config (cached after first

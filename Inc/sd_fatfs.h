@@ -105,8 +105,16 @@ pl_fx_status_t SDFat_Read(PL_File *file, void *buf, uint32_t len, uint32_t *got)
 /* Seek the read cursor to an absolute byte offset. */
 pl_fx_status_t SDFat_Seek(PL_File *file, uint32_t offset);
 
-/* Delete a file: free its FAT cluster chain and mark the dir entry 0xE5. */
+/* Delete a file: free its FAT cluster chain and mark the dir entry 0xE5.
+   NOT safe on a file someone still holds open for append — the stale handle
+   would keep writing into the freed clusters (and keep patching the 0xE5
+   entry, so the file never reappears in LIST). Callers must close first;
+   see ErrLog_Clear / Logger_HoldsFile (v0.0.61). */
 pl_fx_status_t SDFat_Delete(const char *name);
+
+/* True iff `f` is an open handle on the 8.3 file `name` (case-insensitive,
+   same normalisation as open/delete). */
+int SDFat_HandleIs(const PL_File *f, const char *name);
 
 /* Raw HAL_SD handle accessor — exposed for USB MSC, which speaks SCSI
    block-level to the host PC and bypasses our FatFs entirely. Returns

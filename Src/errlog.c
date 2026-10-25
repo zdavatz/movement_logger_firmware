@@ -192,6 +192,37 @@ void ErrLog_SetWallClockGps(unsigned year, unsigned mon, unsigned day,
   wall_anchor(secs * 1000u, 1);
 }
 
+int ErrLog_IsLogFile(const char *name)
+{
+  return g_inited && SDFat_HandleIs(&g_log, name);
+}
+
+int ErrLog_Clear(void)
+{
+  if (!g_inited) return SDFat_Delete(LOG_FILENAME);
+  g_inited = 0;                          /* no writes while the handle is down */
+  SDFat_Close(&g_log);
+  int s = SDFat_Delete(LOG_FILENAME);
+  if (SDFat_OpenAppend(&g_log, LOG_FILENAME) != PL_FX_OK) return s;
+  g_inited = 1;
+
+  char hdr[120];
+  snprintf(hdr, sizeof(hdr),
+           "\n--- Log cleared (BLE DELETE) --- " PL_FW_NAME " " PL_FW_VERSION
+           " build #%d\n", (int)PL_BUILD_NUM);
+  SDFat_Append(&g_log, hdr, (uint32_t)strlen(hdr));
+  if (g_wall_src) {
+    /* Re-state the anchor so the fresh file is dated from its first line. */
+    char now_s[24], boot_s[24];
+    format_epoch(now_s,  sizeof(now_s),  g_wall_off_ms + HAL_GetTick());
+    format_epoch(boot_s, sizeof(boot_s), g_wall_off_ms);
+    ErrLog_Writef("clock: %s UTC (src=%s) boot=%s UTC", now_s,
+                  g_wall_src == 2 ? "host" : "gps", boot_s);
+  }
+  SDFat_Flush(&g_log);
+  return s;
+}
+
 static volatile uint8_t g_warning_latched = 0;
 
 uint8_t ErrLog_WarningLatched(void) { return g_warning_latched; }
