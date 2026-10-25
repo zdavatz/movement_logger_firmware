@@ -545,6 +545,21 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## One GpsNNN.csv row per GPS epoch (v0.0.66+) — `logger.c`
+
+In NMEA mode both GGA and RMC raise `GPS_FixUpdated()` for the same epoch,
+so every measurement was written **twice** (2026-10-25 `GPS003.CSV`: 3145
+rows for 1574 distinct `utc` values — looked like "2 Hz"), and the first
+copy carried the *previous* epoch's speed/course (RMC not in yet).
+`gps_queue_fix` now holds the fix back and overwrites it while `utc` stays
+the same; `gps_pending_flush` writes it when the next epoch starts, and
+`Logger_Stop` / `Logger_DeleteOpenFile` flush before closing (`Logger_Init`
+clears it). Rows are the merged GGA+RMC state. With UBX NAV-PVT (one update
+per epoch) each row is just written one epoch later (100 ms at 10 Hz).
+**Measuring the real GPS rate:** count distinct `utc` values per second in
+`GpsNNN.csv` (10 Hz shows `.10`…`.90` fractions), never raw rows.
+Bumped `PL_FW_VERSION` → **0.0.66**.
+
 ## USB MSC owns the card exclusively (v0.0.63+) — `usb_msc.c`, `sd_fatfs.c`, `errlog.c`
 
 **Root cause of the repeated card corruption (2026-10-24/25).** On

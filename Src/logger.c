@@ -46,9 +46,14 @@ static PL_MagSample  g_last_mag;
 static PL_FuelSample g_last_fuel;
 static PL_GpsFix     g_last_gps;
 
+/* GPS epoch held back until the next one starts — see gps_queue_fix. */
+static PL_GpsFix     g_gps_pending;
+static int           g_gps_pending_valid;
+
 int Logger_Init(void)
 {
   if (!SDFat_IsMounted()) return -1;
+  g_gps_pending_valid = 0;      /* never carry an epoch into a new session */
   g_session = SDFat_NextSessionNumber();
   if (g_session < 0) return -2;
 
@@ -236,6 +241,28 @@ static void emit_gps_row(const PL_GpsFix *fix)
   if (n > 0) SDFat_Append(&g_gps, row, (uint32_t)n);
 }
 
+/* v0.0.66: one GpsNNN.csv row per GPS epoch. In NMEA mode GGA and RMC
+   each raise GPS_FixUpdated() for the same epoch, so every measurement was
+   written twice (2026-10-25 GPS003.CSV: 3145 rows for 1574 utc values) —
+   and the first copy carried the PREVIOUS epoch's speed/course, since RMC
+   hadn't arrived yet. The fix is held back and overwritten while the utc
+   stays the same; it is written once the next epoch starts (or the session
+   closes), so the row is the merged GGA+RMC state. With UBX NAV-PVT (one
+   update per epoch) this just delays each row by one epoch. */
+static void gps_pending_flush(void)
+{
+  if (g_gps_pending_valid && g_active) emit_gps_row(&g_gps_pending);
+  g_gps_pending_valid = 0;
+}
+
+static void gps_queue_fix(const PL_GpsFix *f)
+{
+  if (g_gps_pending_valid && strcmp(g_gps_pending.utc, f->utc) != 0)
+    gps_pending_flush();
+  g_gps_pending       = *f;
+  g_gps_pending_valid = 1;
+}
+
 static void emit_bat_row(const PL_FuelSample *fuel)
 {
   char row[80];
@@ -295,7 +322,7 @@ void Logger_Tick(void)
          antenna or open-sky-blocked moment writes "ghost" rows with
          the last-known lat/lon and nsat=0 / hdop=99.9 — confusing the
          visualisation tools that interpret each row as a real fix. */
-      if (g_active && f.fix_q > 0) emit_gps_row(&f);
+      if (g_active && f.fix_q > 0) gps_queue_fix(&f);
     }
   }
 
@@ -436,6 +463,7 @@ int Logger_DeleteOpenFile(const char *name)
      the 0xE5 entry, so nothing new ever showed up in LIST until a reboot.
      Close the whole session, delete, and continue in a fresh NNN+1 set
      (the manual-mode deadline, if any, is kept). */
+  gps_pending_flush();          /* last epoch into the closing session */
   g_active = 0;
   SDFat_Close(&g_sens);
   SDFat_Close(&g_gps);
@@ -453,6 +481,7 @@ int Logger_DeleteOpenFile(const char *name)
 void Logger_Stop(void)
 {
   if (!g_active) return;
+  gps_pending_flush();          /* last epoch into the closing session */
   g_active = 0;                 /* stop Logger_Tick writing first */
   SDFat_Close(&g_sens);
   SDFat_Close(&g_gps);
