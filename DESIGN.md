@@ -247,6 +247,8 @@ strictly request-then-response, single-outstanding-request).
 | `0xE1` | NOT_FOUND | Filename not present on SD. |
 | `0xE2` | IO_ERROR | SD read/write failed. |
 | `0xE3` | BAD_REQUEST | Malformed payload (zero-length name, invalid offset, unknown opcode). |
+| `0xE8` | SD_USB | (v0.0.70+) DELETE / START_LOG / SET_MODE / CAL_SET refused: a USB host has the card mounted — eject it (or unplug USB-C). Never sent for READ. |
+| `0xE9` | SD_LOWBAT | (v0.0.70+) Same ops refused by the low-battery SD lock (< 3.4 V) — charge via USB-C. Never sent for READ. |
 | `0xA0` | FW_READY | (FOTA) Image verified — box is about to swap banks + reset. **Not an error.** |
 | `0xE4` | FW_HASH_FAIL | (FOTA) Staged image SHA-256 did not match the host-declared digest. Image NOT activated. |
 | `0xE5` | FW_FLASH_FAIL | (FOTA) Inactive-bank erase or program failed. |

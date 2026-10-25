@@ -61,6 +61,17 @@ Below **3.4 V** (5 s in a row) the box closes the running session and stops writ
 
 See REQUIREMENTS.md F-USB-1..6, DESIGN.md §14, and [issue #5](https://github.com/zdavatz/movement_logger_firmware/issues/5) for the full design.
 
+### Clear refusal messages (v0.0.70+)
+
+While the card is mounted over USB or battery-locked, the box refuses deleting files, starting a session, changing the log mode and calibration up front — the apps show *"SD card is mounted over USB — eject it …"* (`0xE8`) or *"battery too low …"* (`0xE9`) instead of a bare `IO_ERROR`. Apps that know these: iOS 1.0.68+, Android 0.0.79+, desktop 0.0.78+.
+
+## GPS stuck at 9600 baud — TX-path test (v0.0.71+)
+
+If the box can't raise the GPS baud (every u-blox command un-ACK'd while NMEA still arrives), it sends a standard NMEA poll for `ZDA` (off by default on the MAX-M10S, so a reply proves the module heard us) and logs the verdict in `ERRLOG.LOG`:
+
+- `gps: tx-test … no reply to NMEA poll` → the box→module wire (JP2 pin 14 → module RXD) is dead: hardware.
+- `gps: tx-test … NMEA poll answered … trying $PUBX,41` → the wire works but the module's UBX input is disabled; `$PUBX,41` re-enables it at 230400 and the normal 10 Hz config follows (`gps: $PUBX,41 OK`).
+
 ## Host time-sync (`SET_TIME 0x08`, v0.0.10+)
 
 The box has no RTC — the CSV `ms` column is a free-running `HAL_GetTick()` counter that starts at 0 on cold boot. So on every BLE connect the host (iPhone / Android / desktop) pushes its current wall-clock millis via `SET_TIME 0x08 <epoch_ms:u64-LE>`, and the firmware appends a marker line into the **open** `SensNNN.csv` and `GpsNNN.csv`:
