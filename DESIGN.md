@@ -1247,12 +1247,13 @@ remount leaves writes blocked until reboot; the card stays reachable
 over USB (ready/capacity key off SD hardware init, not the FAT mount) so
 it can be reformatted.
 
-### Low-battery SD lock (v0.0.67)
+### Low-battery SD lock (v0.0.67; GPS suspend v0.0.68)
 
 A second reason to refuse SD writes, sharing the `sd_write_block` choke
 point with host ownership: battery < 3400 mV for 5 consecutive 1 Hz fuel
-reads closes the session and locks writes; ≥ 3700 mV for 5 reads unlocks
-(drops the cached FAT page, reopens the error log, AUTO reopens a session).
+reads closes the session, puts the GPS into backup (`GPS_Suspend`, not
+persisted) and locks writes; ≥ 3700 mV for 5 reads unlocks (wakes the GPS
+unless the user turned it off, drops the cached FAT page, reopens the error log, AUTO reopens a session).
 `SDFat_WritesBlocked()` = host-owned OR battery-locked; the error log holds
 lines in RAM while either is set, and the last lock to release resumes
 logging. Rationale: brown-out resets on a near-empty cell tore FAT/directory

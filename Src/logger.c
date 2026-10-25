@@ -279,13 +279,14 @@ static void gps_queue_fix(const PL_GpsFix *f)
   g_gps_pending_valid = 1;
 }
 
-/* Close the session and lock every SD write. The box keeps running (BLE,
-   live stream, GPS), only the card is left alone, so a brown-out reset can
-   no longer land in the middle of a FAT / directory write. */
+/* Close the session, put the GPS into backup and lock every SD write. The
+   box keeps running (BLE, live stream), only the card is left alone, so a
+   brown-out reset can no longer land in the middle of a FAT / directory
+   write. */
 static void lowbat_engage(uint16_t mv)
 {
-  ErrLog_Writef("*** power: battery %u mV < %u mV — session closed, SD writes "
-                "locked until %u mV (charge via USB-C) ***",
+  ErrLog_Writef("*** power: battery %u mV < %u mV — session closed, GPS off, "
+                "SD writes locked until %u mV (charge via USB-C) ***",
                 (unsigned)mv, (unsigned)PL_LOWBAT_LOCK_MV,
                 (unsigned)PL_LOWBAT_RELEASE_MV);
   if (g_active) {
@@ -295,7 +296,8 @@ static void lowbat_engage(uint16_t mv)
     SDFat_Close(&g_gps);
     SDFat_Close(&g_bat);
   }
-  ErrLog_Flush();               /* the line above, while writes still work */
+  GPS_Suspend(1);               /* ~25 mA less on an empty cell */
+  ErrLog_Flush();               /* the lines above, while writes still work */
   SDFat_SetLowBatLock(1);
   g_lowbat = 1;
   g_lowbat_count = 0;
@@ -306,6 +308,7 @@ static void lowbat_release(uint16_t mv)
   g_lowbat = 0;
   g_lowbat_count = 0;
   SDFat_SetLowBatLock(0);
+  GPS_Suspend(0);
   ErrLog_ReopenAfterHost();     /* no-op while a USB host still owns the card */
   ErrLog_Writef("power: battery %u mV — SD writes unlocked", (unsigned)mv);
   if (SDFat_WritesBlocked()) return;   /* USB release resumes the logger */

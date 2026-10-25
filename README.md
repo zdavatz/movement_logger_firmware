@@ -55,9 +55,9 @@ sudo mount /dev/sda1 /mnt
 
 While the host has the drive mounted, the box makes **no** SD writes at all (two filesystem drivers can't share the card) — since v0.0.63 that includes the error log, which before kept writing and corrupted the card's FAT. About 5 s after you unplug (the board can't sense the cable itself, so it watches for the USB bus going quiet — v0.0.65+), the box re-reads the card and resumes the previous mode (AUTO → new session, MANUAL → wait for `START_LOG`). On v0.0.63/v0.0.64 it only resumed after a power cycle. Tip for macOS: put an empty `.metadata_never_index` file in the card's root so Spotlight doesn't index it. BLE FileSync remains the wireless path; they coexist but are mutually exclusive at runtime.
 
-### Low battery (v0.0.67+)
+### Low battery (v0.0.67+, GPS off since v0.0.68)
 
-Below **3.4 V** (5 s in a row) the box closes the running session and stops writing to the SD card — a nearly empty battery browns the box out mid-write, which tears the filesystem. It keeps running otherwise (BLE, live data, GPS; you can still list and download files). The error log gets a `*** power: battery … SD writes locked ***` line. Charge via USB-C: at **3.7 V** it unlocks and, in AUTO mode, opens a new session.
+Below **3.4 V** (5 s in a row) the box closes the running session and stops writing to the SD card — a nearly empty battery browns the box out mid-write, which tears the filesystem. It also switches the GPS off (~25 mA less). BLE and live data keep running, and you can still list and download files. The error log gets a `*** power: battery … SD writes locked ***` line. Charge via USB-C: at **3.7 V** it unlocks, switches the GPS back on (unless you turned it off in the app) and, in AUTO mode, opens a new session.
 
 See REQUIREMENTS.md F-USB-1..6, DESIGN.md §14, and [issue #5](https://github.com/zdavatz/movement_logger_firmware/issues/5) for the full design.
 

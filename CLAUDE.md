@@ -545,7 +545,7 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
-## Low-battery SD lock (v0.0.67+) — `logger.c`, `sd_fatfs.c`, `errlog.c`
+## Low-battery SD lock (v0.0.67+, GPS off v0.0.68+) — `logger.c`, `sd_fatfs.c`, `errlog.c`
 
 A nearly empty cell brown-outs the MCU mid-write: 2026-10-25 ERRLOG showed
 6× `reset: PIN+BOR` at boot soc 1–4 % (BAT003 ended at 3216 mV / 6 %), plus
@@ -557,14 +557,18 @@ show it.
 - `lowbat_check` runs on every 1 Hz fuel read. `PL_LOWBAT_SAMPLES` (5)
   consecutive reads below `PL_LOWBAT_LOCK_MV` (3400) → `lowbat_engage`:
   `***` errlog line + flush, close the session (pending GPS epoch first),
-  then `SDFat_SetLowBatLock(1)` — `sd_write_block` refuses every write
-  (same choke point as USB host ownership). BLE, live stream and GPS keep
-  running; reads (LIST/READ) keep working.
+  `GPS_Suspend(1)` (module → backup, ~25 mA saved; the persisted
+  `GPSPWR.CFG` choice and `GPS_GET_POWER` are untouched), then
+  `SDFat_SetLowBatLock(1)` — `sd_write_block` refuses every write (same
+  choke point as USB host ownership). BLE and the live stream keep running;
+  reads (LIST/READ) keep working. A `GPS_POWER` click during the lock is
+  recorded and applied on release.
 - `Logger_Init` refuses (`-6`) while locked and engages the lock itself on a
   single read below the threshold — so a reboot after a brown-out, a
   `START_LOG` or a USB release can't open a session on an empty cell.
 - Release: 5 reads ≥ `PL_LOWBAT_RELEASE_MV` (3700, i.e. USB charging) →
-  unlock, drop the cached FAT page (refused writes may have left RAM-only
+  unlock, `GPS_Suspend(0)` (wakes the module if the user's choice is on),
+  drop the cached FAT page (refused writes may have left RAM-only
   state), `ErrLog_ReopenAfterHost` appends the held lines, AUTO reopens a
   session. MANUAL stays idle.
 - Both locks compose via `SDFat_WritesBlocked()` (host-owned OR low-battery):

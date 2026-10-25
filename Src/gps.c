@@ -74,6 +74,9 @@ static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
    while off so no stale NMEA is parsed. */
 #define GPSPWR_CFG_NAME "GPSPWR.CFG"
 static int g_power = -1;
+/* v0.0.67: module held in backup by the low-battery lock (GPS_Suspend),
+   independent of the user's persisted g_power choice. */
+static int g_suspended = 0;
 
 /* ---------- Adaptive nav rate (v0.0.46, issue #10) ----------------------- */
 /* Cold acquisition happens at 1 Hz; only once a valid fix is in hand is the
@@ -1316,6 +1319,38 @@ int GPS_GetPower(void)
   return g_power;
 }
 
+/* Put the module into backup / wake it, without touching the persisted
+   choice. Shared by GPS_SetPower and GPS_Suspend. */
+static void gps_apply_power(int on, int was_on)
+{
+  if (on) {
+    /* Wake only if it was actually asleep. The RAM config survives software
+       backup, so a wake resumes UBX at the locked baud with no reconfigure. */
+    if (!was_on) {
+      gps_wake_pulse();
+      int nl = 0, ux = 0;
+      listen_traffic(1000, &nl, &ux);
+      ErrLog_Writef("gps: power ON (wake, nmea=%d ubx=%d)", nl, ux);
+    } else {
+      ErrLog_Write("gps: power ON (already on)");
+    }
+  } else {
+    gps_pmreq_backup();
+    g_latest.valid = 0;
+    g_latest.fix_q = 0;
+    ErrLog_Write("gps: power OFF → backup mode");
+  }
+}
+
+void GPS_Suspend(int suspend)
+{
+  suspend = suspend ? 1 : 0;
+  if (suspend == g_suspended) return;
+  g_suspended = suspend;
+  if (GPS_GetPower() == 0) return;   /* user has it off anyway */
+  gps_apply_power(!suspend, suspend);
+}
+
 int GPS_SetPower(int on)
 {
   on = on ? 1 : 0;
@@ -1336,23 +1371,14 @@ int GPS_SetPower(int on)
   int was = g_power;
   g_power = on;
 
-  if (on) {
-    /* Wake only if it was actually asleep. The RAM config survives software
-       backup, so a wake resumes UBX at the locked baud with no reconfigure. */
-    if (was == 0) {
-      gps_wake_pulse();
-      int nl = 0, ux = 0;
-      listen_traffic(1000, &nl, &ux);
-      ErrLog_Writef("gps: power ON (wake, nmea=%d ubx=%d)", nl, ux);
-    } else {
-      ErrLog_Write("gps: power ON (already on)");
-    }
-  } else {
-    gps_pmreq_backup();
-    g_latest.valid = 0;
-    g_latest.fix_q = 0;
-    ErrLog_Write("gps: power OFF → backup mode");
+  /* While suspended the module stays in backup; the new choice applies
+     when GPS_Suspend(0) resumes. */
+  if (g_suspended) {
+    ErrLog_Writef("gps: power %s recorded (suspended by battery lock)",
+                  on ? "ON" : "OFF");
+    return 0;
   }
+  gps_apply_power(on, was != 0);
   return 0;
 }
 
@@ -1617,7 +1643,7 @@ void GPS_Tick(void)
 {
   /* GPS powered off (backup mode): no NMEA is arriving. Discard anything that
      trickled in (e.g. wake-up junk) so the ring can't wrap, and skip parsing. */
-  if (g_power == 0) {
+  if (g_power == 0 || g_suspended) {
     g_rx_tail = g_rx_head;
     /* Slide the link-watchdog stamp: a deliberately sleeping module is not
        a dead link, and the silence window must not start until power-on. */

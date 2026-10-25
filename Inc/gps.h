@@ -102,5 +102,8 @@ uint16_t GPS_BridgeRead(uint8_t *out, uint16_t max);       /* captured UBX → o
    phone-clock `# SYNC` anchor keeps the replay time-aligned with no GPS fix. */
 int  GPS_GetPower(void);           /* 1 = on (default), 0 = off. Reads SD once, then cached. */
 int  GPS_SetPower(int on);         /* apply to the module + persist. 0 on success. */
+/* v0.0.67 low-battery lock: 1 = hold the module in backup, 0 = restore the
+   user's GPS_GetPower() choice. Not persisted, doesn't change GetPower. */
+void GPS_Suspend(int suspend);
 
 #endif
