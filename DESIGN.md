@@ -65,7 +65,7 @@ payload.
 
 | Opcode | Name | Payload | Notes |
 |---|---|---|---|
-| `0x01` | `LIST` | none | Request a listing of the SD root. |
+| `0x01` | `LIST` | none | Request a listing of the SD root. Reply: one FileData notify per entry, `name,size\n`, then a lone `\n` terminator. Since v0.0.58 an SD read error during the walk adds one comma-less `!SDERR rc=<pl_fx_status_t>\n` row before the terminator (hosts skip rows without a comma, so legacy apps just see an empty list). |
 | `0x02` | `READ` | `<name>\0[<offset:u32-LE>]` | Read `<name>` from byte `<offset>` to EOF. `<name>` is a NUL-terminated ASCII 8.3 filename. The 4-byte little-endian offset is optional — absent (write ends at the NUL) means `offset = 0` = whole file. A resumed transfer after a dropped link sends `offset = bytes already received`. Works on the *active* session's files too — returns a consistent snapshot up to the last 1 Hz flush. |
 | `0x03` | `DELETE` | `<name>\0` | Delete the file. `<name>` NUL-terminated. Returns single-byte status. |
 | `0x04` | `STOP_LOG` | none | Flush + close the current session. No FileData reply (host re-checks via LIST). |
