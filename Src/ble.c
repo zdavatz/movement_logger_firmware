@@ -1432,6 +1432,7 @@ static void ble_process_command(void)
       snprintf(buf, sizeof(buf), "ble: SET_TIME epoch_ms=%s tick=%lu wrote=%d",
                &edec[ep], (unsigned long)HAL_GetTick(), wrote);
       ErrLog_Write(buf);
+      ErrLog_SetWallClock(epoch_ms);   /* human-readable date for the log */
       /* Flush NOW so the epoch anchor is physically on the SD card before
          the auto-LIST (~500 ms behind SET_TIME) snapshots the file size.
          ErrLog_Write only appends to the RAM buffer; without this flush the

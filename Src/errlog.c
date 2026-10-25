@@ -116,6 +116,82 @@ int ErrLog_Init(void)
   return 0;
 }
 
+/* Wall-clock anchor. The box has no RTC, so ERRLOG lines only carry the
+   ms-since-boot tick until a host pushes SET_TIME (every connect: iPhone,
+   Android, desktop) or the GPS delivers a valid UTC date+time. From then on
+   wall = tick + g_wall_off_ms, and every heartbeat carries a readable UTC
+   date. Lines written before the anchor are dated via the `boot=` field of
+   the `clock:` line (boot = wall at tick 0). */
+static uint64_t g_wall_off_ms;     /* epoch_ms - HAL_GetTick() at anchor */
+static uint8_t  g_wall_src;        /* 0 = none, 1 = gps, 2 = host        */
+
+/* Howard Hinnant's civil_from_days, unsigned-only (epoch ≥ 1970). */
+static void civil_from_days(uint32_t z, unsigned *y, unsigned *m, unsigned *d)
+{
+  z += 719468u;
+  uint32_t era = z / 146097u;
+  uint32_t doe = z - era * 146097u;
+  uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+  uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+  uint32_t mp  = (5u * doy + 2u) / 153u;
+  *d = (unsigned)(doy - (153u * mp + 2u) / 5u + 1u);
+  *m = (unsigned)(mp < 10u ? mp + 3u : mp - 9u);
+  *y = (unsigned)(yoe + era * 400u + (*m <= 2u ? 1u : 0u));
+}
+
+static uint32_t days_from_civil(unsigned y, unsigned m, unsigned d)
+{
+  y -= (m <= 2u) ? 1u : 0u;
+  uint32_t era = y / 400u;
+  uint32_t yoe = y - era * 400u;
+  uint32_t doy = (153u * (m > 2u ? m - 3u : m + 9u) + 2u) / 5u + d - 1u;
+  uint32_t doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+  return era * 146097u + doe - 719468u;
+}
+
+/* "YYYY-MM-DD HH:MM:SS" (UTC). */
+static void format_epoch(char *out, size_t len, uint64_t epoch_ms)
+{
+  uint32_t secs = (uint32_t)(epoch_ms / 1000u);
+  unsigned y, mo, d;
+  civil_from_days(secs / 86400u, &y, &mo, &d);
+  uint32_t sod = secs % 86400u;
+  snprintf(out, len, "%04u-%02u-%02u %02u:%02u:%02u", y, mo, d,
+           (unsigned)(sod / 3600u), (unsigned)((sod / 60u) % 60u),
+           (unsigned)(sod % 60u));
+}
+
+static void wall_anchor(uint64_t epoch_ms, uint8_t src)
+{
+  uint32_t tick = HAL_GetTick();
+  if (epoch_ms < (uint64_t)tick) return;           /* nonsense epoch */
+  g_wall_off_ms = epoch_ms - tick;
+  g_wall_src    = src;
+  char now_s[24], boot_s[24];
+  format_epoch(now_s,  sizeof(now_s),  epoch_ms);
+  format_epoch(boot_s, sizeof(boot_s), g_wall_off_ms);
+  ErrLog_Writef("clock: %s UTC (src=%s) boot=%s UTC", now_s,
+                src == 2 ? "host" : "gps", boot_s);
+}
+
+void ErrLog_SetWallClock(uint64_t epoch_ms)
+{
+  if (!g_inited) return;
+  wall_anchor(epoch_ms, 2);
+}
+
+void ErrLog_SetWallClockGps(unsigned year, unsigned mon, unsigned day,
+                            unsigned hh, unsigned mm, unsigned ss)
+{
+  /* First GPS anchor per boot only — a host SET_TIME (or an earlier GPS
+     anchor) already dated the log; re-anchoring 10x/s would just spam. */
+  if (!g_inited || g_wall_src != 0) return;
+  if (year < 2024u || mon < 1u || mon > 12u || day < 1u || day > 31u) return;
+  uint64_t secs = (uint64_t)days_from_civil(year, mon, day) * 86400u
+                + hh * 3600u + mm * 60u + ss;
+  wall_anchor(secs * 1000u, 1);
+}
+
 static volatile uint8_t g_warning_latched = 0;
 
 uint8_t ErrLog_WarningLatched(void) { return g_warning_latched; }
@@ -160,6 +236,13 @@ void ErrLog_Heartbeat(void)
 {
   if (!g_inited) return;
   uint64_t free_b = SDFat_FreeBytes();
-  ErrLog_Writef("hb: free=%lu MB", (unsigned long)(free_b / (1024*1024)));
+  if (g_wall_src) {
+    char now_s[24];
+    format_epoch(now_s, sizeof(now_s), g_wall_off_ms + HAL_GetTick());
+    ErrLog_Writef("hb: free=%lu MB utc=%s", (unsigned long)(free_b / (1024*1024)),
+                  now_s);
+  } else {
+    ErrLog_Writef("hb: free=%lu MB", (unsigned long)(free_b / (1024*1024)));
+  }
   ErrLog_Flush();
 }

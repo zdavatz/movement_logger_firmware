@@ -542,6 +542,7 @@ static void parse_nav_pvt(const uint8_t *p, uint16_t len)
       int cs = (nano > 0) ? (int)(nano / 10000000) : 0;    /* clamp neg nano */
       snprintf(g_latest.utc, sizeof(g_latest.utc), "%02u%02u%02u.%02u",
                (unsigned)p[8], (unsigned)p[9], (unsigned)p[10], (unsigned)cs);
+      ErrLog_SetWallClockGps(rd_u16(p + 4), p[6], p[7], p[8], p[9], p[10]);
     }
     g_latest.tick_ms = HAL_GetTick();
     g_latest.valid   = 1;
