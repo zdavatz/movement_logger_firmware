@@ -1228,8 +1228,17 @@ only the `g_active` logger gates applied, so `ERRLOG.LOG` kept appending
 with cached FAT state while the host wrote the same FAT — the card
 corruption of 2026-10-24/25.)
 
-`tud_umount_cb` fires on physical unplug / bus reset (a host eject alone
-does not end it). Only if the card was host-owned: `SDFat_Remount()`
+**There is no VBUS sense on this board** (ST's BSP: `vbus_sensing_enable =
+DISABLE`), so a physical unplug never produces a bus reset and
+`tud_umount_cb` does not fire — the DWC2 only sees a bus suspend, the same
+as a sleeping host. Since v0.0.65 `tud_suspend_cb` arms a timer and
+`UsbMsc_Tick` treats a suspend lasting `USB_GONE_MS` (5 s) as "host gone":
+`tud_disconnect()` → release the card → `tud_connect()`. The soft
+detach/attach forces a merely-sleeping host to re-enumerate on wake
+(→ `tud_mount_cb`, card handed back) and re-read the volume instead of
+writing with a stale cache. `tud_resume_cb` cancels the timer;
+`tud_umount_cb` (genuine bus reset) releases too. Release, only if the
+card was host-owned: `SDFat_Remount()`
 re-reads MBR/BPB and drops all cached FAT state, `ErrLog_ReopenAfterHost()`
 reopens the log from scratch (the stale handle is discarded, never
 flushed) and appends the held lines, then `Logger_Init()` — AUTO opens a

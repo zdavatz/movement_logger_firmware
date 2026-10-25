@@ -562,7 +562,7 @@ Now:
   box-side write — the single choke point; the MSC bridge writes via
   `SDFat_RawHandle()` and is unaffected). `ErrLog_Write` buffers lines in a
   2 KB RAM hold (overflow counted, not wrapped) and never touches the SD.
-- `tud_umount_cb` (only if host-owned): `SDFat_Remount()` (re-reads MBR/BPB,
+- Card release (`usb_release_card`, only if host-owned): `SDFat_Remount()` (re-reads MBR/BPB,
   drops all FAT caches, clears host ownership) → `ErrLog_ReopenAfterHost()`
   (discards the stale handle **without** flush/close, reopens, appends the
   held lines + dropped count) → logger resume. Remount failure → `***` line,
@@ -572,13 +572,34 @@ Now:
   stays reachable over USB for a reformat.
 - BLE ops that write the card (DELETE, SET_MODE, CAL_SET, …) fail with an
   I/O status while the host owns it; `ErrLog_Clear` refuses outright.
-- `tud_umount_cb` fires on unplug / bus reset, not on a macOS eject — after
-  an eject the box stays hands-off until the cable is pulled.
+- **Unplug detection (v0.0.65) — the board has NO VBUS sense.** ST's BSP
+  projects run `vbus_sensing_enable = DISABLE`; a physical unplug produces
+  no bus reset, so `tud_umount_cb` never fires (the v0.0.63 assumption was
+  wrong — field ERRLOG: not one `usb: unmounted` line ever, and v0.0.63/64
+  boxes stopped writing for good after any USB contact until a power
+  cycle). The DWC2 only sees a bus **suspend** — same as a sleeping host.
+  `tud_suspend_cb` arms a timer; if the suspend outlasts `USB_GONE_MS`
+  (5 s) while the card is host-owned, `UsbMsc_Tick` does `tud_disconnect()`
+  → `usb_release_card()` → `tud_connect()`. The soft detach/attach is what
+  makes the sleeping-host case safe: on wake the host has lost the device
+  and must re-enumerate (→ `tud_mount_cb` hands the card back) and re-read
+  the volume, instead of writing with its cached FAT onto a card the box
+  has since written. `tud_resume_cb` cancels the timer. `tud_umount_cb`
+  still releases on a genuine bus reset (incl. the one after our own
+  re-attach — `usb_release_card` no-ops when not host-owned).
+  Known trade-off (untested on hardware): a host that suspends the port
+  after a Finder *eject* with the cable still in will see the volume
+  re-mount ~5 s later — harmless to the card.
+- **Keep Spotlight off the card**: macOS indexing put its `.Spotlight-V100/
+  Store-V2` directory into clusters the box was still appending ERRLOG.LOG
+  to (2026-10-25: 72 KB of FAT LFN entries `0.indexPositionTable`,
+  `live.0.indexHead`, `STORE DB` inside ERRLOG.LOG). A `.metadata_never_index`
+  file in the card root stops macOS from creating that directory at all.
 
 Also seen on this card earlier: the DELETE-of-an-open-file bug fixed in
 v0.0.61/62 corrupts the FAT the same way. A card already damaged by either
 bug must be reformatted — firmware can't repair it. Bumped `PL_FW_VERSION`
-→ **0.0.63**.
+→ **0.0.63**; unplug detection **0.0.65**.
 
 ## FAT32-only mount — reject FAT12/FAT16 cards (v0.0.59+) — `sd_fatfs.c`
 

@@ -37,6 +37,19 @@ volatile uint32_t g_otg_fs_irq_count = 0;
 static volatile bool s_mounted      = false;
 static volatile bool s_ever_mounted = false;
 
+/* v0.0.65: unplug detection. The board routes no VBUS sense to the MCU (ST's
+   own BSP projects run vbus_sensing_enable = DISABLE), so a physical unplug
+   never produces a bus reset and tud_umount_cb never fires — the DWC2 only
+   sees a bus SUSPEND, exactly like a sleeping host. Field ERRLOG: not one
+   "usb: unmounted" line ever, and since v0.0.63 the box stopped writing
+   for good after any USB contact. A suspend that lasts USB_GONE_MS while
+   the card is host-owned is therefore treated as "host gone". */
+#define USB_GONE_MS  5000U
+static volatile bool     s_suspended  = false;
+static volatile uint32_t s_suspend_at = 0;
+
+static void usb_release_card(const char *why);
+
 /* ---------------------------------------------------------------------------
  * USB peripheral hardware bring-up
  *
@@ -146,6 +159,22 @@ bool UsbMsc_Init(void)
 void UsbMsc_Tick(void)
 {
   tud_task();
+
+  /* Host gone (unplug, or a host asleep for USB_GONE_MS). Soft-detach
+     first, so a host that was merely asleep can't resume onto a card the
+     box is about to write: it loses the device, and after the re-attach
+     below it must re-enumerate (→ tud_mount_cb hands the card back) and
+     re-read the volume from scratch instead of writing with a cached FAT.
+     On a real unplug the detach/attach is a no-op on dead lines. */
+  if (s_mounted && s_suspended &&
+      (uint32_t)(HAL_GetTick() - s_suspend_at) >= USB_GONE_MS) {
+    s_suspended = false;
+    s_mounted   = false;
+    tud_disconnect();
+    usb_release_card("bus suspended 5 s (unplug)");
+    HAL_Delay(20);                       /* let the host see the detach */
+    tud_connect();
+  }
 }
 
 bool UsbMsc_IsMounted(void)   { return s_mounted; }
@@ -164,6 +193,7 @@ void tud_mount_cb(void)
 {
   s_mounted = true;
   s_ever_mounted = true;
+  s_suspended = false;
   ErrLog_Write("usb: mounted — pausing logger + all SD writes");
   /* Flush + close any open session, then mark inactive. Logger_Stop is
      idempotent so it's safe to call even if no session is open. */
@@ -177,24 +207,25 @@ void tud_mount_cb(void)
   SDFat_SetHostOwned();
 }
 
-void tud_umount_cb(void)
+/* Take the card back from the host. The host may have changed anything
+   (allocated clusters, rewritten the root dir, reformatted) — re-read the
+   volume before the box writes a single block. Refuse to resume on a volume
+   we can't mount; writes stay blocked until reboot, the card is still
+   reachable over USB. Only when the card was actually handed over — the
+   reopen discards the log handle's unflushed tail, which must not happen
+   on a stray callback (also covers tud_umount_cb firing on the bus reset
+   that follows our own soft re-attach). */
+static void usb_release_card(const char *why)
 {
-  s_mounted = false;
-  /* The host may have changed anything (allocated clusters, rewritten the
-     root dir, reformatted) — re-read the volume before the box writes a
-     single block. Refuse to resume on a volume we can't mount; writes stay
-     blocked until reboot, the card is still reachable over USB. Only when
-     the card was actually handed over — the reopen discards the log
-     handle's unflushed tail, which must not happen on a stray callback. */
   if (!SDFat_HostOwned()) return;
   pl_fx_status_t rc = SDFat_Remount();
   if (rc != PL_FX_OK) {
-    ErrLog_Writef("*** usb: unmounted — SD remount FAIL rc=%d, SD writes "
-                  "blocked until reboot", (int)rc);
+    ErrLog_Writef("*** usb: %s — SD remount FAIL rc=%d, SD writes "
+                  "blocked until reboot", why, (int)rc);
     return;
   }
   ErrLog_ReopenAfterHost();
-  ErrLog_Write("usb: unmounted — SD remounted, resuming logger");
+  ErrLog_Writef("usb: %s — SD remounted, resuming logger", why);
   /* Resume logging. In AUTO mode this opens a fresh session immediately.
      In MANUAL mode it stays idle until the next START_LOG. */
   if (Logger_GetMode() != LOGGER_MODE_MANUAL) {
@@ -204,19 +235,30 @@ void tud_umount_cb(void)
   }
 }
 
-/* Bus suspended (no SOF for 3 ms). Treat as soft-disconnect for safety —
-   the host may be entering selective suspend. We do NOT resume logging
-   here: only an explicit unmount or a full bus reset transitions us
-   back. This is conservative; a re-mount on resume re-fires tud_mount_cb
-   without ill effect. */
+/* Fires on a bus reset of a configured device — NOT on a physical unplug
+   on this board (no VBUS sense; see USB_GONE_MS). */
+void tud_umount_cb(void)
+{
+  s_mounted = false;
+  s_suspended = false;
+  usb_release_card("unmounted");
+}
+
+/* Bus suspended (no SOF for 3 ms): a physical unplug on this board, or a
+   sleeping / selectively-suspending host. Only arm the timer here —
+   UsbMsc_Tick releases the card if the suspend outlasts USB_GONE_MS. */
 void tud_suspend_cb(bool remote_wakeup_en)
 {
   (void) remote_wakeup_en;
+  if (s_mounted && !s_suspended) {
+    s_suspend_at = HAL_GetTick();
+    s_suspended  = true;
+  }
 }
 
 void tud_resume_cb(void)
 {
-  /* No-op — s_mounted reflects host SCSI activity, not bus power. */
+  s_suspended = false;
 }
 
 /* ===========================================================================
