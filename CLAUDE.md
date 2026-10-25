@@ -545,6 +545,24 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## GPS TX-path test: NMEA poll + `$PUBX,41` (v0.0.71+) — `gps.c`
+
+When the baud raise stays un-ACK'd and the module is found streaming NMEA
+(the "stuck at 9600" boxes), `gps_tx_path_test` separates the two causes that
+look identical in the log: it sends a standard NMEA poll `$EIGNQ,ZDA` (ZDA is
+off by default on the M10, so a `ZDA,` line can only be the reply), ×3 with
+1.5 s windows.
+
+- **No reply** → `*** gps: tx-test … no reply to NMEA poll (ZDA): box->module
+  TX dead … ***` — hardware (JP2 pin 14 → module RXD). Nothing software can do.
+- **Reply** → TX works and the module swallows UBX (inProtoMask NMEA-only —
+  BBR-held while V_BCKP is powered, or flash on older modules; the May 2026
+  `fc4463a5` case). Then `$PUBX,41,1,0003,0003,230400,0` (NMEA-borne, so it
+  passes the UBX block) re-enables UBX in/out at 230400; confirmed by a
+  MON-VER poll answered at 230400 → the normal config (and 10 Hz) follows.
+  v0.0.18 found `$PUBX,41` unreliable for the *output* mask on the M10, which
+  is why it's only this last-resort path, verified, never the primary route.
+
 ## SD-write refusals say why (v0.0.70+) — `ble.c`
 
 DELETE / START_LOG / SET_MODE / CAL_SET check `sd_write_refusal()` first and,

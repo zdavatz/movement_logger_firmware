@@ -956,6 +956,85 @@ static int ubx_send_retry(uint8_t cls, uint8_t id, const uint8_t *payload,
   return -1;
 }
 
+/* ---------- TX-path test: NMEA poll + $PUBX,41 (v0.0.71) ---------------- */
+
+/* Send "$<body>*CS\r\n" — NMEA XOR checksum over everything between $ and *. */
+static void nmea_send(const char *body)
+{
+  uint8_t cs = 0;
+  for (const char *c = body; *c; c++) cs ^= (uint8_t)*c;
+  char line[96];
+  int n = snprintf(line, sizeof(line), "$%s*%02X\r\n", body, cs);
+  if (n > 0 && n < (int)sizeof(line))
+    HAL_UART_Transmit(&g_huart4, (uint8_t *)line, (uint16_t)n, 200);
+}
+
+/* Watch the RX ring for `token` (plain bytes, e.g. "ZDA,") for up to `ms`.
+   1 = seen, 0 = not. Same abort-then-arm pattern as listen_traffic. */
+static int wait_token(const char *token, uint32_t ms)
+{
+  size_t tl = strlen(token), m = 0;
+  uint32_t t0 = HAL_GetTick();
+  while ((HAL_GetTick() - t0) < ms) {
+    while (g_rx_head != g_rx_tail) {
+      uint8_t b = g_rx_ring[g_rx_tail];
+      g_rx_tail = (uint16_t)((g_rx_tail + 1u) % GPS_RX_RING_SIZE);
+      if (b == (uint8_t)token[m]) { if (++m == tl) return 1; }
+      else m = (b == (uint8_t)token[0]) ? 1 : 0;
+    }
+  }
+  return 0;
+}
+
+/* Every UBX command went un-ACK'd although the module streams NMEA. Two
+   causes look identical from the logs: (a) the box→module TX wire is dead,
+   (b) the module's UBX *input* is disabled (inProtoMask NMEA-only — kept in
+   BBR while V_BCKP stays powered, or in flash on older modules) and it
+   swallows every UBX frame. Tell them apart with something the module must
+   answer even in case (b): a standard NMEA poll for ZDA, a sentence the
+   M10 does NOT output by default — so a ZDA line can only be the reply.
+     answered → TX works, UBX input blocked → try $PUBX,41 (NMEA-borne port
+                config: UBX+NMEA in/out, 230400) to re-enable UBX.
+     silent   → TX path dead: hardware (JP2 pin 14 → module RXD).
+   Returns the new baud if $PUBX,41 took, else 0 (UART left at `baud`). */
+static uint32_t gps_tx_path_test(uint32_t baud)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  int answered = 0;
+  for (int i = 0; i < 3 && !answered; i++) {
+    listen_traffic(50, NULL, NULL);              /* flush + arm RX IRQ */
+    nmea_send("EIGNQ,ZDA");
+    answered = wait_token("ZDA,", 1500);
+  }
+  if (!answered) {
+    ErrLog_Writef("*** gps: tx-test @%lu — no reply to NMEA poll (ZDA): "
+                  "box->module TX dead, check JP2 pin 14 -> module RXD ***",
+                  (unsigned long)baud);
+    return 0;
+  }
+  ErrLog_Writef("*** gps: tx-test @%lu — NMEA poll answered: TX works, "
+                "UBX input blocked — trying $PUBX,41 ***", (unsigned long)baud);
+
+  char body[48];
+  snprintf(body, sizeof(body), "PUBX,41,1,0003,0003,%lu,0",
+           (unsigned long)GPS_UART_BAUDRATE);
+  nmea_send(body);
+  HAL_Delay(100);                                /* let it switch */
+  if (gps_uart_reopen(GPS_UART_BAUDRATE) != 0) return 0;
+  ubx_send(0x0A, 0x04, NULL, 0);                 /* MON-VER: needs UBX in+out */
+  int nl = 0, ux = 0;
+  listen_traffic(800, &nl, &ux);
+  if (ux > 0) {
+    ErrLog_Writef("gps: $PUBX,41 OK — @%lu, UBX input re-enabled (nmea=%d ubx=%d)",
+                  (unsigned long)GPS_UART_BAUDRATE, nl, ux);
+    return GPS_UART_BAUDRATE;
+  }
+  ErrLog_Writef("*** gps: $PUBX,41 ignored @%lu (nmea=%d ubx=%d) — staying @%lu ***",
+                (unsigned long)GPS_UART_BAUDRATE, nl, ux, (unsigned long)baud);
+  (void)gps_uart_reopen(baud);
+  return 0;
+}
+
 /* ---------- GPS power (backup / wake) ----------------------------------- */
 
 /* Drop the receiver into UBX-RXM-PMREQ *backup* mode (~tens of µA). Wakes on
@@ -1248,7 +1327,6 @@ int GPS_Init(void)
       ErrLog_Writef("gps: cfg baud %lu ACK (from %lu)",
                     (unsigned long)GPS_UART_BAUDRATE, (unsigned long)found);
     } else {
-      fails++;
       final_baud = found;
       ErrLog_Writef("*** gps: cfg baud %lu NOT confirmed — staying @%lu ***",
                     (unsigned long)GPS_UART_BAUDRATE, (unsigned long)found);
@@ -1256,6 +1334,9 @@ int GPS_Init(void)
         ErrLog_Write("gps: uart_reinit@fallback FAIL");
         return -1;
       }
+      uint32_t nb = gps_tx_path_test(found);
+      if (nb) final_baud = nb;
+      else    fails++;
       listen_traffic(200, NULL, NULL);             /* re-arm the RX IRQ */
     }
   }
