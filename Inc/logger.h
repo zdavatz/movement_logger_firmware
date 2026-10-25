@@ -33,7 +33,10 @@ typedef struct {
 #define LOGGER_MODE_AUTO    0
 #define LOGGER_MODE_MANUAL  1
 
-int  Logger_Init(void);            /* opens session files; returns 0 on success */
+int  Logger_Init(void);            /* opens session files; returns 0 on success, -6 = battery lock */
+/* v0.0.67: 1 while the low-battery SD lock is on (battery < PL_LOWBAT_LOCK_MV:
+   session closed, all SD writes refused until PL_LOWBAT_RELEASE_MV). */
+int  Logger_LowBatLocked(void);
 void Logger_Tick(void);            /* called every 1 ms from main loop */
 int  Logger_IsActive(void);
 /* True iff `name` is one of the Sens/Gps/Bat files the running session holds

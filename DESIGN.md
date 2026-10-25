@@ -1247,6 +1247,17 @@ remount leaves writes blocked until reboot; the card stays reachable
 over USB (ready/capacity key off SD hardware init, not the FAT mount) so
 it can be reformatted.
 
+### Low-battery SD lock (v0.0.67)
+
+A second reason to refuse SD writes, sharing the `sd_write_block` choke
+point with host ownership: battery < 3400 mV for 5 consecutive 1 Hz fuel
+reads closes the session and locks writes; ≥ 3700 mV for 5 reads unlocks
+(drops the cached FAT page, reopens the error log, AUTO reopens a session).
+`SDFat_WritesBlocked()` = host-owned OR battery-locked; the error log holds
+lines in RAM while either is set, and the last lock to release resumes
+logging. Rationale: brown-out resets on a near-empty cell tore FAT/directory
+writes (2026-10-25: 6× PIN+BOR at 1–4 % soc).
+
 ### State-machine table addendum
 
 Added to §11's audit table:

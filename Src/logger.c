@@ -50,9 +50,25 @@ static PL_GpsFix     g_last_gps;
 static PL_GpsFix     g_gps_pending;
 static int           g_gps_pending_valid;
 
+/* v0.0.67 low-battery SD lock — see lowbat_check. */
+static int           g_lowbat;
+static uint8_t       g_lowbat_count;
+
+static void gps_pending_flush(void);
+static void lowbat_engage(uint16_t mv);
+
+int Logger_LowBatLocked(void) { return g_lowbat; }
+
 int Logger_Init(void)
 {
   if (!SDFat_IsMounted()) return -1;
+  /* Never open a session on a cell that is already too low (boot after a
+     brown-out, START_LOG, USB release) — engage the lock right away. */
+  PL_FuelSample fs;
+  if (!g_lowbat && FUEL_Read(&fs) == 0 && fs.voltage_mV > 1000U &&
+      fs.voltage_mV < PL_LOWBAT_LOCK_MV)
+    lowbat_engage(fs.voltage_mV);
+  if (g_lowbat) return -6;
   g_gps_pending_valid = 0;      /* never carry an epoch into a new session */
   g_session = SDFat_NextSessionNumber();
   if (g_session < 0) return -2;
@@ -263,6 +279,54 @@ static void gps_queue_fix(const PL_GpsFix *f)
   g_gps_pending_valid = 1;
 }
 
+/* Close the session and lock every SD write. The box keeps running (BLE,
+   live stream, GPS), only the card is left alone, so a brown-out reset can
+   no longer land in the middle of a FAT / directory write. */
+static void lowbat_engage(uint16_t mv)
+{
+  ErrLog_Writef("*** power: battery %u mV < %u mV — session closed, SD writes "
+                "locked until %u mV (charge via USB-C) ***",
+                (unsigned)mv, (unsigned)PL_LOWBAT_LOCK_MV,
+                (unsigned)PL_LOWBAT_RELEASE_MV);
+  if (g_active) {
+    gps_pending_flush();
+    g_active = 0;
+    SDFat_Close(&g_sens);
+    SDFat_Close(&g_gps);
+    SDFat_Close(&g_bat);
+  }
+  ErrLog_Flush();               /* the line above, while writes still work */
+  SDFat_SetLowBatLock(1);
+  g_lowbat = 1;
+  g_lowbat_count = 0;
+}
+
+static void lowbat_release(uint16_t mv)
+{
+  g_lowbat = 0;
+  g_lowbat_count = 0;
+  SDFat_SetLowBatLock(0);
+  ErrLog_ReopenAfterHost();     /* no-op while a USB host still owns the card */
+  ErrLog_Writef("power: battery %u mV — SD writes unlocked", (unsigned)mv);
+  if (SDFat_WritesBlocked()) return;   /* USB release resumes the logger */
+  if (Logger_GetMode() != LOGGER_MODE_MANUAL && Logger_Init() != 0)
+    ErrLog_Write("power: logger re-open after battery lock failed");
+}
+
+/* 1 Hz, on every fuel read. A run of PL_LOWBAT_SAMPLES readings is needed
+   either way so a single load spike (GPS acquisition, SD write burst) can't
+   lock, and a brief charger glitch can't unlock. */
+static void lowbat_check(uint16_t mv)
+{
+  if (mv <= 1000U) return;      /* gauge not ready / bogus read */
+  int crossing = g_lowbat ? (mv >= PL_LOWBAT_RELEASE_MV)
+                          : (mv <  PL_LOWBAT_LOCK_MV);
+  if (!crossing) { g_lowbat_count = 0; return; }
+  if (++g_lowbat_count < PL_LOWBAT_SAMPLES) return;
+  if (g_lowbat) lowbat_release(mv);
+  else          lowbat_engage(mv);
+}
+
 static void emit_bat_row(const PL_FuelSample *fuel)
 {
   char row[80];
@@ -356,6 +420,7 @@ void Logger_Tick(void)
     if (FUEL_Read(&fuel) == 0) {
       g_last_fuel = fuel;
       if (g_active) emit_bat_row(&fuel);
+      lowbat_check(fuel.voltage_mV);
     }
   }
 

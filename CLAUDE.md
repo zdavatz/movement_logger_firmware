@@ -545,6 +545,36 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## Low-battery SD lock (v0.0.67+) — `logger.c`, `sd_fatfs.c`, `errlog.c`
+
+A nearly empty cell brown-outs the MCU mid-write: 2026-10-25 ERRLOG showed
+6× `reset: PIN+BOR` at boot soc 1–4 % (BAT003 ended at 3216 mV / 6 %), plus
+a missing `SENS001` and NUL holes in `ERRLOG.LOG` — torn writes, not a
+cross-link (every Sens/Gps/Bat file held only its own row schema). The GPS
+(~25–30 mA) is what tips a low cell over, which is why a GPS-less box didn't
+show it.
+
+- `lowbat_check` runs on every 1 Hz fuel read. `PL_LOWBAT_SAMPLES` (5)
+  consecutive reads below `PL_LOWBAT_LOCK_MV` (3400) → `lowbat_engage`:
+  `***` errlog line + flush, close the session (pending GPS epoch first),
+  then `SDFat_SetLowBatLock(1)` — `sd_write_block` refuses every write
+  (same choke point as USB host ownership). BLE, live stream and GPS keep
+  running; reads (LIST/READ) keep working.
+- `Logger_Init` refuses (`-6`) while locked and engages the lock itself on a
+  single read below the threshold — so a reboot after a brown-out, a
+  `START_LOG` or a USB release can't open a session on an empty cell.
+- Release: 5 reads ≥ `PL_LOWBAT_RELEASE_MV` (3700, i.e. USB charging) →
+  unlock, drop the cached FAT page (refused writes may have left RAM-only
+  state), `ErrLog_ReopenAfterHost` appends the held lines, AUTO reopens a
+  session. MANUAL stays idle.
+- Both locks compose via `SDFat_WritesBlocked()` (host-owned OR low-battery):
+  errlog holds lines in RAM while either is set, and whichever lock releases
+  last reopens the log/logger (`usb_release_card` returns early if the
+  battery lock is still on; `lowbat_release` defers to the USB release
+  while a host still owns the card).
+- `fat_load_page_for_cluster` drops a dirty FAT page while writes are
+  locked instead of failing every later FAT read on it.
+
 ## One GpsNNN.csv row per GPS epoch (v0.0.66+) — `logger.c`
 
 In NMEA mode both GGA and RMC raise `GPS_FixUpdated()` for the same epoch,

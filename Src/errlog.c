@@ -202,7 +202,7 @@ int ErrLog_Clear(void)
   if (!g_inited) return SDFat_Delete(LOG_FILENAME);
   /* v0.0.63: the card belongs to a USB host — every write would fail and
      the reopen below would leave the log dead until reboot. */
-  if (SDFat_HostOwned()) return PL_FX_ERR_IO;
+  if (SDFat_WritesBlocked()) return PL_FX_ERR_IO;
   g_inited = 0;                          /* no writes while the handle is down */
   SDFat_Close(&g_log);
   int s = SDFat_Delete(LOG_FILENAME);
@@ -246,7 +246,9 @@ static void hold_line(const char *line, int n)
 
 void ErrLog_ReopenAfterHost(void)
 {
-  if (!g_inited) return;
+  /* Still blocked (host released, battery lock still on, or vice versa):
+     keep holding — the other lock's release calls this again. */
+  if (!g_inited || SDFat_WritesBlocked()) return;
   /* Discard the old handle without SDFat_Close: its flush would patch a
      directory slot and write a sector at positions the host may have
      reused. The host may also have deleted or truncated the file. */
@@ -257,10 +259,11 @@ void ErrLog_ReopenAfterHost(void)
   }
   if (g_hold_len) SDFat_Append(&g_log, g_hold, g_hold_len);
   if (g_hold_dropped) {
-    char line[64];
+    char line[96];
     int n = snprintf(line, sizeof(line),
-                     "[%lu ms] usb: %u errlog lines dropped while host-owned\n",
+                     "[%lu ms] sd: %u errlog lines dropped while SD writes were blocked\n",
                      (unsigned long)HAL_GetTick(), (unsigned)g_hold_dropped);
+    if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
     if (n > 0) SDFat_Append(&g_log, line, (uint32_t)n);
   }
   g_hold_len = 0;
@@ -283,7 +286,7 @@ void ErrLog_Write(const char *s)
                    (unsigned long)HAL_GetTick(), s);
   if (n <= 0) return;
   if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
-  if (SDFat_HostOwned()) { hold_line(line, n); return; }
+  if (SDFat_WritesBlocked()) { hold_line(line, n); return; }
   SDFat_Append(&g_log, line, (uint32_t)n);
 }
 
@@ -301,7 +304,7 @@ void ErrLog_Writef(const char *fmt, ...)
 
 void ErrLog_Flush(void)
 {
-  if (!g_inited || SDFat_HostOwned()) return;
+  if (!g_inited || SDFat_WritesBlocked()) return;
   SDFat_Flush(&g_log);
 }
 

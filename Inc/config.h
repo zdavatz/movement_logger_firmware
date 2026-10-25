@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.66"
+#define PL_FW_VERSION          "0.0.67"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -143,6 +143,16 @@
 /* Sample-buffer sizes -----------------------------------------------------*/
 #define PL_SD_BLOCK_SIZE       512U
 #define PL_FAT_CACHE_CLUSTERS  1U            /* tiny — append-only writer */
+
+/* Low-battery SD lock (v0.0.67) -------------------------------------------*/
+/* Below LOCK for SAMPLES consecutive 1 Hz fuel reads the session is closed
+   and every SD write is refused; at/above RELEASE (USB charging) for as
+   long, writes resume. The hysteresis gap keeps a recovering, unloaded
+   cell from flapping the lock. Brown-outs on a nearly empty cell reset the
+   MCU mid-write and tore the card (2026-10-25: 6x PIN+BOR at soc 1-4 %). */
+#define PL_LOWBAT_LOCK_MV      3400U
+#define PL_LOWBAT_RELEASE_MV   3700U
+#define PL_LOWBAT_SAMPLES      5U
 
 /* Watchdog -----------------------------------------------------------------*/
 #define PL_IWDG_PERIOD_MS      2000U         /* hard reset after ≤2 s hang */

@@ -73,6 +73,13 @@ void SDFat_SetHostOwned(void);
 int  SDFat_HostOwned(void);
 pl_fx_status_t SDFat_Remount(void);
 
+/* Low-battery write lock (v0.0.67). On: flushes the cached FAT page, then
+   refuses every block write until Off; Off drops the cached FAT page. Open
+   PL_File handles must be closed before On. WritesBlocked = host-owned OR
+   low-battery locked — the test every writer outside this layer uses. */
+void SDFat_SetLowBatLock(int on);
+int  SDFat_WritesBlocked(void);
+
 /* Choose the next free NNN s.t. SensNNN.csv / GpsNNN.csv / BatNNN.csv do not
    exist on the card. Returns 0..999, or -1 on error. */
 int  SDFat_NextSessionNumber(void);

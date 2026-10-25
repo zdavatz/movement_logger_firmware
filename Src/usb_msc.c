@@ -224,6 +224,11 @@ static void usb_release_card(const char *why)
                   "blocked until reboot", why, (int)rc);
     return;
   }
+  if (SDFat_WritesBlocked()) {
+    /* Battery lock still on: its release reopens the log + logger. */
+    ErrLog_Writef("usb: %s — SD remounted, battery lock keeps writes off", why);
+    return;
+  }
   ErrLog_ReopenAfterHost();
   ErrLog_Writef("usb: %s — SD remounted, resuming logger", why);
   /* Resume logging. In AUTO mode this opens a fresh session immediately.

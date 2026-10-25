@@ -154,8 +154,12 @@ int main(void)
     if (Logger_GetMode() == LOGGER_MODE_MANUAL) {
       ErrLog_Write("logger: manual mode — idle until START_LOG");
     } else if (Logger_Init() != 0) {
-      ErrLog_Write("logger: init FAIL");
-      beep_pattern(800, 6, 100, 100);
+      if (Logger_LowBatLocked()) {
+        ErrLog_Write("logger: battery too low — no session (SD locked)");
+      } else {
+        ErrLog_Write("logger: init FAIL");
+        beep_pattern(800, 6, 100, 100);
+      }
     } else {
       ErrLog_Write("logger: session opened");
     }

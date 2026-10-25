@@ -81,9 +81,13 @@ static HAL_StatusTypeDef sd_read_block(uint32_t lba, uint8_t *buf)
    is unaffected. Cleared only after SDFat_Remount() re-read the volume. */
 static volatile int g_host_owned = 0;
 
+/* v0.0.67: set while the battery is too low to write safely — see
+   SDFat_SetLowBatLock. Same choke point as host ownership. */
+static volatile int g_lowbat_lock = 0;
+
 static HAL_StatusTypeDef sd_write_block(uint32_t lba, const uint8_t *buf)
 {
-  if (g_host_owned) return HAL_ERROR;
+  if (g_host_owned || g_lowbat_lock) return HAL_ERROR;
   return HAL_SD_WriteBlocks(&g_hsd, buf, lba, 1, 1000);
 }
 
@@ -126,6 +130,11 @@ static pl_fx_status_t fat_load_page_for_cluster(uint32_t cluster, uint32_t *page
   *page_off             = fat_byte_off % 512U;
   if (g_fatpage_lba == page_lba) return PL_FX_OK;
 
+  if (g_fatpage_dirty && g_fatpage_lba && (g_host_owned || g_lowbat_lock)) {
+    /* Writes are locked: the change can never reach the card, so drop it
+       instead of failing every later FAT read on this unwritable page. */
+    g_fatpage_dirty = 0;
+  }
   if (g_fatpage_dirty && g_fatpage_lba) {
     /* Write back current page AND the corresponding entry in FAT #1 (so the
        two FATs stay in sync after every modification — minimal but correct). */
@@ -321,6 +330,23 @@ void SDFat_SetHostOwned(void)
 }
 
 int SDFat_HostOwned(void) { return g_host_owned; }
+
+void SDFat_SetLowBatLock(int on)
+{
+  if (on) {
+    if (!g_lowbat_lock && !g_host_owned) (void)fat_flush_page();
+    g_lowbat_lock = 1;
+    return;
+  }
+  if (!g_lowbat_lock) return;
+  g_lowbat_lock = 0;
+  /* Writes refused while locked may have left in-RAM FAT state the card
+     never saw; start again from what is on the card. */
+  g_fatpage_lba   = 0;
+  g_fatpage_dirty = 0;
+}
+
+int SDFat_WritesBlocked(void) { return g_host_owned || g_lowbat_lock; }
 
 static pl_fx_status_t mount_volume(void)
 {
