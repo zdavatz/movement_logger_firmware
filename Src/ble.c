@@ -1264,20 +1264,14 @@ static void ble_process_command(void)
     memcpy(name, &g_cmd_buf[1], nlen);
     name[nlen] = '\0';
 
-    /* v0.0.61: never free the clusters of a file someone still holds open
-       for append. ERRLOG.LOG is open from boot → close, delete, reopen
-       fresh (before this it stayed invisible until a reboot while the
-       stale handle wrote into freed clusters). The running session's
-       Sens/Gps/Bat files → BUSY. */
-    if (Logger_HoldsFile(name)) {
-      uint8_t st = FSYNC_ST_BUSY;
-      ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
-      snprintf(buf, sizeof(buf), "ble: DELETE '%s' refused — open by running session", name);
-      ErrLog_Write(buf);
-      return;
-    }
-    pl_fx_status_t s = ErrLog_IsLogFile(name) ? (pl_fx_status_t)ErrLog_Clear()
-                                              : SDFat_Delete(name);
+    /* Never free the clusters of a file someone still holds open for
+       append (v0.0.61/62). ERRLOG.LOG is open from boot → close, delete,
+       reopen fresh. A file of the running session → the session rotates
+       into a new NNN+1 set. Before, both left a stale handle writing into
+       freed clusters and nothing reappeared in LIST until a reboot. */
+    pl_fx_status_t s = ErrLog_IsLogFile(name)
+                     ? (pl_fx_status_t)ErrLog_Clear()
+                     : (pl_fx_status_t)Logger_DeleteOpenFile(name);
     uint8_t st = (s == PL_FX_OK)              ? FSYNC_ST_OK
                : (s == PL_FX_ERR_NOT_FOUND)   ? FSYNC_ST_NOT_FOUND
                                               : FSYNC_ST_IO_ERROR;

@@ -37,8 +37,13 @@ int  Logger_Init(void);            /* opens session files; returns 0 on success 
 void Logger_Tick(void);            /* called every 1 ms from main loop */
 int  Logger_IsActive(void);
 /* True iff `name` is one of the Sens/Gps/Bat files the running session holds
-   open (BLE DELETE refuses those with BUSY — v0.0.61). */
+   open. */
 int  Logger_HoldsFile(const char *name);
+/* BLE DELETE of a file (v0.0.62). If the running session holds it open, the
+   session is closed, the file deleted, and logging continues in a fresh
+   NNN+1 Sens/Gps/Bat set (re-stamped with the last host # SYNC anchor);
+   otherwise a plain SDFat_Delete. Returns the delete status. */
+int  Logger_DeleteOpenFile(const char *name);
 void Logger_FlushAll(void);
 
 /* Read the persisted log-mode from the SD config (cached after first

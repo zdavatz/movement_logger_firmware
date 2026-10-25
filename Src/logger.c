@@ -381,8 +381,15 @@ void Logger_FlushAll(void)
   ErrLog_Flush();
 }
 
+/* epoch_ms - HAL_GetTick() of the last host SET_TIME (0 = none) — lets a
+   session re-opened mid-boot (Logger_DeleteOpenFile) carry a # SYNC anchor
+   without waiting for the next connect. */
+static uint64_t g_sync_off_ms = 0;
+
 int Logger_WriteSyncMarker(uint64_t epoch_ms)
 {
+  if (epoch_ms >= (uint64_t)HAL_GetTick())
+    g_sync_off_ms = epoch_ms - HAL_GetTick();
   /* No open session → nothing to anchor. Host still gets an OK reply. */
   if (!g_active) return 0;
 
@@ -419,6 +426,28 @@ int Logger_WriteSyncMarker(uint64_t epoch_ms)
   SDFat_Flush(&g_gps);
   ErrLog_Writef("logger: sync marker tick=%lu", (unsigned long)HAL_GetTick());
   return 1;
+}
+
+int Logger_DeleteOpenFile(const char *name)
+{
+  if (!Logger_HoldsFile(name)) return SDFat_Delete(name);
+  /* The session's handles cache the dir slot + cluster chain; deleting
+     under them left the logger appending into freed clusters and re-patching
+     the 0xE5 entry, so nothing new ever showed up in LIST until a reboot.
+     Close the whole session, delete, and continue in a fresh NNN+1 set
+     (the manual-mode deadline, if any, is kept). */
+  g_active = 0;
+  SDFat_Close(&g_sens);
+  SDFat_Close(&g_gps);
+  SDFat_Close(&g_bat);
+  int s = SDFat_Delete(name);
+  ErrLog_Writef("logger: '%s' deleted while open — rotating session", name);
+  if (Logger_Init() != 0) {
+    ErrLog_Write("*** logger: re-open after delete failed");
+    return s;
+  }
+  if (g_sync_off_ms) Logger_WriteSyncMarker(g_sync_off_ms + HAL_GetTick());
+  return s;
 }
 
 void Logger_Stop(void)
