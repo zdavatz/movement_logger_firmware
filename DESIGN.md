@@ -1247,6 +1247,12 @@ remount leaves writes blocked until reboot; the card stays reachable
 over USB (ready/capacity key off SD hardware init, not the FAT mount) so
 it can be reformatted.
 
+### Refusal status bytes (v0.0.70)
+
+While writes are blocked, SD-writing FileSync ops (DELETE, START_LOG,
+SET_MODE, CAL_SET) are refused up front with `0xE8` (USB host owns the
+card) or `0xE9` (low-battery lock) instead of `0xE2 IO_ERROR`.
+
 ### Eject hands the card back (v0.0.69)
 
 SCSI START STOP UNIT with LoEj=1 (Finder "Eject") releases the card at once

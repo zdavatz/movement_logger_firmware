@@ -545,6 +545,17 @@ logged `rmc=0` — the ERRLOG/CSV half of the A/B test read false-negative
 `listen_traffic`'s robust-arm pattern. Found by the v0.0.49 correctness
 audit (adversarial gps.c review), not in the field.
 
+## SD-write refusals say why (v0.0.70+) — `ble.c`
+
+DELETE / START_LOG / SET_MODE / CAL_SET check `sd_write_refusal()` first and,
+instead of attempting the op against a locked card and replying a generic
+`0xE2 IO_ERROR`, reply **`0xE8 SD_USB`** (a USB host has the card mounted —
+eject it / unplug USB-C) or **`0xE9 SD_LOWBAT`** (battery lock — charge).
+The apps map both to an actionable message. Only ever sent for SD-writing
+ops, so they are deliberately not part of the apps' READ first-notify
+status sniff. GPS_POWER is not gated (it records the choice; see GPS
+suspend).
+
 ## Low-battery SD lock (v0.0.67+, GPS off v0.0.68+) — `logger.c`, `sd_fatfs.c`, `errlog.c`
 
 A nearly empty cell brown-outs the MCU mid-write: 2026-10-25 ERRLOG showed

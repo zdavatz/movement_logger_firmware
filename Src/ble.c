@@ -173,6 +173,10 @@
 #define FSYNC_ST_NOT_FOUND  0xE1
 #define FSYNC_ST_IO_ERROR   0xE2
 #define FSYNC_ST_BAD_REQ    0xE3
+/* v0.0.70: why an SD-writing op (DELETE / START_LOG / SET_MODE / CAL_SET)
+   was refused, instead of a generic IO_ERROR the user can't act on. */
+#define FSYNC_ST_SD_USB     0xE8   /* card mounted by a USB host — eject it */
+#define FSYNC_ST_SD_LOWBAT  0xE9   /* battery lock — charge via USB-C       */
 /* Firmware-update status bytes (FileData replies). 0xA0 is a NON-error
    "verified, about to reset" ack; the 0xE4..0xE7 band are FOTA errors. */
 #define FSYNC_ST_FW_READY        0xA0   /* image verified — activating + reset */
@@ -744,6 +748,16 @@ static uint8_t   g_cmd_buf[256];
 static uint16_t  g_cmd_len     = 0;
 static uint8_t   g_cmd_pending = 0;
 
+/* v0.0.70: 0 when the box may write the card, else the status byte that
+   says why not. Checked BEFORE an SD-writing op so it is refused cleanly
+   rather than half-done against a locked card. */
+static uint8_t sd_write_refusal(void)
+{
+  if (SDFat_HostOwned())     return FSYNC_ST_SD_USB;
+  if (Logger_LowBatLocked()) return FSYNC_ST_SD_LOWBAT;
+  return 0;
+}
+
 /* LIST: one notification per root-dir entry, "name,size\n", then a lone
    "\n" terminator. Callback runs inside SDFat_ListRoot's walk. Returns
    non-zero to abort enumeration if a notify fails — keeps LIST bounded
@@ -1264,6 +1278,15 @@ static void ble_process_command(void)
     memcpy(name, &g_cmd_buf[1], nlen);
     name[nlen] = '\0';
 
+    uint8_t refuse = sd_write_refusal();
+    if (refuse) {
+      ble_notify_or_defer(g_filedata_handle + 1, &refuse, 1, 500);
+      snprintf(buf, sizeof(buf), "ble: DELETE '%s' refused st=0x%02x (%s)", name,
+               refuse, refuse == FSYNC_ST_SD_USB ? "usb host" : "low bat");
+      ErrLog_Write(buf);
+      return;
+    }
+
     /* Never free the clusters of a file someone still holds open for
        append (v0.0.61/62). ERRLOG.LOG is open from boot → close, delete,
        reopen fresh. A file of the running session → the session rotates
@@ -1302,8 +1325,9 @@ static void ble_process_command(void)
           | ((uint32_t)g_cmd_buf[3] << 16)
           | ((uint32_t)g_cmd_buf[4] << 24);
     }
-    int rc = Logger_StartSession(dur);
-    uint8_t st = (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
+    uint8_t refuse = sd_write_refusal();
+    int rc = refuse ? -1 : Logger_StartSession(dur);
+    uint8_t st = refuse ? refuse : (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
     ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
     snprintf(buf, sizeof(buf), "ble: START_LOG dur=%lus rc=%d st=0x%02x",
              (unsigned long)dur, rc, st);
@@ -1317,8 +1341,9 @@ static void ble_process_command(void)
       ErrLog_Write("ble: SET_MODE bad request (no mode byte)");
     } else {
       int manual = (g_cmd_buf[1] != 0) ? 1 : 0;
-      int rc = Logger_SetMode(manual);
-      uint8_t st = (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
+      uint8_t refuse = sd_write_refusal();
+      int rc = refuse ? -1 : Logger_SetMode(manual);
+      uint8_t st = refuse ? refuse : (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
       ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
       snprintf(buf, sizeof(buf), "ble: SET_MODE %s rc=%d st=0x%02x",
                manual ? "manual" : "auto", rc, st);
@@ -1384,8 +1409,10 @@ static void ble_process_command(void)
       ErrLog_Writef("ble: CAL_SET bad length %u (expected %u)",
                     (unsigned)g_cmd_len, (unsigned)(1u + CAL_BLOB_SIZE));
     } else {
-      int rc = Calibration_SetFromBlob(&g_cmd_buf[1], CAL_BLOB_SIZE);
-      uint8_t st = (rc == 0)  ? FSYNC_ST_OK
+      uint8_t refuse = sd_write_refusal();
+      int rc = refuse ? -1 : Calibration_SetFromBlob(&g_cmd_buf[1], CAL_BLOB_SIZE);
+      uint8_t st = refuse     ? refuse
+                 : (rc == 0)  ? FSYNC_ST_OK
                  : (rc == -1) ? FSYNC_ST_IO_ERROR
                               : FSYNC_ST_BAD_REQ;
       ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
