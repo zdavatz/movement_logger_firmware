@@ -1247,6 +1247,13 @@ remount leaves writes blocked until reboot; the card stays reachable
 over USB (ready/capacity key off SD hardware init, not the FAT mount) so
 it can be reformatted.
 
+### Eject hands the card back (v0.0.69)
+
+SCSI START STOP UNIT with LoEj=1 (Finder "Eject") releases the card at once
+(`usb_release_card`), and TEST UNIT READY then reports "medium not present"
+(NOT READY / ASC 0x3A) until the next enumeration, so the host cannot
+remount it while the box writes. A stop without LoEj is ignored.
+
 ### Low-battery SD lock (v0.0.67; GPS suspend v0.0.68)
 
 A second reason to refuse SD writes, sharing the `sd_write_block` choke

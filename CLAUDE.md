@@ -621,6 +621,16 @@ Now:
   stays reachable over USB for a reformat.
 - BLE ops that write the card (DELETE, SET_MODE, CAL_SET, …) fail with an
   I/O status while the host owns it; `ErrLog_Clear` refuses outright.
+- **Eject releases the card (v0.0.69).** macOS "Eject" sends SCSI START
+  STOP UNIT with LoEj=1 (the INQUIRY reports removable media).
+  `tud_msc_start_stop_cb` then sets `s_ejected` and runs `usb_release_card`
+  immediately — no unplug needed, so the box can stay on USB-C and charge.
+  While `s_ejected`, TEST UNIT READY answers NOT READY / 0x3A "medium not
+  present" and READ/WRITE(10) fail, so the host can't remount behind the
+  box; the next enumeration (`tud_mount_cb`: replug or bus reset) clears it
+  and hands the card back to the host. A stop *without* LoEj (power
+  management) only logs `usb: host stop (no eject)` — releasing there could
+  give the card to the box while the host still has it mounted.
 - **Unplug detection (v0.0.65) — the board has NO VBUS sense.** ST's BSP
   projects run `vbus_sensing_enable = DISABLE`; a physical unplug produces
   no bus reset, so `tud_umount_cb` never fires (the v0.0.63 assumption was

@@ -48,6 +48,13 @@ static volatile bool s_ever_mounted = false;
 static volatile bool     s_suspended  = false;
 static volatile uint32_t s_suspend_at = 0;
 
+/* v0.0.69: the host ejected the medium (START STOP UNIT, LoEj=1). The box
+   takes the card back right away — no unplug needed, so it can stay on
+   USB-C and charge — and reports "medium not present" until the next
+   enumeration (replug / bus reset → tud_mount_cb) so the host can't
+   remount behind the box's back. */
+static volatile bool     s_ejected    = false;
+
 static void usb_release_card(const char *why);
 
 /* ---------------------------------------------------------------------------
@@ -194,6 +201,7 @@ void tud_mount_cb(void)
   s_mounted = true;
   s_ever_mounted = true;
   s_suspended = false;
+  s_ejected = false;
   ErrLog_Write("usb: mounted — pausing logger + all SD writes");
   /* Flush + close any open session, then mark inactive. Logger_Stop is
      idempotent so it's safe to call even if no session is open. */
@@ -296,10 +304,13 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
    absence is fatal at boot so we never see that branch. */
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
-  (void) lun;
   /* Card hardware, not the box's own FAT mount: after a failed post-USB
      remount (host left an unreadable volume) the host must still be able
      to reach the card to reformat it. */
+  if (s_ejected) {
+    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);  /* medium not present */
+    return false;
+  }
   return SDFat_RawHandle() != NULL;
 }
 
@@ -331,9 +342,13 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
 bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
                            bool start, bool load_eject)
 {
-  (void) lun; (void) power_condition; (void) load_eject;
-  if (!start) {
-    ErrLog_Write("usb: host eject");
+  (void) lun; (void) power_condition;
+  if (!start && load_eject) {
+    /* The host has flushed and unmounted the volume before it ejects. */
+    s_ejected = true;
+    usb_release_card("host eject");
+  } else if (!start) {
+    ErrLog_Write("usb: host stop (no eject)");
   }
   return true;
 }
@@ -350,6 +365,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
   (void) lun;
   SD_HandleTypeDef *hsd = SDFat_RawHandle();
   if (hsd == NULL) return -1;
+  if (s_ejected) return -1;              /* the box owns the card again */
 
   /* Compute the actual starting LBA. offset is in bytes, not blocks. */
   uint32_t start_lba   = lba + (offset / 512u);
@@ -383,6 +399,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
   (void) lun;
   SD_HandleTypeDef *hsd = SDFat_RawHandle();
   if (hsd == NULL) return -1;
+  if (s_ejected) return -1;              /* the box owns the card again */
 
   uint32_t start_lba   = lba + (offset / 512u);
   uint32_t block_count = bufsize / 512u;
