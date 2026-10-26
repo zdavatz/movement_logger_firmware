@@ -1236,7 +1236,9 @@ flushes + closes the open CSVs and sets `g_active = 0`, then
 `ErrLog_Flush()` and `SDFat_SetHostOwned()` (v0.0.63): the dirty FAT
 page is written back and from then on `sd_write_block` refuses **every**
 box-side write — errlog, BLE DELETE/SET_MODE/CAL_SET, everything.
-`ErrLog_Write` keeps lines in a 2 KB RAM hold meanwhile. (Before v0.0.63
+`ErrLog_Write` keeps lines in a 2 KB RAM hold meanwhile — the newest lines
+(v0.0.78: whole lines evicted from the front on overflow, `gps_diag` not held;
+the release writes `sd: N older errlog lines dropped …`). (Before v0.0.63
 only the `g_active` logger gates applied, so `ERRLOG.LOG` kept appending
 with cached FAT state while the host wrote the same FAT — the card
 corruption of 2026-10-24/25.)

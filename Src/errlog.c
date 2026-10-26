@@ -227,19 +227,35 @@ int ErrLog_Clear(void)
 }
 
 static volatile uint8_t g_warning_latched = 0;
+static uint8_t g_unflushed;      /* lines appended since the last flush */
 
 uint8_t ErrLog_WarningLatched(void) { return g_warning_latched; }
 
-/* v0.0.63: lines written while a USB host owns the card. Kept small — a
-   host window is minutes of gps_diag at most; overflow is counted, not
-   wrapped, so the oldest (most diagnostic) lines survive. */
+/* v0.0.63: lines written while a USB host owns the card.
+   v0.0.78: keep the NEWEST lines, not the oldest. The lines that matter are
+   the ones right before something goes wrong (2026-10-26: a BLE dead-end
+   while the card was mounted — the 2 KB filled with gps_diag in ~70 s and
+   the 459 lines covering the failure were the ones dropped). On overflow
+   whole lines are evicted from the front; gps_diag lines are not held at
+   all — they are cumulative counters, the next one after the release
+   carries the same totals. */
 static char     g_hold[2048];
 static uint16_t g_hold_len;
 static uint16_t g_hold_dropped;
 
 static void hold_line(const char *line, int n)
 {
-  if (g_hold_len + n > (int)sizeof(g_hold)) { g_hold_dropped++; return; }
+  if (n > (int)sizeof(g_hold)) { g_hold_dropped++; return; }
+  /* "[123 ms] gps_diag: …" — skip the timestamp prefix before matching. */
+  const char *body = memchr(line, ']', (size_t)n);
+  if (body && strncmp(body, "] gps_diag:", 11) == 0) return;
+  while (g_hold_len + n > (int)sizeof(g_hold)) {
+    char *nl = memchr(g_hold, '\n', g_hold_len);
+    uint16_t cut = nl ? (uint16_t)(nl - g_hold + 1) : g_hold_len;
+    memmove(g_hold, &g_hold[cut], (size_t)(g_hold_len - cut));
+    g_hold_len = (uint16_t)(g_hold_len - cut);
+    g_hold_dropped++;
+  }
   memcpy(&g_hold[g_hold_len], line, (size_t)n);
   g_hold_len += (uint16_t)n;
 }
@@ -261,7 +277,7 @@ void ErrLog_ReopenAfterHost(void)
   if (g_hold_dropped) {
     char line[96];
     int n = snprintf(line, sizeof(line),
-                     "[%lu ms] sd: %u errlog lines dropped while SD writes were blocked\n",
+                     "[%lu ms] sd: %u older errlog lines dropped while SD writes were blocked\n",
                      (unsigned long)HAL_GetTick(), (unsigned)g_hold_dropped);
     if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
     if (n > 0) SDFat_Append(&g_log, line, (uint32_t)n);
@@ -288,6 +304,7 @@ void ErrLog_Write(const char *s)
   if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
   if (SDFat_WritesBlocked()) { hold_line(line, n); return; }
   SDFat_Append(&g_log, line, (uint32_t)n);
+  g_unflushed = 1;
 }
 
 void ErrLog_Writef(const char *fmt, ...)
@@ -306,6 +323,17 @@ void ErrLog_Flush(void)
 {
   if (!g_inited || SDFat_WritesBlocked()) return;
   SDFat_Flush(&g_log);
+  g_unflushed = 0;
+}
+
+/* v0.0.78: the directory size is only patched on a flush, so a power cut
+   (the magnet) loses every line since the last one — on 2026-10-26 that was
+   the last 3.5 min before a power cycle, in MANUAL mode where little else
+   flushes. Superloop calls this every PL_CADENCE_ERRLOG_FLUSH; no-op when
+   nothing was appended. */
+void ErrLog_PeriodicFlush(void)
+{
+  if (g_unflushed) ErrLog_Flush();
 }
 
 void ErrLog_Heartbeat(void)

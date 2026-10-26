@@ -255,6 +255,11 @@ int main(void)
       ClkTrim_Tick();
     }
 
+    /* ERRLOG.LOG survives a magnet power cut up to the last 10 s (v0.0.78). */
+    if (sched_due(PL_SCHED_ERRLOG, PL_CADENCE_ERRLOG_FLUSH)) {
+      ErrLog_PeriodicFlush();
+    }
+
     /* Green-LED pattern based on GPS fix quality. Phase advances every
        125 ms; eight 125 ms slots = one second per cycle. Pattern table:
          NONE: 1 1 1 1 0 0 0 0  → slow blink (500 ms on / 500 ms off)

@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.77"
+#define PL_FW_VERSION          "0.0.78"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -136,6 +136,7 @@
 #define PL_CADENCE_BATTERY     1000U         /* 1 Hz STC3115 + battery row */
 #define PL_CADENCE_FLUSH       1000U         /* SD flush every 1 s */
 #define PL_CADENCE_HEARTBEAT   60000U        /* error-log heartbeat */
+#define PL_CADENCE_ERRLOG_FLUSH 10000U       /* ERRLOG.LOG flush — a power cut loses at most 10 s of lines */
 #define PL_CADENCE_WATCHDOG    1U            /* kick IWDG every tick */
 #define PL_CADENCE_PLAUSIBLE   1000U         /* check sensor freshness 1 Hz */
 #define PL_CADENCE_CLKTRIM     500U          /* LSE-vs-SysTick sample 2 Hz — must stay < 1500 ms or the LPTIM 16-bit unwrap (2 s wrap) goes ambiguous */

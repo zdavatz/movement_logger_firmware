@@ -611,6 +611,23 @@ a live LFN). Spotlight's mount-time indexing both wrote into the card and, by
 reading it hard over USB, starved Bluetooth (file list / log mode stuck while
 mounted, 2026-10-26). Errlog once: `sd: created .metadata_never_index (Spotlight off)`.
 
+## ERRLOG survives power cuts and USB mounts (v0.0.78+) — `errlog.c`, `main.c`
+
+**2026-10-26: the box went BLE-invisible until a magnet power cycle, and the
+ERRLOG had nothing on why.** Two holes, both fixed:
+
+- **No periodic errlog flush.** The directory size of `ERRLOG.LOG` is only
+  patched on a flush, and `ErrLog_Heartbeat` was never called — in MANUAL mode
+  almost nothing flushed, so the power cut lost the last 3.5 min. The
+  superloop now calls `ErrLog_PeriodicFlush()` every
+  `PL_CADENCE_ERRLOG_FLUSH` (10 s); it no-ops when nothing was appended.
+- **The USB-mount RAM hold kept the oldest lines.** 2 KB filled with
+  `gps_diag` in ~70 s and the 459 lines covering the failure were dropped.
+  `hold_line` now evicts whole lines from the front (newest survive) and
+  doesn't hold `gps_diag` at all (cumulative counters — the next one after
+  release has the same totals). Release line reads
+  `sd: N older errlog lines dropped while SD writes were blocked`.
+
 ## SD-write refusals say why (v0.0.70+) — `ble.c`
 
 DELETE / START_LOG / SET_MODE / CAL_SET check `sd_write_refusal()` first and,

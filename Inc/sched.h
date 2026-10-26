@@ -29,6 +29,7 @@ typedef enum {
   PL_SCHED_LED,           /* Green LED toggle              (2 Hz)   */
   PL_SCHED_PLAUSIBLE,     /* Sensor-plausibility watchdog          */
   PL_SCHED_CLKTRIM,       /* LSE-vs-SysTick trim @ PL_CADENCE_CLKTRIM */
+  PL_SCHED_ERRLOG,        /* ERRLOG.LOG flush @ PL_CADENCE_ERRLOG_FLUSH */
   PL_SCHED_SLOT_COUNT
 } pl_sched_slot_t;
 

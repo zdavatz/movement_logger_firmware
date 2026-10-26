@@ -47,6 +47,8 @@ void ErrLog_Heartbeat(void);
 
 /* Flush whatever is buffered to SD. */
 void ErrLog_Flush(void);
+/* Flush if anything was appended since the last flush (superloop, v0.0.78). */
+void ErrLog_PeriodicFlush(void);
 
 /* USB MSC hand-back (v0.0.63). While a USB host owns the card
    (SDFat_HostOwned) ErrLog_Write keeps lines in a small RAM buffer instead
