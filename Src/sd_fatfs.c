@@ -406,6 +406,93 @@ static pl_fx_status_t mount_volume(void)
 
 int SDFat_IsMounted(void) { return g_mounted; }
 
+/* v0.0.74: give the card the box's volume name. FAT keeps it twice — in
+   the boot sector (BS_VolLab, offset 71, plus the backup boot sector) and
+   as a root-directory entry with attr 0x08, which is what macOS/Windows
+   actually display — so both are set. Only sectors whose label differs are
+   written, so a card already named costs three reads per boot. */
+static pl_fx_status_t set_bpb_label(uint32_t lba, const char label[11],
+                                    int *changed)
+{
+  if (sd_read_block(lba, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  if (g_scratch[510] != 0x55 || g_scratch[511] != 0xAA) return PL_FX_OK;
+  if (g_scratch[66] != 0x29) return PL_FX_OK;   /* no extended BPB fields */
+  if (memcmp(&g_scratch[71], label, 11) == 0) return PL_FX_OK;
+  memcpy(&g_scratch[71], label, 11);
+  if (sd_write_block(lba, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  sd_wait_idle();
+  *changed = 1;
+  return PL_FX_OK;
+}
+
+pl_fx_status_t SDFat_SetVolumeLabel(const char *label, int *changed_out)
+{
+  int changed = 0;
+  if (changed_out) *changed_out = 0;
+  if (!g_mounted || !label) return PL_FX_ERR_INVAL;
+  if (SDFat_WritesBlocked()) return PL_FX_ERR_IO;
+
+  char lab[11];
+  memset(lab, ' ', sizeof(lab));
+  for (int i = 0; i < 11 && label[i]; i++) {
+    char c = label[i];
+    lab[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+  }
+
+  if (sd_read_block(g_part_lba, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  uint16_t bk = rd16(g_scratch, 50);            /* BPB_BkBootSec, usually 6 */
+  pl_fx_status_t s = set_bpb_label(g_part_lba, lab, &changed);
+  if (s != PL_FX_OK) return s;
+  if (bk != 0 && bk != 0xFFFF && bk < g_rsvd_secs) {
+    s = set_bpb_label(g_part_lba + bk, lab, &changed);
+    if (s != PL_FX_OK) return s;
+  }
+
+  /* Root-dir label entry: rename it in place, or put one in the first free
+     slot. A 0x00 slot means every later slot is free too (FAT spec), so no
+     end-of-dir marker has to move. */
+  uint32_t free_lba = 0;
+  int      free_idx = -1;
+  uint32_t cluster  = g_root_cluster;
+  while (cluster >= 2 && cluster < 0x0FFFFFF8u) {
+    uint32_t lba = cluster_to_lba(cluster);
+    for (uint32_t sec = 0; sec < g_sec_per_clus; sec++) {
+      if (sd_read_block(lba + sec, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+      for (int i = 0; i < 512; i += 32) {
+        uint8_t first = g_scratch[i];
+        uint8_t attr  = g_scratch[i + 11];
+        if (first == 0x00 || first == 0xE5) {
+          if (free_idx < 0) { free_lba = lba + sec; free_idx = i / 32; }
+          if (first == 0x00) goto scanned;
+          continue;
+        }
+        if (attr == 0x0F || (attr & 0x18) != 0x08) continue;  /* LFN / not a label */
+        if (memcmp(&g_scratch[i], lab, 11) != 0) {
+          memcpy(&g_scratch[i], lab, 11);
+          if (sd_write_block(lba + sec, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+          sd_wait_idle();
+          changed = 1;
+        }
+        if (changed_out) *changed_out = changed;
+        return PL_FX_OK;
+      }
+    }
+    uint32_t next;
+    if (fat_get_next(cluster, &next) != PL_FX_OK) return PL_FX_ERR_IO;
+    cluster = next;
+  }
+scanned:
+  if (free_idx < 0) return PL_FX_ERR_FULL;
+  if (sd_read_block(free_lba, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  memset(&g_scratch[free_idx * 32], 0, 32);
+  memcpy(&g_scratch[free_idx * 32], lab, 11);
+  g_scratch[free_idx * 32 + 11] = 0x08;         /* attr = volume label */
+  if (sd_write_block(free_lba, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  sd_wait_idle();
+  if (changed_out) *changed_out = 1;
+  return PL_FX_OK;
+}
+
 SD_HandleTypeDef *SDFat_RawHandle(void) { return g_hw_ok ? &g_hsd : NULL; }
 
 uint64_t SDFat_FreeBytes(void)
@@ -540,6 +627,103 @@ int SDFat_NextSessionNumber(void)
   return -1;
 }
 
+/* v0.0.74: long-file-name hygiene. macOS stores each of its files (and
+   folders like .fseventsd / .Spotlight-V100) as LFN entries followed by the
+   8.3 entry they belong to. The box used to delete only the 8.3 entry, and
+   create_file_entry then reused that slot — so a box file sat right behind
+   the LFN of a deleted macOS file. macOS ignores the LFN checksum: it showed
+   LOGMODE.CFG as ".Spotlight-V100" and took GPS000.CSV for its .fseventsd
+   folder, which it then rebuilt over the file (2026-10-26, GPS000 lost).
+   Any live LFN run that is not followed by a live 8.3 entry with the
+   matching checksum is an orphan; this marks it deleted, like fsck. */
+static uint8_t sfn_checksum(const uint8_t *e)
+{
+  uint8_t sum = 0;
+  for (int i = 0; i < 11; i++)
+    sum = (uint8_t)((((sum & 1u) << 7) | (sum >> 1)) + e[i]);
+  return sum;
+}
+
+#define LFN_RUN_MAX 20                /* 255-char name = 20 LFN entries */
+
+static pl_fx_status_t lfn_mark_deleted(const uint32_t *lba, const uint8_t *idx,
+                                       int n)
+{
+  uint8_t sec[512];
+  for (int k = 0; k < n; k++) {
+    if (sd_read_block(lba[k], sec) != HAL_OK) return PL_FX_ERR_IO;
+    sec[idx[k] * 32u] = 0xE5;
+    if (sd_write_block(lba[k], sec) != HAL_OK) return PL_FX_ERR_IO;
+    sd_wait_idle();
+  }
+  return PL_FX_OK;
+}
+
+static pl_fx_status_t drop_orphan_lfns(int *dropped_out)
+{
+  uint32_t run_lba[LFN_RUN_MAX];
+  uint8_t  run_idx[LFN_RUN_MAX];
+  int      run_n = 0;
+  uint8_t  run_chk = 0;
+  int      dropped = 0;
+  pl_fx_status_t s = PL_FX_OK;
+
+  uint32_t cluster = g_root_cluster;
+  while (cluster >= 2 && cluster < 0x0FFFFFF8u) {
+    uint32_t lba = cluster_to_lba(cluster);
+    for (uint32_t sec = 0; sec < g_sec_per_clus; sec++) {
+      if (sd_read_block(lba + sec, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+      for (int i = 0; i < 512; i += 32) {
+        uint8_t first = g_scratch[i];
+        uint8_t attr  = g_scratch[i + 11];
+        int live_lfn = (attr == 0x0F && first != 0xE5 && first != 0x00);
+        int valid_end = 0;
+        if (!live_lfn && run_n > 0) {
+          valid_end = (first != 0x00 && first != 0xE5 && attr != 0x0F &&
+                       sfn_checksum(&g_scratch[i]) == run_chk);
+        }
+        /* A new run start (0x40 bit), an over-long run, or anything that
+           doesn't close the run validly makes the pending run an orphan. */
+        if (run_n > 0 && !valid_end &&
+            (!live_lfn || (first & 0x40) || run_n == LFN_RUN_MAX)) {
+          s = lfn_mark_deleted(run_lba, run_idx, run_n);
+          if (s != PL_FX_OK) return s;
+          dropped += run_n;
+          run_n = 0;
+          /* lfn_mark_deleted may have rewritten this very sector. */
+          if (sd_read_block(lba + sec, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+        }
+        if (valid_end) run_n = 0;
+        if (first == 0x00) goto done;
+        if (live_lfn) {
+          run_lba[run_n] = lba + sec;
+          run_idx[run_n] = (uint8_t)(i / 32);
+          run_n++;
+          run_chk = g_scratch[i + 13];
+        }
+      }
+    }
+    uint32_t next;
+    if (fat_get_next(cluster, &next) != PL_FX_OK) return PL_FX_ERR_IO;
+    cluster = next;
+  }
+done:
+  if (run_n > 0) {
+    s = lfn_mark_deleted(run_lba, run_idx, run_n);
+    if (s == PL_FX_OK) dropped += run_n;
+  }
+  if (dropped_out) *dropped_out = dropped;
+  return s;
+}
+
+pl_fx_status_t SDFat_DropOrphanLfns(int *dropped_out)
+{
+  if (dropped_out) *dropped_out = 0;
+  if (!g_mounted) return PL_FX_ERR_INVAL;
+  if (SDFat_WritesBlocked()) return PL_FX_ERR_IO;
+  return drop_orphan_lfns(dropped_out);
+}
+
 /* Allocate the first cluster + create a directory entry. Returns the entry's
    sector/idx + the chosen first cluster. */
 static pl_fx_status_t create_file_entry(const char name83[11],
@@ -548,12 +732,18 @@ static pl_fx_status_t create_file_entry(const char name83[11],
                                         uint16_t *dir_idx_out)
 {
   uint32_t cluster = g_root_cluster;
+  int prev_live_lfn = 0;   /* v0.0.74: entry before this slot is a live LFN */
   while (cluster >= 2 && cluster < 0x0FFFFFF8u) {
     uint32_t lba = cluster_to_lba(cluster);
     for (uint32_t s = 0; s < g_sec_per_clus; s++) {
       if (sd_read_block(lba + s, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
       for (int i = 0; i < 512; i += 32) {
         uint8_t f = g_scratch[i];
+        int behind_lfn = prev_live_lfn;
+        prev_live_lfn = (g_scratch[i + 11] == 0x0F && f != 0xE5 && f != 0x00);
+        /* A 0xE5 slot right behind a live LFN would inherit that LFN's name
+           on macOS (see drop_orphan_lfns) — skip it. */
+        if (f == 0xE5 && behind_lfn) continue;
         if (f == 0x00 || f == 0xE5) {
           /* Allocate the first cluster for the new file. */
           uint32_t fc = fat_alloc_one();
@@ -936,6 +1126,11 @@ pl_fx_status_t SDFat_Delete(const char *name)
     cluster = next;
   }
   if (fat_flush_page() != PL_FX_OK) return PL_FX_ERR_IO;
+
+  /* v0.0.74: the deleted entry's LFN run (a macOS file) is now an orphan —
+     drop it so no later file inherits its name. Best-effort: the delete
+     itself is already complete. */
+  (void)drop_orphan_lfns(NULL);
 
   /* Reclaim the freed clusters on the next allocation. */
   if (c.found.first_cluster >= 2 && c.found.first_cluster < g_alloc_hint) {

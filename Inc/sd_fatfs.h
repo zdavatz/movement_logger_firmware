@@ -63,6 +63,17 @@ pl_fx_status_t SDFat_Mount(void);
 /* True iff Mount succeeded. */
 int SDFat_IsMounted(void);
 
+/* v0.0.74: set the card's volume name (up to 11 chars, upper-cased) in the
+   boot sector, its backup and the root-dir label entry. Writes only what
+   differs; *changed_out = 1 if anything was written. */
+pl_fx_status_t SDFat_SetVolumeLabel(const char *label, int *changed_out);
+
+/* v0.0.74: mark every orphaned long-file-name entry in the root directory
+   deleted (an LFN run not followed by its own live 8.3 entry). macOS shows
+   a box file sitting behind such a run under the LFN's name, and has
+   overwritten one. Run once per boot; *dropped_out = entries removed. */
+pl_fx_status_t SDFat_DropOrphanLfns(int *dropped_out);
+
 /* USB MSC host ownership (v0.0.63). SetHostOwned flushes the cached FAT
    page, then refuses every block write this layer would issue until
    Remount — call it when a USB host mounts the card, after closing open

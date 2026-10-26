@@ -564,6 +564,29 @@ off by default on the M10, so a `ZDA,` line can only be the reply), ×3 with
   v0.0.18 found `$PUBX,41` unreliable for the *output* mask on the M10, which
   is why it's only this last-resort path, verified, never the primary route.
 
+## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
+
+**Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`
+(`config.h`, **`MOVE_LOGGER`** — FAT allows 11 chars, so `movement_logger` itself can't fit)
+sets the label in the boot sector, the backup boot sector and the root-dir label entry
+(attr 0x08 — what Finder/Explorer show). Only differing sectors are written; errlog
+`sd: volume renamed to MOVE_LOGGER` once, silence after.
+
+**The GPS000.CSV loss (2026-10-26).** macOS stores its files/folders as long-file-name
+(LFN) entries followed by the 8.3 entry. The box deleted only the 8.3 entry and
+`create_file_entry` then reused that slot — leaving a box file right behind the live LFN
+run of a deleted macOS file. macOS ignores the LFN checksum: the card's dump showed
+`LOGMODE.CFG` behind a stale `.Spotlight-V100` LFN (Finder listed it as a 5-byte
+`.Spotlight-V100`), and `GPS000.CSV` behind a stale `.fseventsd` LFN — macOS took it for
+its own folder and rebuilt `.fseventsd` over the file's slot and first cluster.
+Three fixes:
+- `SDFat_DropOrphanLfns` (boot, after the label) marks every LFN run not followed by its
+  own live 8.3 entry (checksum match) deleted — what fsck does. Repairs existing cards;
+  errlog `sd: dropped N orphaned long-name entries`.
+- `SDFat_Delete` runs the same sweep after deleting, so deleting a macOS file from an app
+  no longer leaves its LFN behind.
+- `create_file_entry` never uses a free slot directly behind a live LFN entry.
+
 ## SD-write refusals say why (v0.0.70+) — `ble.c`
 
 DELETE / START_LOG / SET_MODE / CAL_SET check `sd_write_refusal()` first and,

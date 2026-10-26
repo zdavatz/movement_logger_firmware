@@ -104,6 +104,22 @@ int main(void)
   } else {
     Buzzer_Beep(3000U, 60U);
     ErrLog_Init();
+    /* v0.0.74: the card shows up as PL_SD_VOLUME_LABEL on a computer, not
+       whatever it was formatted as. No-op once the name is right. */
+    {
+      int renamed = 0;
+      pl_fx_status_t lrc = SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL, &renamed);
+      if (lrc != PL_FX_OK)
+        ErrLog_Writef("sd: volume label set FAIL rc=%d", (int)lrc);
+      else if (renamed)
+        ErrLog_Writef("sd: volume renamed to %s", PL_SD_VOLUME_LABEL);
+      int dropped = 0;
+      pl_fx_status_t orc = SDFat_DropOrphanLfns(&dropped);
+      if (orc != PL_FX_OK)
+        ErrLog_Writef("sd: orphan-LFN sweep FAIL rc=%d", (int)orc);
+      else if (dropped)
+        ErrLog_Writef("sd: dropped %d orphaned long-name entries", dropped);
+    }
     /* Firmware-update rollback check (runs before sensors so a reverting boot
        is as quick as possible). If a BLE-flashed image was swapped in but never
        confirmed healthy after FW_MAX_BOOT_ATTEMPTS resets, this flips SWAP_BANK

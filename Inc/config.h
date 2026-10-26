@@ -12,7 +12,7 @@
 
 /* Firmware identification --------------------------------------------------*/
 #define PL_FW_NAME             "MovementLogger"
-#define PL_FW_VERSION          "0.0.73"
+#define PL_FW_VERSION          "0.0.74"
 #define PL_FW_BLE_NAME         "STBoxFs"   /* 7 chars, fits BLE name budget */
 
 /* GPIO pin map (taken from the SensorTileBoxPro BSP; we use HAL directly) --*/
@@ -143,6 +143,10 @@
 /* Sample-buffer sizes -----------------------------------------------------*/
 #define PL_SD_BLOCK_SIZE       512U
 #define PL_FAT_CACHE_CLUSTERS  1U            /* tiny — append-only writer */
+
+/* SD volume name (v0.0.74) — what Finder/Explorer shows for the card. FAT
+   allows 11 characters; the firmware sets it on every boot if it differs. */
+#define PL_SD_VOLUME_LABEL     "MOVE_LOGGER"
 
 /* Low-battery SD lock (v0.0.67) -------------------------------------------*/
 /* Below LOCK for SAMPLES consecutive 1 Hz fuel reads the session is closed
