@@ -9,7 +9,8 @@
 #include <string.h>
 
 void Battery_Pack(const PL_FuelSample *f, uint8_t low_batt,
-                  uint8_t logging_active, uint8_t out[BATTERY_PACKET_SIZE])
+                  uint8_t logging_active, uint8_t sd_lowbat_lock,
+                  uint8_t out[BATTERY_PACKET_SIZE])
 {
   memset(out, 0, BATTERY_PACKET_SIZE);
   if (!f) return;
@@ -25,6 +26,7 @@ void Battery_Pack(const PL_FuelSample *f, uint8_t low_batt,
   uint8_t flags = 0;
   if (low_batt)       flags |= 0x01;   /* bit 0: low_battery_warning_active */
   if (logging_active) flags |= 0x02;   /* bit 1: logging_active */
+  if (sd_lowbat_lock) flags |= 0x04;   /* bit 2: low-battery SD lock (v0.0.72) */
   out[6] = flags;
   out[7] = 0x00;                        /* reserved */
 }

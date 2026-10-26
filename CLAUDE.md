@@ -607,6 +607,10 @@ show it.
   while a host still owns the card).
 - `fat_load_page_for_cluster` drops a dirty FAT page while writes are
   locked instead of failing every later FAT read on it.
+- **Apps see the lock (v0.0.72)**: BatteryStatus `flags` bit 2 =
+  `Logger_LowBatLocked()`, notified within ~1 s of every lock/unlock edge
+  (`ble_battery_tick`). iOS/Android/desktop show a lock banner from the
+  bit — they must never re-derive it from `voltage_mV` (hysteresis).
 
 ## One GpsNNN.csv row per GPS epoch (v0.0.66+) — `logger.c`
 

@@ -443,11 +443,16 @@ offset  size  field         units               source
 **flags**:
 - bit 0: low_battery_warning_active (SOC < 10 %).
 - bit 1: logging_active (normally always 1 — see the no-mode design in Section 2).
-- bits 2-7: reserved.
+- bit 2: sd_lowbat_lock (v0.0.72+) — the low-battery SD lock is on: session
+  closed, GPS in backup, every SD write refused (`0xE9`) until the cell is
+  back at ≥ 3.7 V (`PL_LOWBAT_RELEASE_MV`) for 5 s. Hosts show this as a
+  lock banner; they must read the bit, never re-derive it from `voltage_mV`
+  (the lock has hysteresis 3.4/3.7 V, and the release rule may change).
+- bits 3-7: reserved.
 
 Notify cadence: once per minute while connected. Also notified
-opportunistically whenever the low-battery flag transitions, so the GUI
-sees the warning immediately on first crossing 10 %.
+opportunistically whenever the low-battery flag (bit 0) or the SD-lock
+flag (bit 2) transitions, so the GUI sees the warning immediately.
 
 **Gauge configuration (v0.0.32+).** The STC3115 is programmed at boot with
 the real battery model — 480 mAh HiMax 752535, Ri 160 mΩ, behind the
