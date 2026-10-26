@@ -74,6 +74,11 @@ pl_fx_status_t SDFat_SetVolumeLabel(const char *label, int *changed_out);
    overwritten one. Run once per boot; *dropped_out = entries removed. */
 pl_fx_status_t SDFat_DropOrphanLfns(int *dropped_out);
 
+/* v0.0.77: create an empty `.metadata_never_index` in the root (with LFN
+   entries) unless present, so macOS Spotlight never indexes the card.
+   *created_out = 1 if it was written this call. */
+pl_fx_status_t SDFat_EnsureNoIndexMarker(int *created_out);
+
 /* USB MSC host ownership (v0.0.63). SetHostOwned flushes the cached FAT
    page, then refuses every block write this layer would issue until
    Remount — call it when a USB host mounts the card, after closing open

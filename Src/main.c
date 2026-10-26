@@ -119,6 +119,12 @@ int main(void)
         ErrLog_Writef("sd: orphan-LFN sweep FAIL rc=%d", (int)orc);
       else if (dropped)
         ErrLog_Writef("sd: dropped %d orphaned long-name entries", dropped);
+      int noidx = 0;
+      pl_fx_status_t nrc = SDFat_EnsureNoIndexMarker(&noidx);
+      if (nrc != PL_FX_OK)
+        ErrLog_Writef("sd: .metadata_never_index FAIL rc=%d", (int)nrc);
+      else if (noidx)
+        ErrLog_Write("sd: created .metadata_never_index (Spotlight off)");
     }
     /* Firmware-update rollback check (runs before sensors so a reverting boot
        is as quick as possible). If a BLE-flashed image was swapped in but never

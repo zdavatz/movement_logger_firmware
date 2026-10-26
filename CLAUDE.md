@@ -603,6 +603,14 @@ Three fixes:
   no longer leaves its LFN behind.
 - `create_file_entry` never uses a free slot directly behind a live LFN entry.
 
+**Spotlight kept off the card (v0.0.77).** At boot, after the sweep,
+`SDFat_EnsureNoIndexMarker` creates an empty `.metadata_never_index` in the root
+unless present — the only file the box writes with LFN entries (2 LFN + 8.3
+`METADA~1`, hidden, no data cluster, one sector write; slots never directly behind
+a live LFN). Spotlight's mount-time indexing both wrote into the card and, by
+reading it hard over USB, starved Bluetooth (file list / log mode stuck while
+mounted, 2026-10-26). Errlog once: `sd: created .metadata_never_index (Spotlight off)`.
+
 ## SD-write refusals say why (v0.0.70+) — `ble.c`
 
 DELETE / START_LOG / SET_MODE / CAL_SET check `sd_write_refusal()` first and,

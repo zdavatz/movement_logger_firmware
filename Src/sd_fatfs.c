@@ -724,6 +724,111 @@ pl_fx_status_t SDFat_DropOrphanLfns(int *dropped_out)
   return drop_orphan_lfns(dropped_out);
 }
 
+/* v0.0.77: keep macOS Spotlight off the card. Spotlight indexes every
+   mounted volume: heavy USB reads right after mounting (Bluetooth stalls
+   while the box serves them) and writes into .Spotlight-V100 (it once
+   landed in ERRLOG.LOG's clusters). An empty `.metadata_never_index` in the
+   root stops it. macOS only honours the long name, so this is the one file
+   the box creates with LFN entries: 2 LFN entries + the 8.3 entry METADA~1,
+   no data cluster, all written in one directory-sector write. */
+#define NOINDEX_NAME "." "metadata_never_index"   /* 21 chars → 2 LFN entries */
+static const char k_noindex_sfn[11] = { 'M','E','T','A','D','A','~','1',' ',' ',' ' };
+static const uint8_t k_lfn_char_off[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
+/* UTF-16 unit `k` of LFN entry `part` (0-based) for an ASCII name: the
+   name, one 0x0000 terminator, then 0xFFFF padding. */
+static uint16_t lfn_unit(const char *name, int part, int k)
+{
+  int ci  = part * 13 + k;
+  int len = (int)strlen(name);
+  if (ci < len)  return (uint8_t)name[ci];
+  if (ci == len) return 0x0000;
+  return 0xFFFF;
+}
+
+static int lfn_part_matches(const uint8_t *e, const char *name, int part)
+{
+  for (int k = 0; k < 13; k++) {
+    uint16_t c = (uint16_t)(e[k_lfn_char_off[k]] | (e[k_lfn_char_off[k] + 1] << 8));
+    if (c != lfn_unit(name, part, k)) return 0;
+  }
+  return 1;
+}
+
+static void lfn_fill(uint8_t *e, const char *name, int part, uint8_t seq, uint8_t chk)
+{
+  memset(e, 0, 32);
+  e[0]  = seq;
+  e[11] = 0x0F;                       /* attr = LFN */
+  e[13] = chk;
+  for (int k = 0; k < 13; k++) {
+    uint16_t c = lfn_unit(name, part, k);
+    e[k_lfn_char_off[k]]     = (uint8_t)(c & 0xFF);
+    e[k_lfn_char_off[k] + 1] = (uint8_t)(c >> 8);
+  }
+}
+
+pl_fx_status_t SDFat_EnsureNoIndexMarker(int *created_out)
+{
+  if (created_out) *created_out = 0;
+  if (!g_mounted) return PL_FX_ERR_INVAL;
+  if (SDFat_WritesBlocked()) return PL_FX_ERR_IO;
+  if (exists_83(k_noindex_sfn)) return PL_FX_OK;
+
+  /* One pass: is the marker already there (e.g. created by macOS under a
+     different 8.3 alias), and where are 3 free slots in a row in one
+     sector, not directly behind a live LFN entry? */
+  uint32_t run_lba = 0;
+  int      run_idx = -1;
+  int      prev_live_lfn = 0;
+  uint32_t cluster = g_root_cluster;
+  while (cluster >= 2 && cluster < 0x0FFFFFF8u) {
+    uint32_t lba = cluster_to_lba(cluster);
+    for (uint32_t sec = 0; sec < g_sec_per_clus; sec++) {
+      if (sd_read_block(lba + sec, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+      int free_run = 0;
+      for (int i = 0; i < 512; i += 32) {
+        uint8_t first = g_scratch[i];
+        uint8_t attr  = g_scratch[i + 11];
+        int live_lfn  = (attr == 0x0F && first != 0xE5 && first != 0x00);
+        if (live_lfn && (first & 0x3F) == 1 &&
+            lfn_part_matches(&g_scratch[i], NOINDEX_NAME, 0))
+          return PL_FX_OK;                      /* already present */
+        if (first == 0x00 || first == 0xE5) {
+          if (free_run == 0 && prev_live_lfn) {
+            /* A slot behind a live LFN would join that run — skip it. */
+          } else if (++free_run == 3 && run_idx < 0) {
+            run_lba = lba + sec;
+            run_idx = i / 32 - 2;
+          }
+        } else {
+          free_run = 0;
+        }
+        prev_live_lfn = live_lfn;
+        if (first == 0x00 && run_idx >= 0) goto scanned;
+      }
+    }
+    uint32_t next;
+    if (fat_get_next(cluster, &next) != PL_FX_OK) return PL_FX_ERR_IO;
+    cluster = next;
+  }
+scanned:
+  if (run_idx < 0) return PL_FX_ERR_FULL;
+
+  uint8_t chk = sfn_checksum((const uint8_t *)k_noindex_sfn);
+  if (sd_read_block(run_lba, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  uint8_t *e = &g_scratch[run_idx * 32];
+  lfn_fill(e,      NOINDEX_NAME, 1, 0x42, chk);   /* last LFN entry first */
+  lfn_fill(e + 32, NOINDEX_NAME, 0, 0x01, chk);
+  memset(e + 64, 0, 32);
+  memcpy(e + 64, k_noindex_sfn, 11);
+  e[64 + 11] = 0x22;                              /* hidden + archive */
+  if (sd_write_block(run_lba, g_scratch) != HAL_OK) return PL_FX_ERR_IO;
+  sd_wait_idle();
+  if (created_out) *created_out = 1;
+  return PL_FX_OK;
+}
+
 /* Allocate the first cluster + create a directory entry. Returns the entry's
    sector/idx + the chosen first cluster. */
 static pl_fx_status_t create_file_entry(const char name83[11],
