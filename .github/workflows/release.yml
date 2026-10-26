@@ -13,6 +13,9 @@ on:
 permissions:
   contents: write
 
+env:
+  ARM_TOOLCHAIN_VERSION: 14.2.rel1
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
@@ -20,11 +23,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ARM toolchain
+      # Arm GNU Toolchain, same release as the local builds (Makefile default
+      # $HOME/.software/arm-gnu-toolchain). Cached per version: only the first
+      # run after a version bump downloads (~140 MB); before, every release
+      # ran apt-get against Ubuntu's mirrors and once hung for 8+ minutes.
+      - name: Cache ARM toolchain
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/arm-gnu-toolchain
+          key: arm-gnu-toolchain-${{ env.ARM_TOOLCHAIN_VERSION }}-x86_64
+
+      - name: Download ARM toolchain
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
-          arm-none-eabi-gcc --version
+          URL="https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_TOOLCHAIN_VERSION}/binrel/arm-gnu-toolchain-${ARM_TOOLCHAIN_VERSION}-x86_64-arm-none-eabi.tar.xz"
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o toolchain.tar.xz "$URL"
+          mkdir -p ~/arm-gnu-toolchain
+          tar -xJf toolchain.tar.xz -C ~/arm-gnu-toolchain --strip-components=1
+          rm toolchain.tar.xz
+
+      - name: Check ARM toolchain
+        run: ~/arm-gnu-toolchain/bin/arm-none-eabi-gcc --version
 
       - name: Resolve tag
         id: tag
@@ -37,7 +58,7 @@ jobs:
 
       - name: Build firmware
         working-directory: STM32CubeIDE
-        run: make TOOLCHAIN=/usr/bin
+        run: make TOOLCHAIN=$HOME/arm-gnu-toolchain/bin
 
       - name: Rename + hash artifact
         id: artifact
@@ -49,7 +70,7 @@ jobs:
           echo "path=firmware-${TAG}.bin" >> "$GITHUB_OUTPUT"
           echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
           echo "size=${SIZE}" >> "$GITHUB_OUTPUT"
-          arm-none-eabi-size STM32CubeIDE/build/PumpLogger.elf
+          ~/arm-gnu-toolchain/bin/arm-none-eabi-size STM32CubeIDE/build/PumpLogger.elf
 
       - name: Create / update release
         env:
@@ -61,7 +82,7 @@ jobs:
           - Asset: \`${{ steps.artifact.outputs.path }}\`
           - Size: ${{ steps.artifact.outputs.size }} bytes
           - SHA-256: \`${{ steps.artifact.outputs.sha256 }}\`
-          - Toolchain: Ubuntu \`gcc-arm-none-eabi\` (apt)
+          - Toolchain: Arm GNU Toolchain \`${ARM_TOOLCHAIN_VERSION}\` (cached)
           - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
           Hardware target: STEVAL-MKBOXPRO Rev_C. Flash with:
