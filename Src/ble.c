@@ -750,6 +750,12 @@ static uint8_t   g_cmd_buf[256];
 static uint16_t  g_cmd_len     = 0;
 static uint8_t   g_cmd_pending = 0;
 
+/* v0.0.75 windowed FW_DATA: offset of the last ACK actually sent. */
+static uint32_t  g_fw_acked_off = 0;
+static uint32_t  g_fw_cursor    = 0;   /* box's next-expected offset */
+#define FW_ACK_COALESCE_BYTES   512u
+#define FW_PROGRESS_LOG_BYTES   16384u
+
 /* v0.0.70: 0 when the box may write the card, else the status byte that
    says why not. Checked BEFORE an SD-writing op so it is refused cleanly
    rather than half-done against a locked card. */
@@ -1127,9 +1133,11 @@ static void ble_process_command(void)
   /* Log every incoming opcode immediately — earlier builds only logged
      LIST, so a missing READ trace meant "did the GUI even send it?" was
      unanswerable. Now any opcode lands in the errlog before dispatch. */
-  snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x len=%u",
-           op, (unsigned)g_cmd_len);
-  ErrLog_Write(buf);
+  if (op != FSYNC_OP_FW_DATA) {
+    snprintf(buf, sizeof(buf), "ble: cmd op=0x%02x len=%u",
+             op, (unsigned)g_cmd_len);
+    ErrLog_Write(buf);
+  }
 
   if (op == FSYNC_OP_LIST) {
     snprintf(buf, sizeof(buf), "ble: cmd LIST conn=0x%04x fdh=0x%04x",
@@ -1487,6 +1495,8 @@ static void ble_process_command(void)
        The actual flash erase happens synchronously inside FwUpdate_Begin
        (≤ ~1 s, IWDG fed per page) — a brief logging gap at update time is
        accepted; the box reboots into new firmware moments later anyway. */
+    g_fw_acked_off = 0;
+    g_fw_cursor    = 0;
     if (g_fsm.state != FSM_IDLE) {
       uint8_t st = FSYNC_ST_BUSY;
       ble_notify_try(g_filedata_handle + 1, &st, 1, 50);
@@ -1542,9 +1552,26 @@ static void ble_process_command(void)
     fwup_status_t r = FwUpdate_Data(offset, &g_cmd_buf[5], dlen, &next);
     if (r == FWUP_OK) {
       g_fsm.last_progress_tick = HAL_GetTick();   /* reset the stall watchdog  */
-      uint8_t ack[4] = { (uint8_t)next, (uint8_t)(next >> 8),
-                         (uint8_t)(next >> 16), (uint8_t)(next >> 24) };
-      ble_notify_try(g_filedata_handle + 1, ack, 4, 200);
+      /* v0.0.75 windowed upload: a host may have several chunks in flight.
+         While the chip already holds the next event (IRQ high) and less
+         than FW_ACK_COALESCE_BYTES went unacked, skip this ACK — the next
+         chunk's ACK carries a higher offset anyway. A stop-and-wait host
+         never has a chunk queued, so it still gets every ACK. A chunk that
+         didn't move the cursor (a resend after the host timed out) is
+         always ACKed, so a skipped ACK can never stall the upload. */
+      int fresh = (next > g_fw_cursor);
+      g_fw_cursor = next;
+      if (!(fresh && irq_high() &&
+            (next - g_fw_acked_off) < FW_ACK_COALESCE_BYTES)) {
+        uint8_t ack[4] = { (uint8_t)next, (uint8_t)(next >> 8),
+                           (uint8_t)(next >> 16), (uint8_t)(next >> 24) };
+        ble_notify_try(g_filedata_handle + 1, ack, 4, 200);
+        g_fw_acked_off = next;
+      }
+      if (next / FW_PROGRESS_LOG_BYTES != offset / FW_PROGRESS_LOG_BYTES) {
+        snprintf(buf, sizeof(buf), "ble: FW_DATA rx %lu B", (unsigned long)next);
+        ErrLog_Write(buf);
+      }
     } else {
       uint8_t st = (r == FWUP_ERR_BAD_SEQ) ? FSYNC_ST_FW_BAD_SEQ
                                            : FSYNC_ST_FW_FLASH_FAIL;
@@ -2499,9 +2526,14 @@ void BLE_Tick(void)
         uint16_t attr = (uint16_t)(evt[8]  | (evt[9]  << 8));
         uint16_t dlen = (uint16_t)(evt[10] | (evt[11] << 8));
         uint8_t  op   = (n >= 13) ? evt[12] : 0;
-        snprintf(buf, sizeof(buf), "ble: write attr=0x%04x dlen=%u op=0x%02x",
-                 attr, dlen, op);
-        ErrLog_Write(buf);
+        /* FW_DATA chunks are not logged one by one (v0.0.75): ~700 per
+           image, each an SD append — fw_data_progress_log() logs every
+           16 KB instead. */
+        if (!(attr == (uint16_t)(g_filecmd_handle + 1) && op == FSYNC_OP_FW_DATA)) {
+          snprintf(buf, sizeof(buf), "ble: write attr=0x%04x dlen=%u op=0x%02x",
+                   attr, dlen, op);
+          ErrLog_Write(buf);
+        }
         /* If the write landed on the FileCmd value handle (declaration
            handle + 1), capture the payload for ble_process_command(). */
         if (attr == (uint16_t)(g_filecmd_handle + 1) && dlen > 0) {

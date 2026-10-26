@@ -163,6 +163,15 @@ ST gotchas the design is built around):
    `FwUpdate_ConfirmBoot()` (called from the superloop) clears it after
    `FW_CONFIRM_UPTIME_MS` (15 s) of healthy uptime.
 
+**Windowed upload (v0.0.75).** Hosts may keep several FW_DATA chunks in flight
+(desktop v0.0.81: 8). The box still takes one HCI event per `BLE_Tick`, so queued
+chunks wait in the BlueNRG-LP's own event buffer — no extra RAM queue. While the
+IRQ line shows another event pending and < 512 B went unacked, the ACK for a chunk
+that advanced the cursor is skipped (the next one carries a higher offset); a
+chunk that didn't advance it (a resend) is always ACKed, so a skipped ACK can't
+stall the upload. FW_DATA chunks are no longer errlogged one by one — one
+`ble: FW_DATA rx N B` line per 16 KB instead. Stop-and-wait hosts are unaffected.
+
 SHA-256 is software (`sha256.c`, public-domain, verified against FIPS vectors) —
 the U585 has no HASH peripheral and `HAL_CRC` isn't linked. The FileCmd
 `char_value_length` + `g_cmd_buf` were raised 64 → 244/256 so a phone that
