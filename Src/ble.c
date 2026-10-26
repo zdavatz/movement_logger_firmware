@@ -899,6 +899,13 @@ static struct {
   char        name[16];
   uint8_t     buf[244];             /* current chunk in flight; sized for max ATT MTU (247-3) */
   uint16_t    buf_len;              /* 0 = need to read fresh next call */
+  /* READ throughput diagnostics (v0.0.76), reported in the done line: is
+     the stream limited by the superloop (one notify per pass) or by the
+     link (the chip refusing / delaying notifies)? */
+  uint32_t    st_passes;            /* fsm_advance calls while streaming */
+  uint32_t    st_ok;                /* notifies accepted */
+  uint32_t    st_busy;              /* notify attempts refused (congestion) */
+  uint32_t    st_wait_ms;           /* ms spent inside ble_notify_try */
 } g_fsm;
 
 /* Force the chip to drop the current connection. Fire-and-forget — the
@@ -1058,6 +1065,7 @@ static void fsm_advance(void)
      firmware programs flash inside the FW_DATA command handler) and just rides
      the deadline / stall / disconnect guards above. */
   if (g_fsm.state != FSM_READ_STREAM) return;
+  g_fsm.st_passes++;
 
   /* Read next chunk if our retry buffer is empty. */
   if (g_fsm.buf_len == 0) {
@@ -1067,10 +1075,14 @@ static void fsm_advance(void)
        stream chases the growing EOF and over-delivers into the host's
        next queued download (see the stream_cap field doc). */
     if (g_fsm.stream_cap != 0 && g_fsm.sent >= g_fsm.stream_cap) {
-      char msg[96];
-      snprintf(msg, sizeof(msg), "fsm: %s done sent=%lu size=%lu (cap)",
+      char msg[160];
+      snprintf(msg, sizeof(msg),
+               "fsm: %s done sent=%lu size=%lu (cap) ms=%lu passes=%lu ok=%lu busy=%lu wait=%lu",
                g_fsm.name, (unsigned long)g_fsm.sent,
-               (unsigned long)g_fsm.file_size);
+               (unsigned long)g_fsm.file_size,
+               (unsigned long)(now - g_fsm.entered_tick),
+               (unsigned long)g_fsm.st_passes, (unsigned long)g_fsm.st_ok,
+               (unsigned long)g_fsm.st_busy, (unsigned long)g_fsm.st_wait_ms);
       ErrLog_Write(msg);
       SDFat_Close(&g_fsm.f);
       g_fsm.state = FSM_IDLE;
@@ -1098,10 +1110,14 @@ static void fsm_advance(void)
     }
     if (got == 0) {
       /* Clean EOF. */
-      char msg[96];
-      snprintf(msg, sizeof(msg), "fsm: %s done sent=%lu size=%lu",
+      char msg[160];
+      snprintf(msg, sizeof(msg),
+               "fsm: %s done sent=%lu size=%lu ms=%lu passes=%lu ok=%lu busy=%lu wait=%lu",
                g_fsm.name, (unsigned long)g_fsm.sent,
-               (unsigned long)g_fsm.file_size);
+               (unsigned long)g_fsm.file_size,
+               (unsigned long)(now - g_fsm.entered_tick),
+               (unsigned long)g_fsm.st_passes, (unsigned long)g_fsm.st_ok,
+               (unsigned long)g_fsm.st_busy, (unsigned long)g_fsm.st_wait_ms);
       ErrLog_Write(msg);
       SDFat_Close(&g_fsm.f);
       g_fsm.state = FSM_IDLE;
@@ -1112,10 +1128,15 @@ static void fsm_advance(void)
 
   /* Try once to send the buffered chunk. On congestion just leave the
      buffer in place — next BLE_Tick comes around fast and tries again. */
-  if (ble_notify_try(g_filedata_handle + 1, g_fsm.buf, g_fsm.buf_len,
-                     FSM_NOTIFY_BUDGET_MS) != 0) {
+  uint32_t t0 = HAL_GetTick();
+  int nrc = ble_notify_try(g_filedata_handle + 1, g_fsm.buf, g_fsm.buf_len,
+                           FSM_NOTIFY_BUDGET_MS);
+  g_fsm.st_wait_ms += HAL_GetTick() - t0;
+  if (nrc != 0) {
+    g_fsm.st_busy++;
     return;
   }
+  g_fsm.st_ok++;
   g_fsm.sent              += g_fsm.buf_len;
   g_fsm.buf_len            = 0;
   g_fsm.last_progress_tick = now;

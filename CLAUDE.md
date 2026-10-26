@@ -292,6 +292,13 @@ things made long files drop far more than short ones:
    dead link is caught far sooner by the chip's LL supervision timeout raising
    `Disconnection_Complete`.
 
+**READ throughput diagnostics (v0.0.76).** Every `fsm: <file> done …` line now
+ends with `ms= passes= ok= busy= wait=`: stream duration, `fsm_advance` passes,
+notifies accepted / refused, and ms spent inside `ble_notify_try`. passes ≈ ok
+with little wait ⇒ the superloop (one notify per pass) is the limit; many busy
+or a large wait ⇒ the link is. Measured to decide whether sending several
+notifies per pass is worth it.
+
 Both levers are throughput/exposure reductions, not protocol changes — the
 host apps already resume a dropped transfer from `offset = bytes-on-disk`
 (desktop `run_sync_diff`), so these just make drops rare instead of frequent.
