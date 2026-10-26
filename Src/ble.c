@@ -298,6 +298,7 @@ static uint32_t          g_stream_last_ms    = 0;
 static uint8_t           g_battery_subscribed = 0;
 static uint8_t           g_battery_low_prev   = 0;
 static uint8_t           g_battery_lock_prev  = 0;   /* v0.0.72: flags bit 2 */
+static uint8_t           g_battery_usb_prev   = 0;   /* v0.0.73: flags bit 3 */
 static uint32_t          g_battery_check_ms   = 0;   /* 1 Hz transition check */
 static uint32_t          g_battery_notify_ms  = 0;   /* 1/min periodic notify */
 #define BATTERY_CHECK_MS   1000
@@ -1329,7 +1330,7 @@ static void ble_process_command(void)
     uint8_t refuse = sd_write_refusal();
     int rc = refuse ? -1 : Logger_StartSession(dur);
     uint8_t st = refuse ? refuse : (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
-    ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+    ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
     snprintf(buf, sizeof(buf), "ble: START_LOG dur=%lus rc=%d st=0x%02x",
              (unsigned long)dur, rc, st);
     ErrLog_Write(buf);
@@ -1345,7 +1346,7 @@ static void ble_process_command(void)
       uint8_t refuse = sd_write_refusal();
       int rc = refuse ? -1 : Logger_SetMode(manual);
       uint8_t st = refuse ? refuse : (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
-      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
       snprintf(buf, sizeof(buf), "ble: SET_MODE %s rc=%d st=0x%02x",
                manual ? "manual" : "auto", rc, st);
       ErrLog_Write(buf);
@@ -1353,7 +1354,7 @@ static void ble_process_command(void)
   } else if (op == FSYNC_OP_GET_MODE) {
     /* GET_MODE → single byte: 0 = auto, 1 = manual. */
     uint8_t m = (Logger_GetMode() == LOGGER_MODE_MANUAL) ? 1 : 0;
-    ble_notify_try(g_filedata_handle + 1, &m, 1, 500);
+    ble_notify_or_defer(g_filedata_handle + 1, &m, 1, 500);
     snprintf(buf, sizeof(buf), "ble: GET_MODE → %s",
              m ? "manual" : "auto");
     ErrLog_Write(buf);
@@ -1377,7 +1378,7 @@ static void ble_process_command(void)
       int on = (g_cmd_buf[1] != 0) ? 1 : 0;
       int rc = GPS_SetPower(on);
       uint8_t st = (rc == 0) ? FSYNC_ST_OK : FSYNC_ST_IO_ERROR;
-      ble_notify_try(g_filedata_handle + 1, &st, 1, 500);
+      ble_notify_or_defer(g_filedata_handle + 1, &st, 1, 500);
       snprintf(buf, sizeof(buf), "ble: GPS_POWER %s rc=%d st=0x%02x",
                on ? "on" : "off", rc, st);
       ErrLog_Write(buf);
@@ -1385,7 +1386,7 @@ static void ble_process_command(void)
   } else if (op == FSYNC_OP_GPS_GET_POWER) {
     /* GPS_GET_POWER → single byte: 1 = on, 0 = off. */
     uint8_t p = GPS_GetPower() ? 1 : 0;
-    ble_notify_try(g_filedata_handle + 1, &p, 1, 500);
+    ble_notify_or_defer(g_filedata_handle + 1, &p, 1, 500);
     snprintf(buf, sizeof(buf), "ble: GPS_GET_POWER → %s", p ? "on" : "off");
     ErrLog_Write(buf);
   } else if (op == FSYNC_OP_CAL_GET) {
@@ -2216,8 +2217,8 @@ static void ble_stream_tick(void)
 }
 
 /* BatteryStatus: refresh the stored value (so reads work) + notify
-   subscribers. Runs at 1 Hz to catch a low-battery or SD-lock flag
-   transition; the full periodic notify fires once a minute, plus
+   subscribers. Runs at 1 Hz to catch a low-battery, SD-lock or USB-host
+   flag transition; the full periodic notify fires once a minute, plus
    immediately on transition (so the apps' lock banner shows within ~1 s).
    Reuses the logger's cached fuel sample — no extra I²C reads. */
 static void ble_battery_tick(void)
@@ -2231,17 +2232,20 @@ static void ble_battery_tick(void)
   Logger_GetSnapshot(&snap);
   uint8_t low = (snap.fuel.soc_x10 < BATTERY_LOW_SOC_X10) ? 1 : 0;
   uint8_t lock = (uint8_t)Logger_LowBatLocked();
+  uint8_t usb  = (uint8_t)(SDFat_HostOwned() ? 1 : 0);
   uint8_t transitioned = (low != g_battery_low_prev) ||
-                         (lock != g_battery_lock_prev);
+                         (lock != g_battery_lock_prev) ||
+                         (usb != g_battery_usb_prev);
   g_battery_low_prev   = low;
   g_battery_lock_prev  = lock;
+  g_battery_usb_prev   = usb;
 
   uint8_t due_periodic = (uint32_t)(now - g_battery_notify_ms) >= BATTERY_PERIOD_MS;
   if (!transitioned && !due_periodic) return;
   g_battery_notify_ms = now;
 
   uint8_t pkt[BATTERY_PACKET_SIZE];
-  Battery_Pack(&snap.fuel, low, (uint8_t)Logger_IsActive(), lock, pkt);
+  Battery_Pack(&snap.fuel, low, (uint8_t)Logger_IsActive(), lock, usb, pkt);
   ble_write_handle_value(g_battery_handle + 1, pkt, BATTERY_PACKET_SIZE);
   if (g_battery_subscribed) {
     ble_notify(g_battery_handle + 1, pkt, BATTERY_PACKET_SIZE);

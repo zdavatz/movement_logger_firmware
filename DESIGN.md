@@ -448,11 +448,17 @@ offset  size  field         units               source
   back at ≥ 3.7 V (`PL_LOWBAT_RELEASE_MV`) for 5 s. Hosts show this as a
   lock banner; they must read the bit, never re-derive it from `voltage_mV`
   (the lock has hysteresis 3.4/3.7 V, and the release rule may change).
-- bits 3-7: reserved.
+- bit 3: sd_usb_host (v0.0.73+) — a USB host has the SD card mounted
+  (`SDFat_HostOwned()`): the box refuses every SD write (`0xE8`) and holds
+  its log until the card is released (unplug USB-C, or Finder eject).
+  Hosts show an "unplug USB-C" banner and should not even send SD-writing
+  ops while it is set — the refusal reply can be slow to arrive while the
+  host is busy reading the card.
+- bits 4-7: reserved.
 
 Notify cadence: once per minute while connected. Also notified
-opportunistically whenever the low-battery flag (bit 0) or the SD-lock
-flag (bit 2) transitions, so the GUI sees the warning immediately.
+opportunistically whenever the low-battery flag (bit 0), the SD-lock
+flag (bit 2) or the USB-host flag (bit 3) transitions, so the GUI sees the warning immediately.
 
 **Gauge configuration (v0.0.32+).** The STC3115 is programmed at boot with
 the real battery model — 480 mAh HiMax 752535, Ri 160 mΩ, behind the

@@ -404,8 +404,9 @@ Single slot is enough: status-byte replies (`DELETE`, `SET_MODE`, `SET_TIME`,
 `GPS_POWER`, `CAL_SET`) are for one-in-flight ops and the client's state
 machine won't queue a new one until the current resolves. `LIST` / `READ`
 streams still abort on notify failure by design (that IS the peer-gone
-signal). Currently only DELETE calls `ble_notify_or_defer`; the same treatment
-can be added to any other status-byte reply that also occasionally gets eaten.
+signal). DELETE uses `ble_notify_or_defer` since v0.0.36; v0.0.73 extends it
+to START_LOG, SET_MODE, GET_MODE, GPS_POWER and GPS_GET_POWER (a USB-mounted
+card left the iOS mode switch silent and GPS stuck on "Querying box…").
 
 Look for these lines in `ERRLOG.LOG` after a rapid delete run:
 ```
@@ -611,6 +612,8 @@ show it.
   `Logger_LowBatLocked()`, notified within ~1 s of every lock/unlock edge
   (`ble_battery_tick`). iOS/Android/desktop show a lock banner from the
   bit — they must never re-derive it from `voltage_mV` (hysteresis).
+  v0.0.73 adds bit 3 = `SDFat_HostOwned()` (card mounted over USB) so the
+  apps say "unplug USB-C" up front instead of waiting on an `0xE8`.
 
 ## One GpsNNN.csv row per GPS epoch (v0.0.66+) — `logger.c`
 
