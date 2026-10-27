@@ -127,6 +127,23 @@ gps: pa0 rxd-pullup low->high >50000 us, high->low 5503 us -> NO pull-up: pin 14
 
 Connected to the RXD, the module's pull-up lifts the line within microseconds and it never falls (`pull-up present`). If PA0 stays low after release, **JP2 pin 14 is not connected to the u-blox RXD** — the break is in the ribbon core, the RX-pad joint or the SparkFun trace. This check doesn't depend on resistor tolerances (the earlier pull-down divider test does).
 
+### Wiring line on every boot (v0.0.90+)
+
+Every boot ends the GPS setup with one line that grades the SparkFun board's wires from what the firmware actually saw:
+
+```
+gps: wiring 3V3+BLK ok | TX->JP2-13 ok (2722 B) | RX<-JP2-14 ok (6 ACK)
+*** gps: wiring 3V3+BLK ok | TX->JP2-13 ok (9942 B) | RX<-JP2-14 MISSING (no pull-up) (0 ACK) ***
+```
+
+- **3V3+BLK** — the module is powered (it sends bytes, or its RXD pull-up is there).
+- **TX->JP2-13** — module → box: bytes received, `ok` once they decode as NMEA/UBX.
+- **RX<-JP2-14** — box → module: `ok` when the module ACKs commands; otherwise `wired, no reply` (pull-up present) or `MISSING (no pull-up)`.
+
+Any broken wire puts `***` on the line, so the box's red LED lights and the desktop's ERRLOG check flags the boot. The RXD pull-up check now runs on every boot. When it finds no pull-up, the long TX-path probes are skipped and the GPS logs at the factory 9600 / 1 Hz after ~15 s (they used to take ~45 s and fired a false `GPS NO NMEA` alarm).
+
+**Field result (2026-10-27):** the RX pad on the SparkFun board had lost its wire. With JP2 pin 14 on the module's RX (the second UART header on the other board edge — RX between PPS and TX — works when the first RX pad is damaged): `cfg baud 230400 ACK`, all config ACKs, `RX<-JP2-14 ok`, `nav rate → 10Hz (fix acquired) ACK`.
+
 ### Second path to the module: I2C (v0.0.84+)
 
 The MAX-M10S also speaks UBX over I2C (address 0x42). Wire the SparkFun **Qwiic SDA (blue) → I2C3_SDA = PG8** and **SCL (yellow) → I2C3_SCL = PG7** on the box's JP4 extension connector (pin numbers: UM3133 §1.8.6; domain switch on 3 V; leave the Qwiic 3.3 V unconnected). At every boot the firmware then logs:

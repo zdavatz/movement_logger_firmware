@@ -46,6 +46,11 @@ static volatile uint8_t  g_rx_ring[GPS_RX_RING_SIZE];
 static volatile uint16_t g_rx_head;            /* written by IRQ, read by thread */
 static volatile uint16_t g_rx_tail;            /* written by thread, read by IRQ */
 static volatile uint32_t g_rx_dropped;
+/* Wiring report (v0.0.90): every byte the module's TX pad delivered, every
+   ACK it sent back to a command, and the RXD pull-up result. */
+static volatile uint32_t g_rx_total;
+static uint32_t g_wire_acks;
+static int8_t   g_wire_pullup = -1;    /* -1 untested, 0 none, 1 present */
 
 #define NMEA_LINE_MAX  96
 static char     g_linebuf[NMEA_LINE_MAX];
@@ -968,7 +973,7 @@ static int ubx_wait_ack(uint8_t cls, uint8_t id, uint32_t timeout_ms)
         case S_L1:  s = (b == 0x00) ? S_RCLS : S_B5; break;
         case S_RCLS: rcls = b; s = S_RID; break;
         case S_RID:
-          if (rcls == cls && b == id) return ack_kind ? 0 : -2;
+          if (rcls == cls && b == id) { g_wire_acks++; return ack_kind ? 0 : -2; }
           s = S_B5;
           break;
       }
@@ -1239,7 +1244,7 @@ static uint32_t pa0_release_time(int from_high, uint32_t cap_cycles)
   return dt;
 }
 
-static void pa0_rxd_pullup_check(void)
+static int pa0_rxd_pullup_check(void)
 {
   extern void ErrLog_Writef(const char *fmt, ...);
   const uint32_t cap = 160000U * 50U;                            /* 50 ms */
@@ -1251,6 +1256,8 @@ static void pa0_rxd_pullup_check(void)
                 (fall >= cap) ? ">" : "", (unsigned long)(fall / 160U),
                 pullup ? "pull-up present: PA0 reaches the u-blox RXD"
                        : "NO pull-up: pin 14 not on u-blox RXD (6-72k pull-up)");
+  g_wire_pullup = (int8_t)pullup;
+  return pullup;
 }
 
 static void gps_pa0_probe(void)
@@ -1422,9 +1429,35 @@ static int gps_zda_probe(void)
   for (int i = 0; i < 3; i++) {
     listen_traffic(50, NULL, NULL);              /* flush + arm RX IRQ */
     nmea_send("EIGNQ,ZDA");
-    if (wait_token("ZDA,", 1500)) return 1;
+    if (wait_token("ZDA,", 1500)) { g_wire_acks++; return 1; }
   }
   return 0;
+}
+
+/* One line per boot: which of the SparkFun board's four wires work, judged
+   from what the firmware saw (v0.0.90). Pad names are the module's labels.
+     3V3 + BLK  — the module talks (TX bytes) or its RXD pull-up is there
+                  (the pull-up is inside the module, so it needs power).
+     TX pad     — module -> box, JP2 pin 13 / PA1: bytes received, and a baud
+                  lock means they decoded as NMEA/UBX.
+     RX pad     — box -> module, JP2 pin 14 / PA0: proven by any ACK / poll
+                  reply; else the pull-up says wired-but-ignored vs missing.
+   Any broken wire puts *** on the line so the ERRLOG check flags the boot. */
+static void gps_wiring_report(int locked)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  uint32_t rx = g_rx_total;
+  int pwr = (rx > 0) || (g_wire_pullup == 1);
+  const char *tx = (rx == 0) ? "NO DATA" : locked ? "ok" : "garbage (no baud lock)";
+  const char *rxs = g_wire_acks ? "ok"
+                  : (g_wire_pullup == 1) ? "wired, no reply"
+                  : (g_wire_pullup == 0) ? "MISSING (no pull-up)"
+                  : "no reply";
+  int bad = !pwr || rx == 0 || !locked || g_wire_acks == 0;
+  ErrLog_Writef("%sgps: wiring 3V3+BLK %s | TX->JP2-13 %s (%lu B) | RX<-JP2-14 %s (%lu ACK)%s",
+                bad ? "*** " : "", pwr ? "ok" : "NO POWER?",
+                tx, (unsigned long)rx, rxs, (unsigned long)g_wire_acks,
+                bad ? " ***" : "");
 }
 
 /* ---------- Second path to the module: u-blox DDC (I2C) on I2C3 (v0.0.84) --
@@ -1598,6 +1631,15 @@ static void gps_i2c_session(int uart_ok)
 static uint32_t gps_tx_path_test(uint32_t baud)
 {
   extern void ErrLog_Writef(const char *fmt, ...);
+  /* v0.0.90: no RXD pull-up on PA0 = no wire to talk to. The probes below
+     took ~45 s, held the GPS out of GPS_Tick and fired the 30 s
+     "GPS NO NMEA" alarm on a module that was streaming fine. Skip them and
+     log at the factory 9600 / 1 Hz straight away. */
+  if (g_wire_pullup == 0) {
+    ErrLog_Writef("gps: tx-test skipped - no RXD pull-up on PA0, staying @%lu",
+                  (unsigned long)baud);
+    return 0;
+  }
   int answered = gps_zda_probe();
   if (!answered) {
     gps_tx_diag("tx-test");
@@ -1896,6 +1938,12 @@ int GPS_Init(void)
 
   /* Before the UART is opened: idle level + pin config of PA0 (v0.0.79). */
   gps_tx_diag("pre-init");
+  /* Is JP2 pin 14 on the module's RXD? (v0.0.90: every boot, for the wiring
+     line.) Briefly drives PA0 as GPIO; the module at most sees one framing
+     error. UART4 AF is restored before anything is sent. */
+  g_wire_acks = 0;
+  (void)pa0_rxd_pullup_check();
+  gps_pa0_mode(GPIO_MODE_AF_PP, GPIO_NOPULL);
   {
     uint32_t vr = 0, vc = 0;
     uint32_t mv = gps_measure_vdda_mv(&vr, &vc);
@@ -2047,6 +2095,7 @@ int GPS_Init(void)
     if (found == 0) {
       ErrLog_Write("*** GPS: no baud lock — silent at 9600/230400/115200/38400 ***");
       ErrLog_Write("*** check module supply + RX wiring (JP2 pin 13/14) ***");
+      gps_wiring_report(0);
       return -1;
     }
 
@@ -2098,6 +2147,7 @@ int GPS_Init(void)
                 g_rate_armed ? " (10Hz after first fix)" : "",
                 pvt_ok ? "UBX NAV-PVT" : "NMEA fallback",
                 (fails > 0) ? " (config incomplete)" : "");
+  gps_wiring_report(final_baud != 0);
 
   /* v0.0.84: second path to the module over DDC/I2C3 (no-op if not wired). */
   gps_i2c_session(pvt_ok && final_baud == GPS_UART_BAUDRATE);
@@ -2215,6 +2265,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   if (next != g_rx_tail) {
     g_rx_ring[g_rx_head] = g_rx_byte;
     g_rx_head = next;
+    g_rx_total++;
   } else {
     g_rx_dropped++;  /* ring full — main loop fell behind */
   }

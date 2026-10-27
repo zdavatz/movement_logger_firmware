@@ -745,6 +745,32 @@ the open-drain `idle_high=0/64` and the `nopull` probe reading mostly low.
 ErrLog bodies are capped at 180 chars (`ErrLog_Writef`) — keep diagnostic lines
 short or the verdict gets cut (v0.0.89 shortened the `pa0 load` line too).
 
+
+### v0.0.90: wiring line every boot — `gps_wiring_report`
+
+`GPS_Init` runs `pa0_rxd_pullup_check()` on every boot (right after the
+`pre-init` txdiag, PA0 restored to UART4 AF before the first byte goes out)
+and stores the result in `g_wire_pullup`. `g_rx_total` (every byte the RX IRQ
+pushed into the ring) and `g_wire_acks` (every ACK/NAK seen by
+`ubx_wait_ack`, plus a ZDA poll reply) feed `gps_wiring_report()`, called
+after `gps: ready` and on the `no baud lock` exit:
+`gps: wiring 3V3+BLK … | TX->JP2-13 … (N B) | RX<-JP2-14 … (N ACK)`, wrapped in
+`***` when any part is bad. Keep it under the 180-char ErrLog cap.
+
+`gps_tx_path_test` returns at once when `g_wire_pullup == 0`
+(`gps: tx-test skipped - no RXD pull-up on PA0`). The open-drain / probe /
+alt-pin / inverted-TX sequence took ~45 s, kept `GPS_Tick` from draining, and
+the logger's 30 s `*** GPS NO NMEA/UBX` alarm fired on a module that was
+streaming fine (looked like "the GPS is gone"). Those probes only run now when
+a pull-up is present but the module still doesn't answer.
+
+Field confirmation 2026-10-27: the SparkFun RX pad had lost its wire (wire 14
+hanging loose, pad scorched). Pin 14 into the second header's RX hole →
+`pull-up present`, `cfg baud 230400 ACK (from 9600)`, 6 ACKs,
+`nav rate → 10Hz (fix acquired) ACK` at 6.3 s. Without it: no pull-up, 0 ACKs,
+9600 / 1 Hz. A loose contact that drops after boot shows as
+`*** gps: nav rate switch (1Hz) NOT ACK'd x3 ***` (red LED).
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`
