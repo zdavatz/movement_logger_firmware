@@ -1205,13 +1205,52 @@ static void pa0_load_and_crosstalk(void)
   /* edges per million samples, active vs idle */
   uint32_t r_act  = n_act  ? (uint32_t)(((uint64_t)e_act  * 1000000U) / n_act)  : 0;
   uint32_t r_idle = n_idle ? (uint32_t)(((uint64_t)e_idle * 1000000U) / n_idle) : 0;
-  ErrLog_Writef("gps: pa0 load rise=%lu cyc (~%lu pF) fall=%lu cyc (~%lu pF) | crosstalk pa0 edges during NMEA=%lu/%lu smp (%lu ppm) idle=%lu/%lu (%lu ppm), pa1 edges=%lu -> %s",
-                (unsigned long)cu, (unsigned long)pfu, (unsigned long)cd, (unsigned long)pfd,
+  ErrLog_Writef("gps: pa0 load ~%lu/%lu pF (%lu/%lu cyc) | xtalk nmea=%lu/%lu (%lu ppm) idle=%lu/%lu (%lu ppm) pa1=%lu -> %s",
+                (unsigned long)pfu, (unsigned long)pfd, (unsigned long)cu, (unsigned long)cd,
                 (unsigned long)e_act, (unsigned long)n_act, (unsigned long)r_act,
                 (unsigned long)e_idle, (unsigned long)n_idle, (unsigned long)r_idle,
                 (unsigned long)p1edges,
-                (r_act > 4 * r_idle + 5) ? "PA0 picks up the NMEA (wire 14 runs next to the TX wire)"
-                                         : "no NMEA crosstalk on PA0");
+                (r_act > 4 * r_idle + 5) ? "PA0 picks up the NMEA"
+                                         : "no crosstalk");
+}
+
+/* Does PA0 reach the u-blox RXD? (v0.0.89). The MAX-M10S RXD has an always-on
+   internal pull-up (datasheet UBX-20035208: R_pu typ 17 kΩ, 6..72 kΩ). With
+   PA0 released (input, no MCU pull) that pull-up must lift the ~25 pF line
+   to VIO within microseconds. Charge PA0 low, release, time the rise (cap
+   50 ms); then charge high, release, time the fall (cap 50 ms). Pull-up
+   present ⇒ fast rise, no fall. No pull-up ⇒ the line keeps its charge and
+   only leakage moves it. Tolerance-independent, unlike the 40 kΩ divider. */
+static uint32_t pa0_release_time(int from_high, uint32_t cap_cycles)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  GPIOA->BSRR = from_high ? GPIO_PIN_0 : (GPIO_PIN_0 << 16);
+  GPIOA->PUPDR &= ~3U;
+  GPIOA->MODER = (GPIOA->MODER & ~3U) | 1U;                      /* output */
+  for (volatile int d = 0; d < 2000; d++) { }                    /* ~50 µs */
+  uint32_t t0 = DWT->CYCCNT, dt;
+  GPIOA->MODER &= ~3U;                                           /* release */
+  for (;;) {
+    dt = DWT->CYCCNT - t0;
+    int v = (GPIOA->IDR & GPIO_PIN_0) ? 1 : 0;
+    if (v != from_high || dt > cap_cycles) break;
+  }
+  return dt;
+}
+
+static void pa0_rxd_pullup_check(void)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  const uint32_t cap = 160000U * 50U;                            /* 50 ms */
+  uint32_t rise = pa0_release_time(0, cap);                      /* low → high? */
+  uint32_t fall = pa0_release_time(1, cap);                      /* high → low? */
+  int pullup = (rise < 160000U) && (fall >= cap);                /* rise < 1 ms, never falls */
+  ErrLog_Writef("gps: pa0 rxd-pullup low->high %s%lu us, high->low %s%lu us -> %s",
+                (rise >= cap) ? ">" : "", (unsigned long)(rise / 160U),
+                (fall >= cap) ? ">" : "", (unsigned long)(fall / 160U),
+                pullup ? "pull-up present: PA0 reaches the u-blox RXD"
+                       : "NO pull-up: pin 14 not on u-blox RXD (6-72k pull-up)");
 }
 
 static void gps_pa0_probe(void)
@@ -1228,6 +1267,7 @@ static void gps_pa0_probe(void)
   HAL_Delay(5);
   gps_pa0_sample(100, &hd, &nd, &ed);
   pa0_load_and_crosstalk();                       /* v0.0.88 */
+  pa0_rxd_pullup_check();                         /* v0.0.89 */
   gps_pa0_mode(g_pa0_od ? GPIO_MODE_AF_OD : GPIO_MODE_AF_PP, GPIO_NOPULL);
   const char *v =
       (e0 > 500)                          ? "PA0 is DRIVEN (toggles) - wired to an output, e.g. the module TX?" :

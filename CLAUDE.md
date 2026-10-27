@@ -729,6 +729,22 @@ slow for crosstalk to toggle it. **This is where firmware stops**: whether
 pin 14's wire reaches the u-blox RXD is invisible to the MCU; it takes a
 continuity check (JP2-14 → SparkFun RX pad → u-blox RXD) or the I2C path.
 
+### v0.0.89: the RXD pull-up check settles it — `pa0_rxd_pullup_check`
+
+MAX-M10S RXD has an **always-on internal pull-up, typ 17 kΩ (6–72 kΩ)**
+(data sheet UBX-20035208, pin-state table: RXD = input with pull-up in normal
+operation; R_pu,IO footnote covers TXD/RXD/…). `pa0_release_time` drives PA0
+to a level for ~50 µs, releases it (input, no MCU pull) and DWT-times until it
+flips (50 ms cap): low→high then high→low. Connected to RXD ⇒ rise in µs,
+never falls. Field box: `low->high >50000 us, high->low 5503 us` — the line
+keeps a low indefinitely and loses a high in ~5 ms (≈200 MΩ leakage at
+~25 pF): **no pull-up anywhere on pin 14 ⇒ JP2 pin 14 does not reach the
+u-blox RXD.** Unlike the v0.0.83 pull-down divider (40 kΩ vs up to 72 kΩ could
+read low even when connected) this is tolerance-independent; it also explains
+the open-drain `idle_high=0/64` and the `nopull` probe reading mostly low.
+ErrLog bodies are capped at 180 chars (`ErrLog_Writef`) — keep diagnostic lines
+short or the verdict gets cut (v0.0.89 shortened the `pa0 load` line too).
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`

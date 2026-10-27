@@ -115,7 +115,17 @@ gps: early capture 1985 B, 48 lines in 2323 ms (dropped 0) | txt=14 | mix: TXT=1
 When the module stays silent, the boot also logs:
 
 - `gps: alt-pin JP2-4 SWDIO PA13 -> …` (and JP2-6 SWCLK PA14, JP2-8 SWO PB3, JP2-10 JTDI PA15) — the ZDA poll bit-banged at 9600 out of every other MCU-drivable JP2 pin. `ANSWERED` = the module RXD is wired to that pin instead of pin 14 (an IDC/ribbon miscount). The pins' registers are restored afterwards, so SWD/JTAG keeps working.
-- `gps: pa0 load rise=… (~N pF) fall=… (~N pF) | crosstalk …` — the capacitance hanging on PA0 (rise/fall time through the MCU's ~40 kΩ pull; bare pin + box trace ≈ 10 pF, + a 30 cm ribbon core ≈ 25 pF) and whether PA0 picks up the module's NMEA from the neighbouring wire. It shows *that* a wire hangs on pin 14, not whether its far end reaches the u-blox RXD — an open end and a pull-less CMOS input look the same from the MCU.
+- `gps: pa0 load ~N/N pF (… cyc) | xtalk …` — the capacitance hanging on PA0 (rise/fall time through the MCU's ~40 kΩ pull; bare pin + box trace ≈ 10 pF, + a 30 cm ribbon core ≈ 25 pF) and whether PA0 picks up the module's NMEA from the neighbouring wire. It shows *that* a wire hangs on pin 14, not whether its far end reaches the u-blox RXD — an open end and a pull-less CMOS input look the same from the MCU.
+
+### Does pin 14 reach the u-blox RXD at all? (v0.0.89+)
+
+The MAX-M10S has an always-on internal pull-up on RXD (data sheet UBX-20035208: typ. 17 kΩ, 6–72 kΩ). The firmware charges PA0 low and high, releases it (input, no MCU pull) and times how fast it moves:
+
+```
+gps: pa0 rxd-pullup low->high >50000 us, high->low 5503 us -> NO pull-up: pin 14 not on u-blox RXD (6-72k pull-up)
+```
+
+Connected to the RXD, the module's pull-up lifts the line within microseconds and it never falls (`pull-up present`). If PA0 stays low after release, **JP2 pin 14 is not connected to the u-blox RXD** — the break is in the ribbon core, the RX-pad joint or the SparkFun trace. This check doesn't depend on resistor tolerances (the earlier pull-down divider test does).
 
 ### Second path to the module: I2C (v0.0.84+)
 
