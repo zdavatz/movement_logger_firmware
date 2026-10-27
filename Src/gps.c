@@ -1171,6 +1171,64 @@ static void gps_pa0_probe(void)
                 (unsigned long)hd, (unsigned long)nd, v);
 }
 
+/* Count `token` in the RX stream for `ms`; also the longest silence between
+   received bytes (ms). Same thread-side ring read as wait_token. */
+static int gps_count_token(const char *token, uint32_t ms, uint32_t *max_gap_ms)
+{
+  size_t tl = strlen(token), m = 0;
+  int hits = 0;
+  uint32_t t0 = HAL_GetTick(), last = t0, gap = 0;
+  while ((HAL_GetTick() - t0) < ms) {
+    while (g_rx_head != g_rx_tail) {
+      uint32_t now = HAL_GetTick();
+      if (now - last > gap) gap = now - last;
+      last = now;
+      uint8_t b = g_rx_ring[g_rx_tail];
+      g_rx_tail = (uint16_t)((g_rx_tail + 1u) % GPS_RX_RING_SIZE);
+      if (b == (uint8_t)token[m]) { if (++m == tl) { hits++; m = 0; } }
+      else m = (b == (uint8_t)token[0]) ? 1 : 0;
+    }
+  }
+  uint32_t tail = HAL_GetTick() - last;
+  if (tail > gap) gap = tail;
+  if (max_gap_ms) *max_gap_ms = gap;
+  return hits;
+}
+
+/* Does the module hear PA0 at all, even with its replies switched off?
+   (v0.0.85) Every earlier test needed a *reply*; a module whose polled/ACK
+   output is disabled could accept commands silently. Watch for side effects
+   in the NMEA stream we already receive instead:
+     1. $PUBX,40 + UBX VALSET (RAM) GGA rate 0 → GGA sentences stop (GGA,
+        not GSV: a module without satellites may emit no GSV at all);
+     2. UBX-CFG-RST controlled software reset → output pauses, boot TXT
+        banner appears.
+   Either effect = the module receives PA0 and the fix can go over the UART. */
+static void gps_input_effect_test(void)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  uint32_t g0, g1, gap_base, gap_rst;
+  listen_traffic(50, NULL, NULL);                       /* re-arm RX IRQ */
+  int gsv_before = gps_count_token("GGA,", 4000, &g0);
+  nmea_send("PUBX,40,GGA,0,0,0,0,0,0");
+  vs_begin();
+  vs_u1(CFG_MSGOUT_NMEA_GGA_UART1, 0);
+  ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);
+  (void)gps_count_token("GGA,", 1500, &g1);             /* let it apply */
+  int gsv_after = gps_count_token("GGA,", 4000, &g1);
+  (void)gps_count_token("TXT,", 500, &gap_base);        /* baseline gap */
+  const uint8_t rst[4] = { 0x00, 0x00, 0x01, 0x00 };    /* hot, controlled SW reset */
+  ubx_send(0x06, 0x04, rst, sizeof(rst));
+  int txt = gps_count_token("TXT,", 4000, &gap_rst);
+  int gsv_effect = (gsv_before >= 3 && gsv_after * 4 <= gsv_before);
+  int rst_effect = (txt > 0) || (gap_rst > 1500);
+  ErrLog_Writef("gps: input-effect GGA before=%d after=%d | reset txt=%d max_gap=%lu ms (base %lu) -> %s",
+                gsv_before, gsv_after, txt, (unsigned long)gap_rst, (unsigned long)gap_base,
+                (gsv_effect || rst_effect)
+                  ? "MODULE HEARS PA0 (replies off) - fixable over UART"
+                  : "no effect - module receives nothing on RX");
+}
+
 /* Toggle UART4 TX polarity (TXINV) — UE must be off while CR2 changes. */
 static void gps_uart_txinv(uint8_t on)
 {
@@ -1375,6 +1433,7 @@ static uint32_t gps_tx_path_test(uint32_t baud)
       gps_pa0_set_od(0);
       /* v0.0.83: what is on the wire, and an inverted-TX attempt. */
       gps_pa0_probe();
+      gps_input_effect_test();
       gps_uart_txinv(1);
       answered = gps_zda_probe();
       gps_uart_txinv(0);

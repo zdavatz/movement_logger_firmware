@@ -654,6 +654,28 @@ saved "UART input off". Needs two wires (Qwiic SDA/SCL → PG8/PG7 on JP4); the
 JP4 pin numbers come from UM3133 §1.8.6 — don't guess them, JP4 also carries
 supply.
 
+### v0.0.85: does the module hear PA0 at all? — `gps_input_effect_test`
+
+Every earlier test needed a *reply* (ACK, ZDA, MON-VER); a module with its
+polled/ACK output disabled could accept commands silently. This one only
+watches the NMEA stream already arriving on PA1: `gps_count_token` (thread-side
+ring read, also tracks the longest inter-byte gap) counts `GGA,` 4 s, then
+`$PUBX,40,GGA,0,…` + UBX VALSET RAM `CFG-MSGOUT-NMEA_ID_GGA_UART1 = 0`, 1.5 s
+settle, count 4 s again; then `UBX-CFG-RST` (hot, controlled SW reset) and 4 s
+watching for `TXT,` (boot banner) or a >1.5 s output gap. **Use GGA, not GSV**
+— the first version counted GSV and got `before=0` on a module without
+satellites (invalid baseline). Runs after the PA0 probe, adds ~12 s to a
+failing boot only.
+
+Field box result (2026-10-27): `GGA before=4 after=4 | reset txt=0
+max_gap=559 ms (base 446) → no effect`. Together with v0.0.79–v0.0.84
+(`txdiag` all OK, vdda 3.24 V, push-pull/open-drain/inverted silent, PA0 far
+end high-Z) the UART route is exhausted: the module either never receives
+PA0 (break between the PA0 pin and the u-blox RXD, incl. the SparkFun RX
+joint) or has UART input fully disabled in BBR. Neither is fixable over that
+wire — next is the I2C path (v0.0.84, two Qwiic wires) or a direct USB-serial
+adapter on the module.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`

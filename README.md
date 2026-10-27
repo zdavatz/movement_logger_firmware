@@ -98,6 +98,8 @@ Since v0.0.83/0.0.84, when the module stays silent the boot additionally logs:
 - `gps: pa0 probe … -> <verdict>` — PA0 as a plain input with no pull / MCU pull-up / MCU pull-down: *driven* (toggles — wired to an output such as the module TX), *held low* (short / low output), *external pull-up* (the wire reaches a pulled-up input), or *follows the MCU pull* (open / high-impedance line).
 - `gps: tx-test … with TX inverted` — one more attempt with the UART TX polarity inverted.
 
+- `gps: input-effect GGA before=N after=M | reset txt=T max_gap=G ms …` (v0.0.85+) — tests whether the module *hears* PA0 without needing any reply: it sends `$PUBX,40,GGA,0…` plus a UBX `CFG-VALSET` (GGA rate 0) and watches GGA stop, then a `UBX-CFG-RST` soft reset and watches for an output pause / boot `TXT` banner. Any effect = the module receives the box (only its replies are off) and the fix can go over the UART; `no effect` = the module receives nothing on RX (broken connection to its RXD, or UART input fully disabled — then only I2C or a direct USB-serial adapter can reach it).
+
 ### Second path to the module: I2C (v0.0.84+)
 
 The MAX-M10S also speaks UBX over I2C (address 0x42). Wire the SparkFun **Qwiic SDA (blue) → I2C3_SDA = PG8** and **SCL (yellow) → I2C3_SCL = PG7** on the box's JP4 extension connector (pin numbers: UM3133 §1.8.6; domain switch on 3 V; leave the Qwiic 3.3 V unconnected). At every boot the firmware then logs:
