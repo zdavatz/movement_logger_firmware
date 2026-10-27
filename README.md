@@ -88,6 +88,11 @@ gps: txdiag tx-test ok=12 busy=0 tout=0 bytes=109 | PA0 moder=2 af=8 idle_high=6
 - `moder=2 af=8` — PA0 in alternate-function mode, AF8 = UART4_TX. `UE=1 TE=1` — UART4 and its transmitter enabled. `brr=16667` = 9600 baud at 160 MHz.
 - `idle_high=N/64` — idle level of PA0 sampled 64×; an idle TX line must read high. Low with the UART enabled = something pulls the line down externally.
 
+Since v0.0.80/0.0.82 the boot also logs:
+
+- `gps: mcu vdda=<mV> …` — the MCU supply measured via VREFINT, i.e. the voltage of PA0's push-pull "high" (≈3.24 V on the 3.3 V-modded board; a stock 1.8 V board could not drive a 3.3 V module's RX).
+- If the module stays silent with push-pull, PA0 is retried **open-drain** (`gps: txdiag tx-test-od … od=1 idle_high=N/64`). `idle_high` there shows whether anything on the module side pulls the released line up; `0/64` means nothing does. If the module answers open-drain, the box keeps open-drain and redoes the 230400 baud raise.
+
 All OK + every module command un-ACK'd ⇒ the box sends correctly and the fault is downstream: the wire to the module's RX, or a module that ignores its UART input (saved config / damaged RX). Test the module directly with a 3.3 V USB-serial adapter to tell those apart. The desktop's `MovementLogger --ble-debug 6 --gps-tx` sends UBX polls through the box's GPS bridge and prints these lines back.
 
 ## Host time-sync (`SET_TIME 0x08`, v0.0.10+)

@@ -600,6 +600,28 @@ ignores UART input. Don't route new module writes around `gps_tx` — keep the
 counters honest. The desktop `--ble-debug N --gps-tx` probe exercises the
 bridge and prints these lines back from `ERRLOG.LOG`.
 
+### v0.0.80–v0.0.82: open-drain retry + MCU VDDA measurement
+
+- **`gps_measure_vdda_mv` (v0.0.81, fixed v0.0.82)** — VREFINT on ADC1 via
+  bare registers (the ADC HAL is not in the build), logged at boot as
+  `gps: mcu vdda=<mV> (vrefint raw cal)`. On the U5 the ADC stays isolated
+  until **`PWR_SVMCR.ASV`** is set (v0.0.81 forgot it → `vdda=0`); on failure
+  `cal=` carries the failed step (1 LDO, 2 ADRDY, 3 EOC). Every wait is bounded
+  (IWDG), the ADC goes back to deep power-down.
+- **Open-drain fallback (v0.0.80)** — when the ZDA probe gets no reply with
+  push-pull, `gps_pa0_set_od(1)` and the probe is repeated. Answered → keep
+  open-drain (`g_pa0_od`), redo the 230400 raise; still silent → back to
+  push-pull. The `tx-test-od` txdiag is logged **while still open-drain**
+  (v0.0.82; v0.0.80 logged it after reverting), so `idle_high` there shows
+  whether the module side pulls the released line up.
+- **Why:** JP2 pin 1 is the board's 1V8 rail, so a stock board would drive a
+  1.8 V high into a 3.3 V module (below its ~0.7·VCC VIH). Measured on the
+  field box: **`vdda=3243 mV`** (3.3 V mod) — levels are fine there, and
+  `tx-test-od` read `idle_high=0/64` (nothing pulls the released line up).
+  Conclusion for that box: MCU side fully verified; the module does not hear
+  its RXD (input disabled in saved config, damaged RXD, or the connection).
+  Next step is off-box: a 3.3 V USB-serial adapter directly on the module.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`

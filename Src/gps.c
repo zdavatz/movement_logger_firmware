@@ -93,10 +93,11 @@ static void gps_tx_diag(const char *where)
     if (GPIOA->IDR & GPIO_PIN_0) highs++;
     for (volatile int d = 0; d < 200; d++) { }
   }
-  ErrLog_Writef("gps: txdiag %s ok=%lu busy=%lu tout=%lu bytes=%lu | PA0 moder=%lu af=%lu idle_high=%lu/64 | uart4 UE=%d TE=%d RE=%d brr=%lu",
+  ErrLog_Writef("gps: txdiag %s ok=%lu busy=%lu tout=%lu bytes=%lu | PA0 moder=%lu af=%lu od=%lu idle_high=%lu/64 | uart4 UE=%d TE=%d RE=%d brr=%lu",
                 where, (unsigned long)g_tx_ok, (unsigned long)g_tx_busy,
                 (unsigned long)g_tx_tout, (unsigned long)g_tx_bytes,
                 (unsigned long)(GPIOA->MODER & 3U), (unsigned long)(GPIOA->AFR[0] & 0xFU),
+                (unsigned long)(GPIOA->OTYPER & 1U),
                 (unsigned long)highs,
                 (UART4->CR1 & USART_CR1_UE) ? 1 : 0, (UART4->CR1 & USART_CR1_TE) ? 1 : 0,
                 (UART4->CR1 & USART_CR1_RE) ? 1 : 0, (unsigned long)UART4->BRR);
@@ -1033,21 +1034,139 @@ static int wait_token(const char *token, uint32_t ms)
                 config: UBX+NMEA in/out, 230400) to re-enable UBX.
      silent   → TX path dead: hardware (JP2 pin 14 → module RXD).
    Returns the new baud if $PUBX,41 took, else 0 (UART left at `baud`). */
+/* MCU supply measured via VREFINT on ADC1 (v0.0.81) — PA0's push-pull "high"
+   is VDD, so this says whether the box drives 1.8 V or 3.3 V into the
+   module's RXD. Bare registers (the ADC HAL isn't in the build), every wait
+   bounded, ADC returned to deep power-down afterwards. 0 = measurement failed. */
+static uint32_t gps_measure_vdda_mv(uint32_t *raw_out, uint32_t *cal_out)
+{
+  uint32_t t0;
+  uint32_t step = 0;
+  /* U5: VDDA is an independent supply — the ADC stays isolated until it is
+     declared valid (PWR_SVMCR.ASV). */
+  RCC->AHB3ENR |= RCC_AHB3ENR_PWREN;
+  (void)RCC->AHB3ENR;
+  PWR->SVMCR |= PWR_SVMCR_ASV;
+  RCC->AHB2ENR1 |= RCC_AHB2ENR1_ADC12EN;
+  (void)RCC->AHB2ENR1;
+  ADC12_COMMON->CCR = (ADC12_COMMON->CCR & ~ADC_CCR_PRESC)
+                    | (4UL << ADC_CCR_PRESC_Pos)          /* HCLK/8 = 20 MHz */
+                    | ADC_CCR_VREFEN;
+  ADC1->CR &= ~ADC_CR_DEEPPWD;
+  ADC1->CR |= ADC_CR_ADVREGEN;
+  t0 = HAL_GetTick();
+  while (!(ADC1->ISR & ADC_ISR_LDORDY)) if (HAL_GetTick() - t0 > 10) { step = 1; goto fail; }
+  ADC1->ISR = ADC_ISR_ADRDY;
+  ADC1->CR |= ADC_CR_ADEN;
+  t0 = HAL_GetTick();
+  while (!(ADC1->ISR & ADC_ISR_ADRDY)) if (HAL_GetTick() - t0 > 10) { step = 2; goto fail; }
+  ADC1->PCSEL |= ADC_PCSEL_PCSEL_0;                     /* VREFINT = channel 0 */
+  ADC1->SQR1   = 0;                                     /* 1 conversion, ch 0 */
+  ADC1->SMPR1  = (ADC1->SMPR1 & ~ADC_SMPR1_SMP0) | ADC_SMPR1_SMP0;  /* longest */
+  HAL_Delay(2);                                         /* VREFINT start-up */
+  uint32_t acc = 0;
+  for (int i = 0; i < 8; i++) {
+    ADC1->ISR = ADC_ISR_EOC;
+    ADC1->CR |= ADC_CR_ADSTART;
+    t0 = HAL_GetTick();
+    while (!(ADC1->ISR & ADC_ISR_EOC)) if (HAL_GetTick() - t0 > 10) { step = 3; goto fail; }
+    acc += ADC1->DR;
+  }
+  uint32_t raw = acc / 8;
+  const volatile uint8_t *c = (const volatile uint8_t *)VREFINT_CAL_ADDR;
+  uint32_t cal = (uint32_t)c[0] | ((uint32_t)c[1] << 8);  /* unaligned in sysflash */
+  ADC1->CR |= ADC_CR_ADDIS;
+  t0 = HAL_GetTick();
+  while ((ADC1->CR & ADC_CR_ADEN) && HAL_GetTick() - t0 < 10) { }
+  ADC12_COMMON->CCR &= ~ADC_CCR_VREFEN;
+  ADC1->CR &= ~ADC_CR_ADVREGEN;
+  ADC1->CR |= ADC_CR_DEEPPWD;
+  if (raw_out) *raw_out = raw;
+  if (cal_out) *cal_out = cal;
+  return raw ? (VREFINT_CAL_VREF * cal) / raw : 0;
+fail:
+  ADC12_COMMON->CCR &= ~ADC_CCR_VREFEN;
+  if (raw_out) *raw_out = 0;
+  if (cal_out) *cal_out = step;       /* failed step: 1 LDO, 2 ADRDY, 3 EOC */
+  return 0;
+}
+
+/* PA0 output type (v0.0.80). The STEVAL-MKBOXPRO MCU I/O runs at 1.8 V
+   (JP2 pin 1 = the 1V8 rail), so push-pull PA0 drives a 1.8 V "high" — below
+   the 3.3 V MAX-M10S's ~0.7·VCC input threshold, so the module never sees a
+   clean start bit while its own 3.3 V TX into 5 V-tolerant PA1 works fine
+   (exactly the "NMEA arrives, nothing ever ACKs" signature). Open-drain lets
+   the module-side RXD pull-up lift the line to 3.3 V; PA0 is FT so that is
+   safe. Survives gps_uart_reopen (HAL_UART_DeInit leaves GPIO alone). */
+static uint8_t g_pa0_od;
+
+static void gps_pa0_set_od(uint8_t od)
+{
+  GPIO_InitTypeDef g = {0};
+  g.Mode      = od ? GPIO_MODE_AF_OD : GPIO_MODE_AF_PP;
+  g.Pull      = GPIO_NOPULL;
+  g.Speed     = GPIO_SPEED_FREQ_HIGH;
+  g.Alternate = GPIO_AF8_UART4;
+  g.Pin       = GPIO_PIN_0;
+  HAL_GPIO_Init(GPIOA, &g);
+  g_pa0_od = od;
+}
+
+/* ZDA poll ×3 (see gps_tx_path_test). 1 = the module answered. */
+static int gps_zda_probe(void)
+{
+  for (int i = 0; i < 3; i++) {
+    listen_traffic(50, NULL, NULL);              /* flush + arm RX IRQ */
+    nmea_send("EIGNQ,ZDA");
+    if (wait_token("ZDA,", 1500)) return 1;
+  }
+  return 0;
+}
+
 static uint32_t gps_tx_path_test(uint32_t baud)
 {
   extern void ErrLog_Writef(const char *fmt, ...);
-  int answered = 0;
-  for (int i = 0; i < 3 && !answered; i++) {
-    listen_traffic(50, NULL, NULL);              /* flush + arm RX IRQ */
-    nmea_send("EIGNQ,ZDA");
-    answered = wait_token("ZDA,", 1500);
-  }
+  int answered = gps_zda_probe();
   if (!answered) {
-    ErrLog_Writef("*** gps: tx-test @%lu — no reply to NMEA poll (ZDA): "
-                  "box->module TX dead, check JP2 pin 14 -> module RXD ***",
-                  (unsigned long)baud);
     gps_tx_diag("tx-test");
-    return 0;
+    /* v0.0.80: retry with PA0 open-drain (1.8 V MCU I/O vs 3.3 V module). */
+    gps_pa0_set_od(1);
+    answered = gps_zda_probe();
+    if (!answered) {
+      /* idle_high here = does the module side pull the open-drain line up
+         at all? 0/64 → no pull-up, so this attempt could not work. */
+      gps_tx_diag("tx-test-od");
+      gps_pa0_set_od(0);
+      ErrLog_Writef("*** gps: tx-test @%lu — no reply to NMEA poll (ZDA), push-pull "
+                    "and open-drain: box->module TX dead, check JP2 pin 14 -> module RXD ***",
+                    (unsigned long)baud);
+      return 0;
+    }
+    ErrLog_Writef("gps: tx-test @%lu — answered with PA0 open-drain (1.8 V MCU vs 3.3 V module); keeping open-drain",
+                  (unsigned long)baud);
+    gps_tx_diag("tx-test-od");
+    /* The module hears us now; its UBX input is most likely fine, so retry
+       the normal baud raise before the $PUBX,41 last resort. */
+    vs_begin();
+    vs_u4(CFG_UART1_BAUDRATE, GPS_UART_BAUDRATE);
+    ubx_send(0x06, 0x8A, g_vs_buf, g_vs_len);
+    if (gps_uart_reopen(GPS_UART_BAUDRATE) != 0) return 0;
+    if (ubx_wait_ack(0x06, 0x8A, 700) == 0) {
+      ErrLog_Writef("gps: cfg baud %lu ACK (from %lu, open-drain)",
+                    (unsigned long)GPS_UART_BAUDRATE, (unsigned long)baud);
+      return GPS_UART_BAUDRATE;
+    }
+    int nl = 0, ux = 0;
+    listen_traffic(600, &nl, &ux);
+    if (nl + ux > 0) {
+      /* Module switched (its TX reaches us at 230400) but the ACK was lost —
+         open-drain rise time is the suspect at the high rate. Keep going at
+         230400; the config steps report what lands. */
+      ErrLog_Writef("*** gps: baud %lu un-ACK'd but module streams there (nmea=%d ubx=%d) — open-drain edge at high baud? ***",
+                    (unsigned long)GPS_UART_BAUDRATE, nl, ux);
+      return GPS_UART_BAUDRATE;
+    }
+    if (gps_uart_reopen(baud) != 0) return 0;
   }
   ErrLog_Writef("*** gps: tx-test @%lu — NMEA poll answered: TX works, "
                 "UBX input blocked — trying $PUBX,41 ***", (unsigned long)baud);
@@ -1207,6 +1326,12 @@ int GPS_Init(void)
 
   /* Before the UART is opened: idle level + pin config of PA0 (v0.0.79). */
   gps_tx_diag("pre-init");
+  {
+    uint32_t vr = 0, vc = 0;
+    uint32_t mv = gps_measure_vdda_mv(&vr, &vc);
+    ErrLog_Writef("gps: mcu vdda=%lu mV (vrefint raw=%lu cal=%lu) — PA0 push-pull high = this level",
+                  (unsigned long)mv, (unsigned long)vr, (unsigned long)vc);
+  }
 
   /* Enable UART4 IRQ early — we need it armed during the baud-detection
      listen window so bytes accumulate in the ring. Priority 6: on Cortex-M
