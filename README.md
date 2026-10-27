@@ -146,6 +146,12 @@ Any broken wire puts `***` on the line, so the box's red LED lights and the desk
 
 A second boot the same day, with the RX wire held in that hole from power-on, was clean: pull-up present, `cfg baud 230400 ACK` at 2.6 s, every config command ACKed, `RX<-JP2-14 ok (6 ACK)`, no `***` line (red LED off). The firmware configures the module **only during boot**: if the RX contact appears after boot, the module answers bridge polls but the box stays at 9600 / 1 Hz until the next power-cycle. Solder TX and RX — a pressed-in wire may not hold through the next restart.
 
+**Soldered, 10 Hz confirmed (2026-10-27):** with TX and RX soldered into the second header, the box gets `cfg baud 230400 ACK`, a fix after 6 s and `nav rate → 10Hz (fix acquired) ACK`. `gps_diag` counts 199 positions per 20 s, and 116 of 125 rows at the end of `GPS000.CSV` are 0.1 s apart (the rest fall in the window where a BLE GPS-bridge check throttles output to 1 Hz).
+
+Two connectors caused the false alarms that day:
+- **Antenna U.FL plug:** loose after soldering next to it. Symptom: module answers, `NAV-SAT` lists ~27 satellites but **0 with signal**, `gps_rf` AGC pinned at ~5600–5950. Press the plug straight on (never twist it) and tape or glue the cable for strain relief.
+- **Ribbon cable to the box:** it has no key and fits both ways. Seated badly, the SparkFun power LED goes dark and the module sends 0 bytes (`TX->JP2-13 garbage … RX<-JP2-14 wired, no reply`). Red wire = pin 1, on the side of the "1" printed next to the connector. Reversed fully, it can swap 3V3/GND — the MAX-M10S VCC limit is −0.5 V, so that can kill the module.
+
 ### Second path to the module: I2C (v0.0.84+)
 
 The MAX-M10S also speaks UBX over I2C (address 0x42). Wire the SparkFun **Qwiic SDA (blue) → I2C3_SDA = PG8** and **SCL (yellow) → I2C3_SCL = PG7** on the box's JP4 extension connector (pin numbers: UM3133 §1.8.6; domain switch on 3 V; leave the Qwiic 3.3 V unconnected). At every boot the firmware then logs:

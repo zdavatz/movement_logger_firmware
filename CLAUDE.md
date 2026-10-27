@@ -778,6 +778,13 @@ hole from power-on): `cfg baud 230400 ACK` at 2626 ms, all six config ACKs,
 bridge while the ERRLOG still says `RX<-JP2-14 MISSING` and the box stays at
 9600 / 1 Hz — power-cycle to reconfigure.
 
+Soldered (2026-10-27, later that day): fix at 6015 ms, `nav rate → 10Hz` ACK at
+6017 ms, `gps_diag` gga +199 per 20 s, GPS000.CSV tail 116/125 rows at 0.1 s
+(the 1 s rows = the desktop probe's bridge window, `pvt throttle`). Caveat for
+the wiring line: with the ribbon cable unseated (SparkFun power LED dark, 0
+bytes) it still printed `3V3+BLK ok` — the PA0 pull-up test read a residual
+level. `3V3+BLK ok` + `TX garbage (5 B)` + `0 ACK` = check module power first.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`
