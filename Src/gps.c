@@ -68,6 +68,40 @@ static volatile uint32_t g_diag_errors;        /* UART RX error callbacks invoke
    baud if the switch couldn't be confirmed). Logged by the bridge. */
 static uint32_t g_locked_baud = GPS_UART_BAUDRATE;
 
+/* TX diagnostics (v0.0.79). Every byte to the module goes through gps_tx so
+   the HAL result is counted instead of silently dropped — "module never
+   ACKs" must be split into "MCU never sent" vs "sent but nothing arrived". */
+static volatile uint32_t g_tx_ok, g_tx_busy, g_tx_tout, g_tx_bytes;
+
+static void gps_tx(const uint8_t *data, uint16_t len)
+{
+  HAL_StatusTypeDef rc = HAL_UART_Transmit(&g_huart4, (uint8_t *)data, len, 200);
+  if (rc == HAL_OK)        { g_tx_ok++; g_tx_bytes += len; }
+  else if (rc == HAL_BUSY) { g_tx_busy++; }
+  else                     { g_tx_tout++; }
+}
+
+/* One line with the TX counters, the PA0 pin config (MODER 2 = AF, AFRL 8 =
+   AF8/UART4), UART4 enable bits, and the idle PA0 level sampled 64× —
+   an idle UART TX line must read high; low means the pin is being pulled
+   down externally (short / loaded line), not a firmware problem. */
+static void gps_tx_diag(const char *where)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  uint32_t highs = 0;
+  for (int i = 0; i < 64; i++) {
+    if (GPIOA->IDR & GPIO_PIN_0) highs++;
+    for (volatile int d = 0; d < 200; d++) { }
+  }
+  ErrLog_Writef("gps: txdiag %s ok=%lu busy=%lu tout=%lu bytes=%lu | PA0 moder=%lu af=%lu idle_high=%lu/64 | uart4 UE=%d TE=%d RE=%d brr=%lu",
+                where, (unsigned long)g_tx_ok, (unsigned long)g_tx_busy,
+                (unsigned long)g_tx_tout, (unsigned long)g_tx_bytes,
+                (unsigned long)(GPIOA->MODER & 3U), (unsigned long)(GPIOA->AFR[0] & 0xFU),
+                (unsigned long)highs,
+                (UART4->CR1 & USART_CR1_UE) ? 1 : 0, (UART4->CR1 & USART_CR1_TE) ? 1 : 0,
+                (UART4->CR1 & USART_CR1_RE) ? 1 : 0, (unsigned long)UART4->BRR);
+}
+
 /* Persisted GPS power state (battery-save). GPSPWR.CFG on the SD root: first
    byte 'f'/'F' ("off") = backup mode, anything else = on. g_power is the
    cache: -1 = not read yet, 0 = off (in backup), 1 = on. GPS_Tick early-exits
@@ -163,9 +197,9 @@ static void ubx_send(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t l
   uint8_t ck[2] = { 0, 0 };
   for (int i = 2; i < 6; i++) { ck[0] += hdr[i]; ck[1] += ck[0]; }
   for (int i = 0; i < len; i++) { ck[0] += payload[i]; ck[1] += ck[0]; }
-  HAL_UART_Transmit(&g_huart4, hdr, 6, 200);
-  if (len) HAL_UART_Transmit(&g_huart4, (uint8_t *)payload, len, 200);
-  HAL_UART_Transmit(&g_huart4, ck, 2, 200);
+  gps_tx(hdr, 6);
+  if (len) gps_tx(payload, len);
+  gps_tx(ck, 2);
 }
 
 /* ---------- UBX-CFG-VALSET: M10-native config (RAM layer only) ----------- */
@@ -792,6 +826,7 @@ void GPS_BridgeSet(uint8_t on)
     int rc = gps_cfg_valset_bool(CFG_MSGOUT_UBX_NAV_PVT_UART1, 10);
     ErrLog_Writef("gps: bridge ON @%lu baud (pvt throttle %s)",
                   (unsigned long)g_locked_baud, (rc == 0) ? "ACK" : "FAIL");
+    gps_tx_diag("bridge-on");
   } else {
     g_bridge = 0;
     /* Restore the 10 Hz PVT stream. RAM-only, best-effort — a power cycle
@@ -799,6 +834,7 @@ void GPS_BridgeSet(uint8_t on)
     int rc = gps_cfg_valset_bool(CFG_MSGOUT_UBX_NAV_PVT_UART1, 1);
     ErrLog_Writef("gps: bridge off @%lu baud (pvt restore %s)",
                   (unsigned long)g_locked_baud, (rc == 0) ? "ACK" : "FAIL");
+    gps_tx_diag("bridge-off");
   }
 }
 
@@ -807,7 +843,7 @@ uint8_t GPS_BridgeActive(void) { return g_bridge; }
 void GPS_BridgeTx(const uint8_t *data, uint16_t len)
 {
   if (!data || !len) return;
-  HAL_UART_Transmit(&g_huart4, (uint8_t *)data, len, 200);
+  gps_tx(data, len);
 }
 
 uint16_t GPS_BridgeRead(uint8_t *out, uint16_t max)
@@ -966,7 +1002,7 @@ static void nmea_send(const char *body)
   char line[96];
   int n = snprintf(line, sizeof(line), "$%s*%02X\r\n", body, cs);
   if (n > 0 && n < (int)sizeof(line))
-    HAL_UART_Transmit(&g_huart4, (uint8_t *)line, (uint16_t)n, 200);
+    gps_tx((const uint8_t *)line, (uint16_t)n);
 }
 
 /* Watch the RX ring for `token` (plain bytes, e.g. "ZDA,") for up to `ms`.
@@ -1010,6 +1046,7 @@ static uint32_t gps_tx_path_test(uint32_t baud)
     ErrLog_Writef("*** gps: tx-test @%lu — no reply to NMEA poll (ZDA): "
                   "box->module TX dead, check JP2 pin 14 -> module RXD ***",
                   (unsigned long)baud);
+    gps_tx_diag("tx-test");
     return 0;
   }
   ErrLog_Writef("*** gps: tx-test @%lu — NMEA poll answered: TX works, "
@@ -1061,7 +1098,7 @@ static void gps_wake_pulse(void)
 {
   uint8_t junk[16];
   memset(junk, 0xFF, sizeof(junk));
-  HAL_UART_Transmit(&g_huart4, junk, sizeof(junk), 200);
+  gps_tx(junk, sizeof(junk));
   HAL_Delay(120);
 }
 
@@ -1167,6 +1204,9 @@ int GPS_Init(void)
 
   extern void ErrLog_Write(const char *msg);
   extern void ErrLog_Writef(const char *fmt, ...);
+
+  /* Before the UART is opened: idle level + pin config of PA0 (v0.0.79). */
+  gps_tx_diag("pre-init");
 
   /* Enable UART4 IRQ early — we need it armed during the baud-detection
      listen window so bytes accumulate in the ring. Priority 6: on Cortex-M

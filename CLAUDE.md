@@ -580,6 +580,26 @@ off by default on the M10, so a `ZDA,` line can only be the reply), ×3 with
   v0.0.18 found `$PUBX,41` unreliable for the *output* mask on the M10, which
   is why it's only this last-resort path, verified, never the primary route.
 
+## GPS TX diagnostics: `gps_tx` + `gps: txdiag` (v0.0.79+) — `gps.c`
+
+Every byte to the u-blox now goes through `gps_tx()`, which counts the
+`HAL_UART_Transmit` result (`g_tx_ok/busy/tout/bytes`) — before v0.0.79 every
+call site ignored it, so "module never ACKs" could not be split into "MCU
+never sent" vs "sent but nothing arrived". `gps_tx_diag(where)` logs the
+counters plus PA0 `MODER`/`AFRL` (expect 2/8), UART4 `UE/TE/RE`, `BRR`, and
+PA0's idle level sampled 64× from `IDR`. Call sites: `pre-init` (UART not yet
+enabled — `idle_high=0/64` there is normal), `tx-test` (after the ZDA poll
+failed), `bridge-on`/`bridge-off`.
+
+First field result (2026-10-27, the stuck-at-9600 box): `ok=12 busy=0 tout=0
+bytes=109 | moder=2 af=8 idle_high=64/64 | UE=1 TE=1 brr=16667` — the MCU
+transmits correctly at 9600 while the module answers nothing (boot config,
+ZDA poll, bridge MON-VER/NAV-PVT polls). So the firmware path is cleared;
+remaining causes are the JP2 pin 14 → module RXD connection or a module that
+ignores UART input. Don't route new module writes around `gps_tx` — keep the
+counters honest. The desktop `--ble-debug N --gps-tx` probe exercises the
+bridge and prints these lines back from `ERRLOG.LOG`.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`

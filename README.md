@@ -76,6 +76,20 @@ If the box can't raise the GPS baud (every u-blox command un-ACK'd while NMEA st
 - `gps: tx-test … no reply to NMEA poll` → the box→module wire (JP2 pin 14 → module RXD) is dead: hardware.
 - `gps: tx-test … NMEA poll answered … trying $PUBX,41` → the wire works but the module's UBX input is disabled; `$PUBX,41` re-enables it at 230400 and the normal 10 Hz config follows (`gps: $PUBX,41 OK`).
 
+### Box-side TX proof (v0.0.79+)
+
+`ERRLOG.LOG` also gets a `gps: txdiag <where> …` line (before the UART opens, after a failed tx-test, at bridge on/off) that shows whether the box itself actually sent:
+
+```
+gps: txdiag tx-test ok=12 busy=0 tout=0 bytes=109 | PA0 moder=2 af=8 idle_high=64/64 | uart4 UE=1 TE=1 RE=1 brr=16667
+```
+
+- `ok/busy/tout/bytes` — result of every `HAL_UART_Transmit` to the module (previously ignored).
+- `moder=2 af=8` — PA0 in alternate-function mode, AF8 = UART4_TX. `UE=1 TE=1` — UART4 and its transmitter enabled. `brr=16667` = 9600 baud at 160 MHz.
+- `idle_high=N/64` — idle level of PA0 sampled 64×; an idle TX line must read high. Low with the UART enabled = something pulls the line down externally.
+
+All OK + every module command un-ACK'd ⇒ the box sends correctly and the fault is downstream: the wire to the module's RX, or a module that ignores its UART input (saved config / damaged RX). Test the module directly with a 3.3 V USB-serial adapter to tell those apart. The desktop's `MovementLogger --ble-debug 6 --gps-tx` sends UBX polls through the box's GPS bridge and prints these lines back.
+
 ## Host time-sync (`SET_TIME 0x08`, v0.0.10+)
 
 The box has no RTC — the CSV `ms` column is a free-running `HAL_GetTick()` counter that starts at 0 on cold boot. So on every BLE connect the host (iPhone / Android / desktop) pushes its current wall-clock millis via `SET_TIME 0x08 <epoch_ms:u64-LE>`, and the firmware appends a marker line into the **open** `SensNNN.csv` and `GpsNNN.csv`:
