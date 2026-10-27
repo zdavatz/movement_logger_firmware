@@ -110,6 +110,13 @@ gps: early capture 1985 B, 48 lines in 2323 ms (dropped 0) | txt=14 | mix: TXT=1
 
 — a count of the NMEA sentence types in the first ~3 s. All six (GGA, GLL, GSA, GSV, RMC, VTG) = the module runs its **factory message config**, i.e. no saved custom configuration; a missing type means a stored config overrides the default.
 
+### More wiring checks from the firmware (v0.0.87 / v0.0.88)
+
+When the module stays silent, the boot also logs:
+
+- `gps: alt-pin JP2-4 SWDIO PA13 -> …` (and JP2-6 SWCLK PA14, JP2-8 SWO PB3, JP2-10 JTDI PA15) — the ZDA poll bit-banged at 9600 out of every other MCU-drivable JP2 pin. `ANSWERED` = the module RXD is wired to that pin instead of pin 14 (an IDC/ribbon miscount). The pins' registers are restored afterwards, so SWD/JTAG keeps working.
+- `gps: pa0 load rise=… (~N pF) fall=… (~N pF) | crosstalk …` — the capacitance hanging on PA0 (rise/fall time through the MCU's ~40 kΩ pull; bare pin + box trace ≈ 10 pF, + a 30 cm ribbon core ≈ 25 pF) and whether PA0 picks up the module's NMEA from the neighbouring wire. It shows *that* a wire hangs on pin 14, not whether its far end reaches the u-blox RXD — an open end and a pull-less CMOS input look the same from the MCU.
+
 ### Second path to the module: I2C (v0.0.84+)
 
 The MAX-M10S also speaks UBX over I2C (address 0x42). Wire the SparkFun **Qwiic SDA (blue) → I2C3_SDA = PG8** and **SCL (yellow) → I2C3_SCL = PG7** on the box's JP4 extension connector (pin numbers: UM3133 §1.8.6; domain switch on 3 V; leave the Qwiic 3.3 V unconnected). At every boot the firmware then logs:

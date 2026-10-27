@@ -1145,6 +1145,75 @@ static void gps_pa0_sample(uint32_t ms, uint32_t *highs, uint32_t *total, uint32
   *highs = h; *total = n; *edges = e;
 }
 
+/* PA0 load + crosstalk (v0.0.88). Rise/fall time through the MCU's internal
+   ~40 kΩ pull from the opposite rail, DWT-timed: t ≈ 0.69·R·C → rough
+   attached capacitance (pin + box trace ≈ 10 pF, + 30 cm ribbon core
+   ≈ 25-30 pF, + SparkFun trace + u-blox RXD a little more). */
+static uint32_t pa0_edge_cycles(int up)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  uint32_t best[15];
+  for (int r = 0; r < 15; r++) {
+    GPIOA->BSRR = up ? (GPIO_PIN_0 << 16) : GPIO_PIN_0;          /* opposite level */
+    GPIOA->PUPDR &= ~3U;
+    GPIOA->MODER = (GPIOA->MODER & ~3U) | 1U;                    /* output */
+    for (volatile int d = 0; d < 800; d++) { }                   /* ~20 µs */
+    __disable_irq();
+    GPIOA->PUPDR = (GPIOA->PUPDR & ~3U) | (up ? 1U : 2U);
+    uint32_t t0 = DWT->CYCCNT;
+    GPIOA->MODER &= ~3U;                                         /* input */
+    uint32_t dt;
+    for (;;) {
+      dt = DWT->CYCCNT - t0;
+      int v = (GPIOA->IDR & GPIO_PIN_0) ? 1 : 0;
+      if (v == up || dt > 160000U) break;                        /* 1 ms cap */
+    }
+    __enable_irq();
+    best[r] = dt;
+  }
+  for (int i = 1; i < 15; i++) {                                 /* median */
+    uint32_t x = best[i]; int j = i - 1;
+    while (j >= 0 && best[j] > x) { best[j + 1] = best[j]; j--; }
+    best[j + 1] = x;
+  }
+  return best[7];
+}
+
+static void pa0_load_and_crosstalk(void)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  uint32_t cu = pa0_edge_cycles(1), cd = pa0_edge_cycles(0);
+  /* pF ≈ t / (0.69 · 40 kΩ); t = cycles / 160 MHz → pF ≈ cycles · 0.226 */
+  uint32_t pfu = (cu * 226U) / 1000U, pfd = (cd * 226U) / 1000U;
+  /* Crosstalk: PA0 floating (input, no pull), PA1 = module TX (NMEA).
+     Count PA0 edges while PA1 toggled in the last 2 ms vs. while PA1 idle. */
+  GPIOA->PUPDR &= ~3U;
+  GPIOA->MODER &= ~3U;
+  uint32_t last_p1 = 0, p1prev = (GPIOA->IDR & GPIO_PIN_1) ? 1U : 0U,
+           p0prev = (GPIOA->IDR & GPIO_PIN_0) ? 1U : 0U;
+  uint32_t e_act = 0, e_idle = 0, n_act = 0, n_idle = 0, p1edges = 0;
+  uint32_t t_end = HAL_GetTick() + 2000U;
+  while ((int32_t)(HAL_GetTick() - t_end) < 0) {
+    uint32_t idr = GPIOA->IDR, now = DWT->CYCCNT;
+    uint32_t p1 = (idr & GPIO_PIN_1) ? 1U : 0U, p0 = (idr & GPIO_PIN_0) ? 1U : 0U;
+    if (p1 != p1prev) { last_p1 = now; p1prev = p1; p1edges++; }
+    int active = (now - last_p1) < 320000U;                      /* 2 ms */
+    if (active) n_act++; else n_idle++;
+    if (p0 != p0prev) { if (active) e_act++; else e_idle++; p0prev = p0; }
+  }
+  /* edges per million samples, active vs idle */
+  uint32_t r_act  = n_act  ? (uint32_t)(((uint64_t)e_act  * 1000000U) / n_act)  : 0;
+  uint32_t r_idle = n_idle ? (uint32_t)(((uint64_t)e_idle * 1000000U) / n_idle) : 0;
+  ErrLog_Writef("gps: pa0 load rise=%lu cyc (~%lu pF) fall=%lu cyc (~%lu pF) | crosstalk pa0 edges during NMEA=%lu/%lu smp (%lu ppm) idle=%lu/%lu (%lu ppm), pa1 edges=%lu -> %s",
+                (unsigned long)cu, (unsigned long)pfu, (unsigned long)cd, (unsigned long)pfd,
+                (unsigned long)e_act, (unsigned long)n_act, (unsigned long)r_act,
+                (unsigned long)e_idle, (unsigned long)n_idle, (unsigned long)r_idle,
+                (unsigned long)p1edges,
+                (r_act > 4 * r_idle + 5) ? "PA0 picks up the NMEA (wire 14 runs next to the TX wire)"
+                                         : "no NMEA crosstalk on PA0");
+}
+
 static void gps_pa0_probe(void)
 {
   extern void ErrLog_Writef(const char *fmt, ...);
@@ -1158,6 +1227,7 @@ static void gps_pa0_probe(void)
   gps_pa0_mode(GPIO_MODE_INPUT, GPIO_PULLDOWN);
   HAL_Delay(5);
   gps_pa0_sample(100, &hd, &nd, &ed);
+  pa0_load_and_crosstalk();                       /* v0.0.88 */
   gps_pa0_mode(g_pa0_od ? GPIO_MODE_AF_OD : GPIO_MODE_AF_PP, GPIO_NOPULL);
   const char *v =
       (e0 > 500)                          ? "PA0 is DRIVEN (toggles) - wired to an output, e.g. the module TX?" :
@@ -1227,6 +1297,74 @@ static void gps_input_effect_test(void)
                 (gsv_effect || rst_effect)
                   ? "MODULE HEARS PA0 (replies off) - fixable over UART"
                   : "no effect - module receives nothing on RX");
+}
+
+/* Is the module RXD on another JP2 pin? (v0.0.87). The MCU-drivable JP2 pins
+   besides 14 (PA0) are the debug pins 4 = SWDIO/PA13, 6 = SWCLK/PA14,
+   8 = SWO/PB3, 10 = JTDI/PA15. A ribbon/IDC miscount puts the SparkFun RX
+   pad on one of those while PA0 (pin 14) ends nowhere — exactly the
+   "PA0 far end high-Z" probe result. Bit-bang the ZDA poll at 9600 out of
+   each (DWT-timed, IRQs off only while a sentence is clocked out), listen
+   for the reply on the working PA1 path, then restore the pin's registers
+   byte-for-byte (SWD/JTAG usable again). */
+static void bb_send(GPIO_TypeDef *port, uint16_t pin, const char *s)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  const uint32_t bit = SystemCoreClock / 9600U;
+  __disable_irq();
+  for (const char *c = s; *c; c++) {
+    uint16_t frame = (uint16_t)(((uint16_t)(uint8_t)*c << 1) | 0x200U);  /* start 0, 8 data, stop 1 */
+    uint32_t t = DWT->CYCCNT;
+    for (int i = 0; i < 10; i++) {
+      port->BSRR = (frame & (1U << i)) ? pin : ((uint32_t)pin << 16);
+      t += bit;
+      while ((int32_t)(DWT->CYCCNT - t) < 0) { }
+    }
+  }
+  __enable_irq();
+}
+
+static void gps_alt_pin_scan(void)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  static const struct { GPIO_TypeDef *port; uint16_t pin; uint8_t idx; const char *name; } c[] = {
+    { GPIOA, GPIO_PIN_13, 13, "JP2-4 SWDIO PA13" },
+    { GPIOA, GPIO_PIN_14, 14, "JP2-6 SWCLK PA14" },
+    { GPIOB, GPIO_PIN_3,   3, "JP2-8 SWO PB3"    },
+    { GPIOA, GPIO_PIN_15, 15, "JP2-10 JTDI PA15" },
+  };
+  char zda[24];
+  {
+    uint8_t cs = 0;
+    for (const char *b = "EIGNQ,ZDA"; *b; b++) cs ^= (uint8_t)*b;
+    snprintf(zda, sizeof(zda), "$EIGNQ,ZDA*%02X\r\n", cs);
+  }
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  for (unsigned k = 0; k < sizeof(c) / sizeof(c[0]); k++) {
+    GPIO_TypeDef *P = c[k].port;
+    uint32_t i = c[k].idx;
+    uint32_t moder = P->MODER, otyper = P->OTYPER, ospeedr = P->OSPEEDR,
+             pupdr = P->PUPDR, odr = P->ODR, afr = P->AFR[i >> 3];
+    P->BSRR = c[k].pin;                                          /* idle high */
+    P->OTYPER &= ~(1U << i);
+    P->PUPDR  &= ~(3U << (2 * i));
+    P->MODER   = (P->MODER & ~(3U << (2 * i))) | (1U << (2 * i)); /* output */
+    HAL_Delay(5);
+    int answered = 0;
+    for (int t = 0; t < 2 && !answered; t++) {
+      listen_traffic(50, NULL, NULL);                            /* flush + arm RX */
+      bb_send(P, c[k].pin, zda);
+      answered = wait_token("ZDA,", 1200);
+    }
+    P->AFR[i >> 3] = afr;
+    P->PUPDR = pupdr; P->OSPEEDR = ospeedr; P->OTYPER = otyper;
+    P->ODR = odr;     P->MODER = moder;                          /* restore */
+    ErrLog_Writef("gps: alt-pin %s -> %s", c[k].name,
+                  answered ? "ANSWERED - the module RXD is wired to THIS JP2 pin, not pin 14"
+                           : "no reply");
+    if (answered) break;
+  }
 }
 
 /* Toggle UART4 TX polarity (TXINV) — UE must be off while CR2 changes. */
@@ -1434,6 +1572,7 @@ static uint32_t gps_tx_path_test(uint32_t baud)
       /* v0.0.83: what is on the wire, and an inverted-TX attempt. */
       gps_pa0_probe();
       gps_input_effect_test();
+      gps_alt_pin_scan();
       gps_uart_txinv(1);
       answered = gps_zda_probe();
       gps_uart_txinv(0);

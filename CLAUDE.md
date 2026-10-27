@@ -703,6 +703,32 @@ Note on the desktop CLI: `--flash-firmware` once printed "Firmware sent" while
 the box logged `fwupdate: ABORT` — confirm a flash by the version GET_VERSION
 reports after the reboot, not by the CLI line.
 
+### v0.0.87: bit-bang the ZDA poll out of the other JP2 pins — `gps_alt_pin_scan`
+
+The MCU-drivable JP2 pins besides 14 are 4 = SWDIO/PA13, 6 = SWCLK/PA14,
+8 = SWO/PB3, 10 = JTDI/PA15 (12 = NRST can't be driven without resetting
+the MCU; 3/5/9 carry nothing usable; 1 = 1V8 rail). Each is saved
+(MODER/OTYPER/OSPEEDR/PUPDR/ODR/AFR), set to push-pull output idling high,
+`$EIGNQ,ZDA` is clocked out at 9600 with the DWT cycle counter (`bb_send`, IRQs
+off only while one sentence is sent), the reply is awaited on PA1, then the
+registers are restored byte-for-byte (SWD back). Runs after the input-effect
+test, ~10 s, failing boots only. Field box: all four `no reply`.
+
+### v0.0.88: PA0 load + crosstalk — `pa0_load_and_crosstalk`
+
+Called from `gps_pa0_probe`. Load: drive PA0 to the opposite rail, switch to
+input with the internal pull, DWT-count until the level flips (median of
+15, 1 ms cap); pF ≈ cycles × 0.226 (t = 0.69·40 kΩ·C at 160 MHz — the pull
+is 25–55 kΩ, so ±40 %). Crosstalk: PA0 floating, PA1 (module TX) sampled in
+the same loop; PA0 edges counted while PA1 toggled within 2 ms vs. idle.
+Field box: `rise=114 cyc (~25 pF) fall=93 cyc (~21 pF)`, 0 crosstalk edges
+against 8510 PA1 edges. ~23 pF ≈ pin/trace (~10 pF) + a ~30 cm ribbon core,
+so a wire hangs on pin 14 — but a floating far end and a pull-less u-blox RXD
+differ by only a few pF, inside the error, and a >20 pF floating node is too
+slow for crosstalk to toggle it. **This is where firmware stops**: whether
+pin 14's wire reaches the u-blox RXD is invisible to the MCU; it takes a
+continuity check (JP2-14 → SparkFun RX pad → u-blox RXD) or the I2C path.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`
