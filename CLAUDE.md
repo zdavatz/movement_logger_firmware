@@ -676,6 +676,33 @@ joint) or has UART input fully disabled in BBR. Neither is fixable over that
 wire — next is the I2C path (v0.0.84, two Qwiic wires) or a direct USB-serial
 adapter on the module.
 
+### v0.0.86: listen to the u-blox from power-on — `GPS_EarlyListen` / `gps_early_report`
+
+`main()` calls `GPS_EarlyListen()` right after `SystemClock_Config()` (which
+already selects the UART4 kernel clock): PA0/PA1 AF8, UART4 @9600, byte IRQ
+armed into the normal RX ring. `GPS_Init` starts with `gps_early_report()`,
+which waits until 3 s after the arm (or the ring is nearly full — it drops the
+*newest* bytes, so the banner survives), then logs every `$xxTXT` line as
+`gps: early …` and a sentence-type histogram, before resetting the ring.
+Adds ≤ ~2.5 s to boot (the watchdog starts later). A FOTA/IWDG reset doesn't
+power-cycle the module, so no banner then — only a real power-on does.
+
+Field box (2026-10-27): banner `HW UBX 10 000A0000 / ROM SPG 5.10 (7b202e) /
+FWVER=SPG 5.10 / PROTVER=34.10 / MOD=MAX-M10S / ANTSUPERV=AC / ANTSTATUS=OK`,
+mix `RMC VTG GGA GSA×4 GSV GLL` = **factory message config**. History check:
+firmware ≤ v0.0.40 sent `$PUBX,41,1,0003,0002` + legacy CFG-MSG (GLL/GSA/GSV/
+VTG off) + `CFG-CFG SAVE` to BBR/flash every boot — that saved state is **not**
+active on this module (all default sentences present). And flashing the July
+build v0.0.57 back reproduced the failure bit-for-bit, so it is no firmware
+regression. A factory-config M10 must answer ZDA / obey `$PUBX,40` and
+`CFG-RST` at 9600; it does none while PA0 provably transmits → the bytes don't
+reach the u-blox RXD (ribbon wire, SparkFun RX joint, SparkFun trace, or the
+RXD pin). Next step is a continuity check, not firmware.
+
+Note on the desktop CLI: `--flash-firmware` once printed "Firmware sent" while
+the box logged `fwupdate: ABORT` — confirm a flash by the version GET_VERSION
+reports after the reboot, not by the CLI line.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`

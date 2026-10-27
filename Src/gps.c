@@ -1606,8 +1606,93 @@ static int gps_apply_config(int *pvt_ok_out)
   return fails;
 }
 
+/* ---------- Listen to the u-blox firmware from power-on (v0.0.86) --------
+   The module boots on the same rail as the MCU and prints its $GxTXT banner
+   (firmware version, PROTVER, module, sometimes config notes) within the
+   first second — long before GPS_Init (~0.45 s) and its baud handling. So the
+   UART is opened RX-only-in-practice at the module's factory 9600 straight
+   after SystemClock_Config, the byte IRQ fills the ring, and GPS_Init first
+   reports what arrived: every TXT line plus a histogram of the NMEA sentence
+   types, i.e. which (non-factory?) message config the module runs from its
+   battery-backed memory. Only a real power-on shows the banner; an MCU-only
+   reset (FOTA, IWDG) just shows the running stream. */
+static uint32_t g_early_tick;          /* HAL tick when EarlyListen armed; 0 = not */
+
+void GPS_EarlyListen(void)
+{
+  __HAL_RCC_UART4_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  GPIO_InitTypeDef g = {0};
+  g.Mode      = GPIO_MODE_AF_PP;
+  g.Pull      = GPIO_NOPULL;
+  g.Speed     = GPIO_SPEED_FREQ_HIGH;
+  g.Alternate = GPIO_AF8_UART4;
+  g.Pin       = GPIO_PIN_0 | GPIO_PIN_1;
+  HAL_GPIO_Init(GPIOA, &g);
+  if (gps_uart_reopen(9600) != 0) return;
+  HAL_NVIC_SetPriority(UART4_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(UART4_IRQn);
+  if (HAL_UART_Receive_IT(&g_huart4, &g_rx_byte, 1) != HAL_OK) return;
+  g_early_tick = HAL_GetTick();
+  if (g_early_tick == 0) g_early_tick = 1;
+}
+
+static void gps_early_report(void)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  if (!g_early_tick) return;
+  /* Give the module the first 3 s after power-on (its banner + 2 epochs). */
+  while ((HAL_GetTick() - g_early_tick) < 3000) {
+    uint16_t used = (uint16_t)((g_rx_head + GPS_RX_RING_SIZE - g_rx_tail) % GPS_RX_RING_SIZE);
+    if (used > GPS_RX_RING_SIZE - 64) break;
+  }
+  static char buf[GPS_RX_RING_SIZE + 1];
+  uint16_t n = 0;
+  while (g_rx_tail != g_rx_head && n < GPS_RX_RING_SIZE) {
+    buf[n++] = (char)g_rx_ring[g_rx_tail];
+    g_rx_tail = (uint16_t)((g_rx_tail + 1u) % GPS_RX_RING_SIZE);
+  }
+  buf[n] = 0;
+  char types[12][4];
+  uint16_t counts[12];
+  int nt = 0, txt = 0, lines = 0;
+  memset(counts, 0, sizeof(counts));
+  for (uint16_t i = 0; i < n; i++) {
+    if (buf[i] != '$') continue;
+    uint16_t j = i;
+    while (j < n && buf[j] != '\r' && buf[j] != '\n') j++;
+    uint16_t len = (uint16_t)(j - i);
+    if (len >= 7) {
+      lines++;
+      const char *t = &buf[i + 3];                 /* "$GNTXT" → "TXT" */
+      if (memcmp(t, "TXT", 3) == 0 && txt < 14) {
+        char line[96];
+        uint16_t c = (len < sizeof(line) - 1) ? len : (uint16_t)(sizeof(line) - 1);
+        memcpy(line, &buf[i], c); line[c] = 0;
+        ErrLog_Writef("gps: early %s", line);
+        txt++;
+      }
+      int k;
+      for (k = 0; k < nt; k++) if (memcmp(types[k], t, 3) == 0) break;
+      if (k == nt && nt < 12) { memcpy(types[nt], t, 3); types[nt][3] = 0; nt++; }
+      if (k < 12) counts[k]++;
+    }
+    i = j;
+  }
+  char mix[160];
+  int o = 0;
+  for (int k = 0; k < nt && o < (int)sizeof(mix); k++)
+    o += snprintf(mix + o, sizeof(mix) - (size_t)o, " %s=%u", types[k], counts[k]);
+  ErrLog_Writef("gps: early capture %u B, %d lines in %lu ms (dropped %lu) | txt=%d | mix:%s%s",
+                n, lines, (unsigned long)(HAL_GetTick() - g_early_tick),
+                (unsigned long)g_rx_dropped, txt, nt ? mix : " none",
+                txt ? "" : " (no banner: MCU-only reset, or module booted before the UART opened)");
+  g_early_tick = 0;
+}
+
 int GPS_Init(void)
 {
+  gps_early_report();                 /* v0.0.86: what the module said since power-on */
   memset(&g_latest, 0, sizeof(g_latest));
   g_updated   = 0;
   g_linelen   = 0;

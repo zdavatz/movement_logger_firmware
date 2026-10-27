@@ -53,6 +53,10 @@ int main(void)
 
   SystemClock_Config();
 
+  /* v0.0.86: start capturing the u-blox's power-on output ($GxTXT banner)
+     now — GPS_Init reports it. */
+  GPS_EarlyListen();
+
   /* Kick the LSE crystal now (non-blocking) so it has the whole sensor
      bring-up (~7 s) to start; ClkTrim_Tick picks it up from the superloop
      and slews SysTick to it. Logs nothing — errlog isn't up yet. */

@@ -100,6 +100,16 @@ Since v0.0.83/0.0.84, when the module stays silent the boot additionally logs:
 
 - `gps: input-effect GGA before=N after=M | reset txt=T max_gap=G ms …` (v0.0.85+) — tests whether the module *hears* PA0 without needing any reply: it sends `$PUBX,40,GGA,0…` plus a UBX `CFG-VALSET` (GGA rate 0) and watches GGA stop, then a `UBX-CFG-RST` soft reset and watches for an output pause / boot `TXT` banner. Any effect = the module receives the box (only its replies are off) and the fix can go over the UART; `no effect` = the module receives nothing on RX (broken connection to its RXD, or UART input fully disabled — then only I2C or a direct USB-serial adapter can reach it).
 
+### What the module says at power-on (v0.0.86+)
+
+The UART is opened at 9600 right after the clock setup, so the box records the u-blox's own boot output. On a real power-on (switch or magnet — not a FOTA/MCU-only reset) `ERRLOG.LOG` gets the module's banner as `gps: early $GNTXT,…` lines (firmware version, protocol version, module type, antenna status), followed by
+
+```
+gps: early capture 1985 B, 48 lines in 2323 ms (dropped 0) | txt=14 | mix: TXT=14 RMC=4 VTG=3 GGA=3 GSA=12 GSV=9 GLL=3
+```
+
+— a count of the NMEA sentence types in the first ~3 s. All six (GGA, GLL, GSA, GSV, RMC, VTG) = the module runs its **factory message config**, i.e. no saved custom configuration; a missing type means a stored config overrides the default.
+
 ### Second path to the module: I2C (v0.0.84+)
 
 The MAX-M10S also speaks UBX over I2C (address 0x42). Wire the SparkFun **Qwiic SDA (blue) → I2C3_SDA = PG8** and **SCL (yellow) → I2C3_SCL = PG7** on the box's JP4 extension connector (pin numbers: UM3133 §1.8.6; domain switch on 3 V; leave the Qwiic 3.3 V unconnected). At every boot the firmware then logs:

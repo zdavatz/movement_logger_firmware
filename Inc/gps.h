@@ -46,6 +46,7 @@ typedef struct {
   uint8_t  fresh;         /* 1 = MON-RF reply within the last 15 s       */
 } PL_GpsRfLive;
 
+void GPS_EarlyListen(void);   /* v0.0.86: open UART4 RX @9600 right after clock setup */
 int  GPS_Init(void);
 void GPS_Tick(void);
 int  GPS_GetLatestFix(PL_GpsFix *out);
