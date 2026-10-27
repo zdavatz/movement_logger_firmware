@@ -1112,6 +1112,74 @@ static void gps_pa0_set_od(uint8_t od)
   g_pa0_od = od;
 }
 
+/* What is attached to PA0? (v0.0.83). PA0 as a plain input, sampled with no
+   pull, the MCU pull-up and the MCU pull-down (~40 kΩ):
+     edges > 0 (no pull)      → something drives PA0 — e.g. soldered to the
+                                module's TX instead of its RX;
+     low even with pull-up    → held low externally (short to GND / low output);
+     high even with pull-down → an external pull-up / driver: the wire reaches
+                                a pulled-up input (the module RXD);
+     follows the MCU pull     → open / high-impedance line.
+   Restores PA0 to UART4 AF afterwards (push-pull or open-drain per g_pa0_od). */
+static void gps_pa0_mode(uint32_t mode, uint32_t pull)
+{
+  GPIO_InitTypeDef g = {0};
+  g.Mode      = mode;
+  g.Pull      = pull;
+  g.Speed     = GPIO_SPEED_FREQ_HIGH;
+  g.Alternate = GPIO_AF8_UART4;
+  g.Pin       = GPIO_PIN_0;
+  HAL_GPIO_Init(GPIOA, &g);
+}
+
+static void gps_pa0_sample(uint32_t ms, uint32_t *highs, uint32_t *total, uint32_t *edges)
+{
+  uint32_t h = 0, n = 0, e = 0;
+  uint32_t last = (GPIOA->IDR & GPIO_PIN_0) ? 1U : 0U;
+  uint32_t t0 = HAL_GetTick();
+  while ((HAL_GetTick() - t0) < ms) {
+    uint32_t v = (GPIOA->IDR & GPIO_PIN_0) ? 1U : 0U;
+    h += v; n++;
+    if (v != last) { e++; last = v; }
+  }
+  *highs = h; *total = n; *edges = e;
+}
+
+static void gps_pa0_probe(void)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  uint32_t h0, n0, e0, hu, nu, eu, hd, nd, ed;
+  gps_pa0_mode(GPIO_MODE_INPUT, GPIO_NOPULL);
+  HAL_Delay(5);
+  gps_pa0_sample(1000, &h0, &n0, &e0);          /* NMEA burst at 1 Hz lands here */
+  gps_pa0_mode(GPIO_MODE_INPUT, GPIO_PULLUP);
+  HAL_Delay(5);
+  gps_pa0_sample(100, &hu, &nu, &eu);
+  gps_pa0_mode(GPIO_MODE_INPUT, GPIO_PULLDOWN);
+  HAL_Delay(5);
+  gps_pa0_sample(100, &hd, &nd, &ed);
+  gps_pa0_mode(g_pa0_od ? GPIO_MODE_AF_OD : GPIO_MODE_AF_PP, GPIO_NOPULL);
+  const char *v =
+      (e0 > 500)                          ? "PA0 is DRIVEN (toggles) - wired to an output, e.g. the module TX?" :
+      (hu * 10 < nu)                      ? "PA0 held LOW externally (short to GND / low output)" :
+      (hd * 10 > nd * 9)                  ? "PA0 has an external PULL-UP - wire reaches a pulled-up input" :
+      (hu * 10 > nu * 9 && hd * 10 < nd)  ? "PA0 follows the MCU pull - open / high-impedance line" :
+                                            "PA0 ambiguous";
+  ErrLog_Writef("gps: pa0 probe nopull high=%lu/%lu edges=%lu | pullup high=%lu/%lu | pulldown high=%lu/%lu -> %s",
+                (unsigned long)h0, (unsigned long)n0, (unsigned long)e0,
+                (unsigned long)hu, (unsigned long)nu,
+                (unsigned long)hd, (unsigned long)nd, v);
+}
+
+/* Toggle UART4 TX polarity (TXINV) — UE must be off while CR2 changes. */
+static void gps_uart_txinv(uint8_t on)
+{
+  UART4->CR1 &= ~USART_CR1_UE;
+  if (on) UART4->CR2 |= USART_CR2_TXINV;
+  else    UART4->CR2 &= ~USART_CR2_TXINV;
+  UART4->CR1 |= USART_CR1_UE;
+}
+
 /* ZDA poll ×3 (see gps_tx_path_test). 1 = the module answered. */
 static int gps_zda_probe(void)
 {
@@ -1121,6 +1189,174 @@ static int gps_zda_probe(void)
     if (wait_token("ZDA,", 1500)) return 1;
   }
   return 0;
+}
+
+/* ---------- Second path to the module: u-blox DDC (I2C) on I2C3 (v0.0.84) --
+   The MAX-M10S also speaks UBX over I2C (DDC, 7-bit address 0x42). On the
+   STEVAL-MKBOXPRO, I2C3 (PG7 = SCL, PG8 = SDA, AF4) is the DIL24/extension
+   bus in the VDDIO2 domain (set to 3 V for the GPS), so wiring the SparkFun
+   Qwiic SDA/SCL there gives the firmware a path to the module that does not
+   depend on the UART RX line at all — to read why it ignores the UART and to
+   switch UART input back on. Probe costs a few ms when nothing is wired.
+   DDC reads: reg 0xFD/0xFE = bytes waiting (big-endian), 0xFF = data. */
+#define UBLOX_DDC_ADDR        (0x42U << 1)
+#define CFG_UART1INPROT_NMEA  0x10730002UL
+#define CFG_UART1OUTPROT_NMEA 0x10740002UL
+#define CFG_UART1_ENABLED     0x10520005UL
+
+static I2C_HandleTypeDef g_hi2c3;
+
+static int gps_i2c_init(void)
+{
+  __HAL_RCC_GPIOG_CLK_ENABLE();
+  RCC_PeriphCLKInitTypeDef clk = {0};
+  clk.PeriphClockSelection = RCC_PERIPHCLK_I2C3;
+  clk.I2c3ClockSelection   = RCC_I2C3CLKSOURCE_PCLK3;      /* 160 MHz */
+  if (HAL_RCCEx_PeriphCLKConfig(&clk) != HAL_OK) return -1;
+  __HAL_RCC_I2C3_CLK_ENABLE();
+  GPIO_InitTypeDef g = {0};
+  g.Mode      = GPIO_MODE_AF_OD;
+  g.Pull      = GPIO_PULLUP;                              /* Qwiic board has its own too */
+  g.Speed     = GPIO_SPEED_FREQ_LOW;
+  g.Alternate = GPIO_AF4_I2C3;
+  g.Pin       = GPIO_PIN_7 | GPIO_PIN_8;
+  HAL_GPIO_Init(GPIOG, &g);
+  memset(&g_hi2c3, 0, sizeof(g_hi2c3));
+  g_hi2c3.Instance             = I2C3;
+  g_hi2c3.Init.Timing          = 0xA040184A;              /* same as I2C1/I2C4, slow */
+  g_hi2c3.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+  g_hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  g_hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  g_hi2c3.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&g_hi2c3) != HAL_OK) return -1;
+  HAL_I2CEx_ConfigAnalogFilter(&g_hi2c3, I2C_ANALOGFILTER_ENABLE);
+  return 0;
+}
+
+static int gps_i2c_send_ubx(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len)
+{
+  uint8_t f[128];
+  if (len + 8U > sizeof(f)) return -1;
+  f[0] = 0xB5; f[1] = 0x62; f[2] = cls; f[3] = id;
+  f[4] = (uint8_t)(len & 0xFF); f[5] = (uint8_t)(len >> 8);
+  if (len) memcpy(&f[6], payload, len);
+  uint8_t a = 0, b = 0;
+  for (uint16_t i = 2; i < 6U + len; i++) { a += f[i]; b += a; }
+  f[6 + len] = a; f[7 + len] = b;
+  return (HAL_I2C_Master_Transmit(&g_hi2c3, UBLOX_DDC_ADDR, f, (uint16_t)(len + 8U), 100) == HAL_OK) ? 0 : -1;
+}
+
+/* Collect DDC output until a frame cls/id appears or `ms` elapse. Returns the
+   payload length (copied to out) or -1. NMEA in the stream is skipped. */
+static int gps_i2c_wait_ubx(uint8_t cls, uint8_t id, uint8_t *out, uint16_t out_max, uint32_t ms)
+{
+  static uint8_t buf[600];
+  uint16_t n = 0;
+  uint32_t t0 = HAL_GetTick();
+  while ((HAL_GetTick() - t0) < ms) {
+    uint8_t cnt[2];
+    if (HAL_I2C_Mem_Read(&g_hi2c3, UBLOX_DDC_ADDR, 0xFD, I2C_MEMADD_SIZE_8BIT, cnt, 2, 50) != HAL_OK) return -1;
+    uint16_t avail = (uint16_t)((cnt[0] << 8) | cnt[1]);
+    if (avail == 0 || avail == 0xFFFF) { HAL_Delay(10); continue; }
+    if (avail > sizeof(buf) - n) {
+      if (n > 0) { memmove(buf, buf + n / 2, n - n / 2); n = (uint16_t)(n - n / 2); }
+      if (avail > sizeof(buf) - n) avail = (uint16_t)(sizeof(buf) - n);
+    }
+    if (HAL_I2C_Mem_Read(&g_hi2c3, UBLOX_DDC_ADDR, 0xFF, I2C_MEMADD_SIZE_8BIT, buf + n, avail, 200) != HAL_OK) return -1;
+    n = (uint16_t)(n + avail);
+    for (uint16_t i = 0; i + 8 <= n; i++) {
+      if (buf[i] == 0xB5 && buf[i + 1] == 0x62 && buf[i + 2] == cls && buf[i + 3] == id) {
+        uint16_t len = (uint16_t)(buf[i + 4] | (buf[i + 5] << 8));
+        if (i + 8U + len > n) break;                      /* incomplete, read more */
+        uint16_t c = (len < out_max) ? len : out_max;
+        memcpy(out, &buf[i + 6], c);
+        return (int)len;
+      }
+    }
+  }
+  return -1;
+}
+
+/* VALGET one key from `layer` (0 RAM, 1 BBR, 2 Flash, 7 default). -1 = no
+   answer / key absent. */
+static int32_t gps_i2c_valget(uint32_t key, uint8_t layer)
+{
+  uint8_t p[8] = { 0x00, layer, 0, 0,
+                   (uint8_t)key, (uint8_t)(key >> 8), (uint8_t)(key >> 16), (uint8_t)(key >> 24) };
+  if (gps_i2c_send_ubx(0x06, 0x8B, p, sizeof(p)) != 0) return -1;
+  uint8_t r[16];
+  int len = gps_i2c_wait_ubx(0x06, 0x8B, r, sizeof(r), 600);
+  if (len < 9) return -1;                                  /* 4 hdr + 4 key + ≥1 value */
+  uint32_t sz = (key >> 28) & 7U;                          /* 1/2: 1 B, 3: 2 B, 4: 4 B */
+  if (sz <= 2) return r[8];
+  if (sz == 3) return (int32_t)(r[8] | (r[9] << 8));
+  return (int32_t)(r[8] | (r[9] << 8) | (r[10] << 16) | ((uint32_t)r[11] << 24));
+}
+
+static void gps_i2c_session(int uart_ok)
+{
+  extern void ErrLog_Writef(const char *fmt, ...);
+  if (gps_i2c_init() != 0) {
+    ErrLog_Writef("gps-i2c: I2C3 init failed");
+    return;
+  }
+  if (HAL_I2C_IsDeviceReady(&g_hi2c3, UBLOX_DDC_ADDR, 3, 20) != HAL_OK) {
+    ErrLog_Writef("gps-i2c: no u-blox at 0x42 on I2C3 (PG7 SCL / PG8 SDA) — Qwiic SDA/SCL not wired there");
+    HAL_I2C_DeInit(&g_hi2c3);
+    return;
+  }
+  ErrLog_Writef("gps-i2c: u-blox ACKs at 0x42 on I2C3");
+
+  uint8_t v[64];
+  memset(v, 0, sizeof(v));
+  if (gps_i2c_send_ubx(0x0A, 0x04, NULL, 0) == 0 &&
+      gps_i2c_wait_ubx(0x0A, 0x04, v, sizeof(v) - 1, 1000) >= 40) {
+    v[29] = 0; v[39] = 0;                                  /* swVersion[30], hwVersion[10] */
+    ErrLog_Writef("gps-i2c: MON-VER sw='%s' hw='%s'", (char *)v, (char *)&v[30]);
+  } else {
+    ErrLog_Writef("gps-i2c: MON-VER no reply over I2C");
+  }
+
+  static const struct { uint32_t key; const char *name; } keys[] = {
+    { CFG_UART1_ENABLED,     "uart1_en" },
+    { CFG_UART1_BAUDRATE,    "baud"     },
+    { CFG_UART1INPROT_UBX,   "in_ubx"   },
+    { CFG_UART1INPROT_NMEA,  "in_nmea"  },
+    { CFG_UART1OUTPROT_UBX,  "out_ubx"  },
+    { CFG_UART1OUTPROT_NMEA, "out_nmea" },
+  };
+  for (uint8_t layer = 0; layer <= 1; layer++) {
+    char line[160];
+    int o = snprintf(line, sizeof(line), "gps-i2c: %s", layer ? "BBR" : "RAM");
+    for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]) && o < (int)sizeof(line); i++) {
+      int32_t val = gps_i2c_valget(keys[i].key, layer);
+      o += snprintf(line + o, sizeof(line) - (size_t)o, " %s=%ld", keys[i].name, (long)val);
+    }
+    ErrLog_Writef("%s", line);
+  }
+
+  if (!uart_ok) {
+    /* Switch UART1 input (UBX + NMEA) and UBX output back on, RAM + BBR. */
+    uint8_t p[4 + 3 * 5];
+    uint8_t *q = p;
+    *q++ = 0x00; *q++ = 0x03; *q++ = 0; *q++ = 0;          /* version, layers RAM|BBR */
+    const uint32_t k[3] = { CFG_UART1INPROT_UBX, CFG_UART1INPROT_NMEA, CFG_UART1OUTPROT_UBX };
+    for (int i = 0; i < 3; i++) {
+      *q++ = (uint8_t)k[i]; *q++ = (uint8_t)(k[i] >> 8);
+      *q++ = (uint8_t)(k[i] >> 16); *q++ = (uint8_t)(k[i] >> 24);
+      *q++ = 1;
+    }
+    uint8_t ack[4];
+    int rc = (gps_i2c_send_ubx(0x06, 0x8A, p, (uint16_t)(q - p)) == 0)
+               ? gps_i2c_wait_ubx(0x05, 0x01, ack, sizeof(ack), 800) : -1;
+    ErrLog_Writef("gps-i2c: re-enable UART1 input (RAM+BBR) %s", (rc >= 2) ? "ACK" : "no ACK");
+    if (rc >= 2) {
+      int heard = gps_zda_probe();
+      ErrLog_Writef("gps-i2c: UART ZDA probe after re-enable: %s",
+                    heard ? "ANSWERED — UART input works now; full config on next boot"
+                          : "still no reply — the module ignores the RX line itself");
+    }
+  }
 }
 
 static uint32_t gps_tx_path_test(uint32_t baud)
@@ -1137,6 +1373,17 @@ static uint32_t gps_tx_path_test(uint32_t baud)
          at all? 0/64 → no pull-up, so this attempt could not work. */
       gps_tx_diag("tx-test-od");
       gps_pa0_set_od(0);
+      /* v0.0.83: what is on the wire, and an inverted-TX attempt. */
+      gps_pa0_probe();
+      gps_uart_txinv(1);
+      answered = gps_zda_probe();
+      gps_uart_txinv(0);
+      ErrLog_Writef("gps: tx-test @%lu with TX inverted: %s",
+                    (unsigned long)baud, answered ? "ANSWERED" : "no reply");
+      if (answered) {
+        gps_uart_txinv(1);   /* keep it — the path inverts */
+        return 0;            /* config at 9600 follows; baud raise left as-is */
+      }
       ErrLog_Writef("*** gps: tx-test @%lu — no reply to NMEA poll (ZDA), push-pull "
                     "and open-drain: box->module TX dead, check JP2 pin 14 -> module RXD ***",
                     (unsigned long)baud);
@@ -1528,6 +1775,9 @@ int GPS_Init(void)
                 g_rate_armed ? " (10Hz after first fix)" : "",
                 pvt_ok ? "UBX NAV-PVT" : "NMEA fallback",
                 (fails > 0) ? " (config incomplete)" : "");
+
+  /* v0.0.84: second path to the module over DDC/I2C3 (no-op if not wired). */
+  gps_i2c_session(pvt_ok && final_baud == GPS_UART_BAUDRATE);
 
   /* Apply the persisted GPS-power choice. If the user turned GPS off to save
      battery, drop the just-configured module straight into backup mode (its

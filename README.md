@@ -93,6 +93,20 @@ Since v0.0.80/0.0.82 the boot also logs:
 - `gps: mcu vdda=<mV> …` — the MCU supply measured via VREFINT, i.e. the voltage of PA0's push-pull "high" (≈3.24 V on the 3.3 V-modded board; a stock 1.8 V board could not drive a 3.3 V module's RX).
 - If the module stays silent with push-pull, PA0 is retried **open-drain** (`gps: txdiag tx-test-od … od=1 idle_high=N/64`). `idle_high` there shows whether anything on the module side pulls the released line up; `0/64` means nothing does. If the module answers open-drain, the box keeps open-drain and redoes the 230400 baud raise.
 
+Since v0.0.83/0.0.84, when the module stays silent the boot additionally logs:
+
+- `gps: pa0 probe … -> <verdict>` — PA0 as a plain input with no pull / MCU pull-up / MCU pull-down: *driven* (toggles — wired to an output such as the module TX), *held low* (short / low output), *external pull-up* (the wire reaches a pulled-up input), or *follows the MCU pull* (open / high-impedance line).
+- `gps: tx-test … with TX inverted` — one more attempt with the UART TX polarity inverted.
+
+### Second path to the module: I2C (v0.0.84+)
+
+The MAX-M10S also speaks UBX over I2C (address 0x42). Wire the SparkFun **Qwiic SDA (blue) → I2C3_SDA = PG8** and **SCL (yellow) → I2C3_SCL = PG7** on the box's JP4 extension connector (pin numbers: UM3133 §1.8.6; domain switch on 3 V; leave the Qwiic 3.3 V unconnected). At every boot the firmware then logs:
+
+- `gps-i2c: u-blox ACKs at 0x42` (or `no u-blox at 0x42 … not wired there` — costs a few ms when unwired),
+- `gps-i2c: MON-VER sw=… hw=…`,
+- `gps-i2c: RAM …` / `gps-i2c: BBR …` — `uart1_en`, `baud`, `in_ubx`, `in_nmea`, `out_ubx`, `out_nmea` from the module's RAM and battery-backed config: shows *why* it ignores the UART,
+- and, if the UART path failed, `gps-i2c: re-enable UART1 input (RAM+BBR) ACK` followed by a UART re-test (`ANSWERED` = fixed; the next boot runs the full 230400 / 10 Hz config).
+
 All OK + every module command un-ACK'd ⇒ the box sends correctly and the fault is downstream: the wire to the module's RX, or a module that ignores its UART input (saved config / damaged RX). Test the module directly with a 3.3 V USB-serial adapter to tell those apart. The desktop's `MovementLogger --ble-debug 6 --gps-tx` sends UBX polls through the box's GPS bridge and prints these lines back.
 
 ## Host time-sync (`SET_TIME 0x08`, v0.0.10+)

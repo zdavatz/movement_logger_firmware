@@ -622,6 +622,38 @@ bridge and prints these lines back from `ERRLOG.LOG`.
   its RXD (input disabled in saved config, damaged RXD, or the connection).
   Next step is off-box: a 3.3 V USB-serial adapter directly on the module.
 
+### v0.0.83: PA0 line probe + inverted-TX retry
+
+After the open-drain attempt fails, `gps_pa0_probe()` switches PA0 to a plain
+input and samples it 1 s with no pull (counting edges — the 1 Hz NMEA burst
+would land here if PA0 were on the module TX), then 100 ms each with the MCU
+pull-up and pull-down. Verdict thresholds: >500 edges = driven (v0.0.83 used
+20 and misreported floating-line noise as "DRIVEN"), pull-up still low = held
+low, pull-down still high = external pull-up, else follows the MCU pull =
+open/high-Z. Then one ZDA probe with `USART_CR2_TXINV` (UE off while CR2
+changes). Field box: `nopull high=26794/3548968 edges=31 | pullup 100% |
+pulldown 0% → open / high-impedance`, inverted TX no reply — PA0 sees neither
+a driver nor a pull-up on the far side (open joint, or a pull-less RXD).
+
+### v0.0.84: second path to the module over DDC/I2C3 — `gps_i2c_session`
+
+The MAX-M10S speaks UBX over I2C at 0x42 (DDC: reg 0xFD/0xFE = bytes waiting,
+big-endian; 0xFF = data stream; writes are raw UBX frames). On the
+STEVAL-MKBOXPRO **I2C3 = PG7 SCL / PG8 SDA (AF4)** is the DIL24/extension bus
+in the VDDIO2 domain (ST BSP `SensorTileBoxPro_bus.h` / `_DIL24.c`; I2C1 =
+mag/baro, I2C2 = ST25DV NFC, I2C4 = fuel gauge — don't reuse those). Kernel
+clock explicitly `RCC_I2C3CLKSOURCE_PCLK3` (APB3 = 160 MHz, so I2C1's
+`0xA040184A` timing applies). Runs once at the end of `GPS_Init`:
+`HAL_I2C_IsDeviceReady` (NACK → one log line, DeInit, done — a few ms when
+unwired) → MON-VER → VALGET of `CFG-UART1-ENABLED/BAUDRATE/INPROT-UBX/NMEA/
+OUTPROT-UBX/NMEA` from RAM (layer 0) and BBR (layer 1) → if the UART path
+failed, VALSET RAM|BBR `INPROT-UBX/NMEA = 1, OUTPROT-UBX = 1`, then a UART ZDA
+re-probe. The module's *own* write layers are used here deliberately (BBR) —
+unlike the UART config, which stays RAM-only — because the point is to undo a
+saved "UART input off". Needs two wires (Qwiic SDA/SCL → PG8/PG7 on JP4); the
+JP4 pin numbers come from UM3133 §1.8.6 — don't guess them, JP4 also carries
+supply.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`
