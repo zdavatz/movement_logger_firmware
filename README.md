@@ -144,6 +144,8 @@ Any broken wire puts `***` on the line, so the box's red LED lights and the desk
 
 **Field result (2026-10-27):** the RX pad on the SparkFun board had lost its wire. With JP2 pin 14 on the module's RX (the second UART header on the other board edge — RX between PPS and TX — works when the first RX pad is damaged): `cfg baud 230400 ACK`, all config ACKs, `RX<-JP2-14 ok`, `nav rate → 10Hz (fix acquired) ACK`.
 
+A second boot the same day, with the RX wire held in that hole from power-on, was clean: pull-up present, `cfg baud 230400 ACK` at 2.6 s, every config command ACKed, `RX<-JP2-14 ok (6 ACK)`, no `***` line (red LED off). The firmware configures the module **only during boot**: if the RX contact appears after boot, the module answers bridge polls but the box stays at 9600 / 1 Hz until the next power-cycle. Solder TX and RX — a pressed-in wire may not hold through the next restart.
+
 ### Second path to the module: I2C (v0.0.84+)
 
 The MAX-M10S also speaks UBX over I2C (address 0x42). Wire the SparkFun **Qwiic SDA (blue) → I2C3_SDA = PG8** and **SCL (yellow) → I2C3_SCL = PG7** on the box's JP4 extension connector (pin numbers: UM3133 §1.8.6; domain switch on 3 V; leave the Qwiic 3.3 V unconnected). At every boot the firmware then logs:

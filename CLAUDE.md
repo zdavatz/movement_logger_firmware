@@ -771,6 +771,13 @@ hanging loose, pad scorched). Pin 14 into the second header's RX hole →
 9600 / 1 Hz. A loose contact that drops after boot shows as
 `*** gps: nav rate switch (1Hz) NOT ACK'd x3 ***` (red LED).
 
+Second confirmation boot (2026-10-27, build #64, wire in the second header's RX
+hole from power-on): `cfg baud 230400 ACK` at 2626 ms, all six config ACKs,
+`ready @230400`, `RX<-JP2-14 ok (6 ACK)`, zero `***`. The config runs once in
+`GPS_Init`; a contact made after boot gives `MODULE ANSWERED` over the BLE
+bridge while the ERRLOG still says `RX<-JP2-14 MISSING` and the box stays at
+9600 / 1 Hz — power-cycle to reconfigure.
+
 ## Card named MOVE_LOGGER + orphaned long-name entries dropped (v0.0.74+) — `sd_fatfs.c`
 
 **Volume name.** Every boot, right after `SDFat_Mount`, `SDFat_SetVolumeLabel(PL_SD_VOLUME_LABEL)`
